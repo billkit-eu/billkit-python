@@ -1,0 +1,55 @@
+{
+  "$comment": "Machine-readable scenario matrix every SDK integration suite must cover. See SCENARIOS.md for the rationale and for how to add one. Each suite asserts it implements every scenario in ITS OWN family, so adding an entry fails the other SDKs in that family until they catch up. Families: 'server' (node/python/php), 'browser' (js/react), 'framework' (laravel).",
+  "version": 2,
+  "families": {
+    "server": ["node", "python", "php"],
+    "browser": ["js", "react"],
+    "framework": ["laravel"]
+  },
+  "scenarios": [
+    { "id": "auth.valid_key", "family": "server", "group": "auth", "summary": "A provisioned key authenticates and reaches a real resource." },
+    { "id": "auth.bad_key", "family": "server", "group": "auth", "summary": "An unknown key maps to the authentication exception." },
+    { "id": "auth.scoped_key_denied", "family": "server", "group": "auth", "summary": "A narrowly-scoped key gets the permission exception off-scope." },
+
+    { "id": "crud.product", "family": "server", "group": "crud", "summary": "Product create/retrieve/update/list/delete round-trip." },
+    { "id": "crud.price", "family": "server", "group": "crud", "summary": "Price create under a product, retrieve, list filtered by product_id." },
+    { "id": "crud.customer", "family": "server", "group": "crud", "summary": "Customer create/retrieve/update/delete; deleted row leaves the list." },
+    { "id": "crud.coupon", "family": "server", "group": "crud", "summary": "Coupon create/validate/update/delete." },
+    { "id": "crud.tax_rate", "family": "server", "group": "crud", "summary": "Tax rate create/retrieve/update/delete." },
+    { "id": "crud.webhook_endpoint", "family": "server", "group": "crud", "summary": "Webhook endpoint create/retrieve/update/rotate-secret/delete." },
+
+    { "id": "pagination.has_more", "family": "server", "group": "pagination", "summary": "limit < N yields has_more and an exactly-limit-long page." },
+    { "id": "pagination.auto_iter", "family": "server", "group": "pagination", "summary": "Auto-paging iterator yields every row exactly once." },
+
+    { "id": "idempotency.replay", "family": "server", "group": "idempotency", "summary": "Same key + same body replays the same resource id." },
+    { "id": "idempotency.key_reuse_conflict", "family": "server", "group": "idempotency", "summary": "Same key + different body maps to the conflict exception." },
+
+    { "id": "errors.not_found", "family": "server", "group": "errors", "summary": "404 maps to the resource-missing exception with its code." },
+    { "id": "errors.invalid_request", "family": "server", "group": "errors", "summary": "A validation failure maps to the invalid-request exception and carries `param`." },
+
+    { "id": "money.checkout_to_active", "family": "server", "group": "money", "summary": "Checkout -> settle -> webhook -> subscription active + paid payment." },
+    { "id": "money.partial_refund", "family": "server", "group": "money", "summary": "Partial refund books and leaves the remainder refundable." },
+    { "id": "money.over_refund_rejected", "family": "server", "group": "money", "summary": "Refunding beyond the remaining balance is rejected." },
+    { "id": "money.dispute_opened", "family": "server", "group": "money", "summary": "Chargeback + webhook opens a listable, retrievable dispute." },
+
+    { "id": "webhooks.verify_roundtrip", "family": "server", "group": "webhooks", "summary": "A correctly signed payload verifies." },
+    { "id": "webhooks.reject_tampered", "family": "server", "group": "webhooks", "summary": "A mutated body fails verification." },
+    { "id": "webhooks.reject_stale", "family": "server", "group": "webhooks", "summary": "A timestamp outside tolerance fails verification." },
+
+    { "id": "element.mount", "family": "browser", "group": "element", "summary": "The iframe mounts at the configured origin+path and the client_secret is never in the URL." },
+    { "id": "element.handshake", "family": "browser", "group": "element", "summary": "init is posted only after the iframe's ready, targeted at the exact origin, carrying a REAL client_secret and the session id parsed from it." },
+    { "id": "element.origin_isolation", "family": "browser", "group": "element", "summary": "Messages from a foreign origin, and from a window that isn't this iframe, are both ignored." },
+    { "id": "element.live_secret_authenticates", "family": "browser", "group": "element", "summary": "A real minted client_secret authenticates on GET /v1/checkout/sessions/{id}/element, at the session id the loader parsed out of it." },
+    { "id": "element.api_key_rejected", "family": "browser", "group": "element", "summary": "A secret API key is refused on the embedded surface; that surface accepts only the Checkout scheme." },
+    { "id": "element.live_confirm_activates", "family": "browser", "group": "element", "summary": "Confirming the embedded session, settling, and delivering the webhook drives the subscription active." },
+    { "id": "element.teardown", "family": "browser", "group": "element", "summary": "destroy()/unmount removes the iframe and stops routing messages." },
+
+    { "id": "laravel.customer", "family": "framework", "group": "laravel", "summary": "Billable::createOrGetBillKitCustomer creates a real customer and persists its id." },
+    { "id": "laravel.checkout", "family": "framework", "group": "laravel", "summary": "Billable::checkout returns a real session carrying a Mollie redirect url." },
+    { "id": "laravel.subscription_sync", "family": "framework", "group": "laravel", "summary": "checkout -> settle -> webhook -> the Subscription model reports active." },
+    { "id": "laravel.subscription_actions", "family": "framework", "group": "laravel", "summary": "cancel and reactivate drive real API state and re-sync the model." },
+    { "id": "laravel.refund", "family": "framework", "group": "laravel", "summary": "Billable::refund books a real partial refund." },
+    { "id": "laravel.billing_portal", "family": "framework", "group": "laravel", "summary": "Subscription::billingPortalUrl mints a real portal session url." },
+    { "id": "laravel.webhook_signature", "family": "framework", "group": "laravel", "summary": "The webhook route accepts a correctly signed payload and rejects a tampered one." }
+  ]
+}

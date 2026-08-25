@@ -1,0 +1,37 @@
+name: Publish to PyPI
+
+# Triggered by pushing a tag of the form ``vX.Y.Z``.
+# The tag's version must match ``project.version`` in ``pyproject.toml``.
+#
+# The distribution is ``billkit-eu``; the import name is ``billkit``.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Build + publish
+    runs-on: ubuntu-latest
+    permissions:
+      # PyPI trusted publishing (OIDC). Configure the ``billkit-eu`` project
+      # on PyPI to trust this workflow in this repository first.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v9.0.0
+      - name: Verify tag matches pyproject.toml
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(uv run python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag ($TAG_VERSION) does not match pyproject.toml ($PKG_VERSION)."
+            exit 1
+          fi
+      - name: Test
+        run: uv run pytest -q
+      - name: Build
+        run: uv build
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
