@@ -12,6 +12,19 @@ Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+- The README's alternate install line said `uv add billkit`, which installs an
+  unrelated project that happens to hold the bare name on PyPI. It now reads
+  `uv add billkit-eu`, matching the `pip install` line directly above it, and
+  the distinction between the distribution name (`billkit-eu`) and the import
+  name (`billkit`) is spelled out rather than left to be inferred.
+
+  No code changed. This is a documentation-only release, but the documentation
+  in question is the install instruction shown on the PyPI page, so following it
+  got you the wrong package.
+
 ## [0.1.0]
 
 First public release.
@@ -54,5 +67,6 @@ First public release.
   API keys, request/response bodies and query strings are never logged, and the
   final failure is raised rather than logged so you never get a duplicate entry.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/billkit-eu/billkit-python/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/billkit-eu/billkit-python/releases/tag/v0.1.0

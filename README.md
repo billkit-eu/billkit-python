@@ -7,10 +7,16 @@ Async + sync client for [BillKit](https://billkit.eu), the Stripe-Billing-shape 
 ```bash
 pip install billkit-eu
 # or
-uv add billkit
+uv add billkit-eu
 ```
 
-Requires Python 3.11+.
+Requires Python 3.11+. The distribution is `billkit-eu` because the bare
+`billkit` name on PyPI belongs to an unrelated project. The import name is
+unaffected:
+
+```python
+import billkit
+```
 
 ## Quick start
 
