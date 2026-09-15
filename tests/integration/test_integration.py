@@ -163,7 +163,7 @@ def test_auth_valid_key(client: BillKit) -> None:
 
 def test_auth_bad_key() -> None:
     """[auth.bad_key] an unknown key raises AuthenticationError."""
-    bogus = BillKit(api_key="sk_test_0000000000000000000000", base_url=BASE_URL)
+    bogus = BillKit(api_key="bk_test_0000000000000000000000", base_url=BASE_URL)
     with pytest.raises(AuthenticationError):
         bogus.products.list()
 
@@ -290,12 +290,12 @@ def test_crud_webhook_endpoint(client: BillKit) -> None:
         description="python integration suite",
     )
     # The signing secret is returned exactly once, on create.
-    assert created["secret"].startswith("whsec_")
+    assert created["secret"].startswith("bkwhsec_")
 
     client.webhook_endpoints.update(created["id"], description="renamed")
 
     rotated = client.webhook_endpoints.rotate_secret(created["id"])
-    assert rotated["secret"].startswith("whsec_")
+    assert rotated["secret"].startswith("bkwhsec_")
     assert rotated["secret"] != created["secret"]
 
     # Disabling stops delivery and keeps everything else, so the endpoint
@@ -556,7 +556,7 @@ def test_usage_non_metered_rejected(client: BillKit, tenant: ITTenant) -> None:
 
 # ── webhooks ─────────────────────────────────────────────────────────
 
-SECRET = "whsec_integration_secret"
+SECRET = "bkwhsec_integration_secret"
 BODY = json.dumps({"id": "evt_1", "type": "subscription.created"})
 
 

@@ -139,7 +139,7 @@ def test_logs_never_contain_the_api_key_body_or_query(
 
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert blob, "Expected DEBUG records; the rest of this test would pass vacuously."
-    assert "sk_test_unit" not in blob, "The API key reached a log record."
+    assert "bk_test_unit" not in blob, "The API key reached a log record."
     assert "Bearer" not in blob, "The Authorization header reached a log record."
     assert "ada@example.com" not in blob, "A request/response body (PII) reached a log record."
     assert "Ada Lovelace" not in blob, "A request/response body (PII) reached a log record."
@@ -237,7 +237,7 @@ def test_constructing_a_client_applies_the_mitigation(clean_httpx_loggers: objec
     logger.setLevel(logging.DEBUG)
     logging.getLogger("httpx").setLevel(logging.NOTSET)
 
-    BillKit(api_key="sk_test_unit", base_url="https://test.billkit.eu")
+    BillKit(api_key="bk_test_unit", base_url="https://test.billkit.eu")
 
     assert logging.getLogger("httpx").level == logging.WARNING
 
@@ -251,7 +251,7 @@ def test_an_injected_httpx_client_keeps_its_owner_s_logging(
     logging.getLogger("httpx").setLevel(logging.NOTSET)
 
     BillKit(
-        api_key="sk_test_unit",
+        api_key="bk_test_unit",
         base_url="https://test.billkit.eu",
         httpx_client=httpx.Client(),
     )

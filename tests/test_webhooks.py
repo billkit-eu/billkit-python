@@ -68,7 +68,7 @@ def test_wrong_secret_rejected(sample_event_body: bytes, webhook_secret: str) ->
         WebhookSignature.verify(
             payload=sample_event_body,
             signature_header=header,
-            secret="whsec_wrong",
+            secret="bkwhsec_wrong",
         )
 
 
@@ -116,7 +116,7 @@ def test_accepts_when_any_of_multiple_v1_matches(
     ts = int(time.time())
     signed = f"{ts}.".encode("ascii") + sample_event_body
     good = hmac.new(webhook_secret.encode(), signed, hashlib.sha256).hexdigest()
-    bad = hmac.new(b"whsec_rotated_out", signed, hashlib.sha256).hexdigest()
+    bad = hmac.new(b"bkwhsec_rotated_out", signed, hashlib.sha256).hexdigest()
     header = f"t={ts},v1={bad},v1={good}"
 
     event = WebhookSignature.verify(
@@ -132,8 +132,8 @@ def test_rejects_when_none_of_multiple_v1_match(
 ) -> None:
     ts = int(time.time())
     signed = f"{ts}.".encode("ascii") + sample_event_body
-    bad1 = hmac.new(b"whsec_wrong_a", signed, hashlib.sha256).hexdigest()
-    bad2 = hmac.new(b"whsec_wrong_b", signed, hashlib.sha256).hexdigest()
+    bad1 = hmac.new(b"bkwhsec_wrong_a", signed, hashlib.sha256).hexdigest()
+    bad2 = hmac.new(b"bkwhsec_wrong_b", signed, hashlib.sha256).hexdigest()
     header = f"t={ts},v1={bad1},v1={bad2}"
 
     with pytest.raises(WebhookVerificationError, match="mismatch"):

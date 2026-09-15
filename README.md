@@ -23,7 +23,7 @@ import billkit
 ```python
 from billkit import BillKit
 
-client = BillKit(api_key="sk_test_...")
+client = BillKit(api_key="bk_test_...")
 
 customer = client.customers.create(email="ada@example.com", name="Ada Lovelace")
 product = client.products.create(
@@ -111,7 +111,7 @@ client.customers.delete(customer["id"])  # -> {"deleted": True, ...}
 ```python
 from billkit import AsyncBillKit
 
-async with AsyncBillKit(api_key="sk_test_...") as client:
+async with AsyncBillKit(api_key="bk_test_...") as client:
     customer = await client.customers.create(email="ada@example.com")
 ```
 
@@ -121,7 +121,7 @@ async with AsyncBillKit(api_key="sk_test_...") as client:
 from billkit import BillKit, RetryPolicy
 
 client = BillKit(
-    api_key="sk_test_...",  # or set BILLKIT_API_KEY
+    api_key="bk_test_...",  # or set BILLKIT_API_KEY
     base_url="https://api.billkit.eu",  # override for self-hosted
     timeout=30.0,  # seconds, or pass httpx.Timeout
     retry_policy=RetryPolicy(
@@ -138,7 +138,7 @@ The SDK auto-generates an `Idempotency-Key` for every mutating call, so 5xx and 
 ```python
 from billkit import BillKit, ResourceMissingError, RateLimitError, BillKitError
 
-client = BillKit(api_key="sk_test_...")
+client = BillKit(api_key="bk_test_...")
 try:
     customer = client.customers.retrieve("cus_doesnt_exist")
 except ResourceMissingError:

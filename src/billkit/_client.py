@@ -72,7 +72,7 @@ class AsyncBillKit:
     Use as an async context manager to ensure the underlying
     httpx client is closed::
 
-        async with AsyncBillKit(api_key="sk_test_...") as client:
+        async with AsyncBillKit(api_key="bk_test_...") as client:
             customer = await client.customers.create(email="...")
 
     Or instantiate directly and call :meth:`close` when done.
@@ -133,7 +133,7 @@ class BillKit:
 
     Use as a context manager or call :meth:`close` when done::
 
-        with BillKit(api_key="sk_test_...") as client:
+        with BillKit(api_key="bk_test_...") as client:
             customer = client.customers.create(email="...")
     """
 

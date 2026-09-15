@@ -24,7 +24,7 @@ async def test_create_customer_async(async_client: AsyncBillKit) -> None:
     assert customer["id"] == "cus_1"
     assert route.called
     request = route.calls.last.request
-    assert request.headers["Authorization"] == "Bearer sk_test_unit"
+    assert request.headers["Authorization"] == "Bearer bk_test_unit"
     assert_idempotency_header(request)
 
 

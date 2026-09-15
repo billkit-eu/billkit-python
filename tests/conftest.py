@@ -32,7 +32,7 @@ FAST_RETRY = RetryPolicy(
 @pytest.fixture
 async def async_client() -> AsyncIterator[AsyncBillKit]:
     async with AsyncBillKit(
-        api_key="sk_test_unit",
+        api_key="bk_test_unit",
         base_url="https://test.billkit.eu",
         retry_policy=FAST_RETRY,
     ) as client:
@@ -42,7 +42,7 @@ async def async_client() -> AsyncIterator[AsyncBillKit]:
 @pytest.fixture
 def sync_client() -> Iterator[BillKit]:
     with BillKit(
-        api_key="sk_test_unit",
+        api_key="bk_test_unit",
         base_url="https://test.billkit.eu",
         retry_policy=FAST_RETRY,
     ) as client:
@@ -51,7 +51,7 @@ def sync_client() -> Iterator[BillKit]:
 
 @pytest.fixture
 def webhook_secret() -> str:
-    return "whsec_unit_test_secret"
+    return "bkwhsec_unit_test_secret"
 
 
 @pytest.fixture

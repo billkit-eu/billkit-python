@@ -7,7 +7,7 @@ Quick start
 
     from billkit import BillKit
 
-    client = BillKit(api_key="sk_test_...")
+    client = BillKit(api_key="bk_test_...")
     customer = client.customers.create(email="ada@example.com", name="Ada Lovelace")
     product = client.products.create(name="Pro")
     price = client.prices.create(
@@ -26,7 +26,7 @@ Async variant
 
     from billkit import AsyncBillKit
 
-    async with AsyncBillKit(api_key="sk_test_...") as client:
+    async with AsyncBillKit(api_key="bk_test_...") as client:
         customer = await client.customers.create(email="ada@example.com")
 
 Webhook verification
@@ -40,7 +40,7 @@ Webhook verification
         event = WebhookSignature.verify(
             payload=request.body,
             signature_header=request.headers["BillKit-Signature"],
-            secret="whsec_...",
+            secret="bkwhsec_...",
         )
     except WebhookVerificationError:
         return Response(status_code=400)
