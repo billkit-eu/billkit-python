@@ -31,9 +31,7 @@ async def test_5xx_is_retried_then_succeeds(async_client: AsyncBillKit) -> None:
 @respx.mock
 async def test_5xx_exhausts_budget_then_raises(async_client: AsyncBillKit) -> None:
     route = respx.post("https://test.billkit.eu/v1/customers").mock(
-        return_value=httpx.Response(
-            500, json={"error": {"type": "api_error", "message": "boom"}}
-        )
+        return_value=httpx.Response(500, json={"error": {"type": "api_error", "message": "boom"}})
     )
     with pytest.raises(ServerError):
         await async_client.customers.create(email="a@b.co")

@@ -106,9 +106,7 @@ async def test_retrieve_subscription_no_idempotency_on_get(
 @respx.mock
 async def test_list_passes_pagination_params(async_client: AsyncBillKit) -> None:
     route = respx.get("https://test.billkit.eu/v1/customers").mock(
-        return_value=httpx.Response(
-            200, json={"object": "list", "data": [], "has_more": False}
-        )
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
     )
     await async_client.customers.list(limit=25, starting_after="cus_x")
     assert route.called
@@ -120,9 +118,7 @@ async def test_list_passes_pagination_params(async_client: AsyncBillKit) -> None
 @pytest.mark.asyncio
 @respx.mock
 async def test_subscription_cancel_uses_post(async_client: AsyncBillKit) -> None:
-    route = respx.post(
-        "https://test.billkit.eu/v1/subscriptions/sub_1/cancel"
-    ).mock(
+    route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/cancel").mock(
         return_value=httpx.Response(200, json={"id": "sub_1", "status": "canceled"})
     )
     sub = await async_client.subscriptions.cancel("sub_1")

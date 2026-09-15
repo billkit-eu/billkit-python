@@ -12,6 +12,38 @@ Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
 ## [Unreleased]
 
+### Added
+- `client.prices.update(price_id, active=False)` (and `AsyncPrices.update`)
+  archives a price through `POST /v1/prices/{id}`. The price keeps its id and
+  stays readable through `retrieve()` and `list()`, because subscriptions renew
+  against it by id. Subscriptions already on it keep renewing; what stops is new
+  business. Re-archiving is a no-op that returns the price unchanged, so a retry
+  is safe. `active` is the only field a price accepts and `active=True` is
+  refused, because prices are immutable.
+- `subscriptions.list()` and `.iter()` take `customer_id`, `status` and
+  `renewal_state`, on both the sync and async clients. `iter()` carries the
+  filters onto every page request rather than filtering a walk locally. Both
+  `status` and `renewal_state` take a comma-separated list.
+
+### Removed
+- `delete()` on `products`, `prices`, `coupons`, `tax_rates` and
+  `webhook_endpoints`, on both the sync and async clients. None of them deleted
+  anything: every one of those rows stays readable afterwards, which is why they
+  have to. Retire them through the update route instead — `active=False` for
+  products, prices, tax rates and coupons, `status="disabled"` for webhook
+  endpoints. The server no longer answers `DELETE` on those paths at all.
+
+### Changed
+- `client.customers.delete(customer_id)` returns
+  `{"id": ..., "object": "customer", "deleted": True}` instead of the customer.
+  The customer leaves the API, so returning a body that reads like a live
+  resource said the opposite of what happened.
+- Paused subscriptions are found with `renewal_state="paused"`.
+  `status="paused"` is no longer accepted by the API and raises
+  `InvalidRequestError`: pausing sets `renewal_state` and leaves `status` at
+  `active`, because the customer has paid for the period they are in. The README
+  documents the split between the two filters.
+
 ## [0.1.1]
 
 ### Fixed

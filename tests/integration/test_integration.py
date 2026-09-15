@@ -67,10 +67,12 @@ COVERED: set[str] = {
     "auth.scoped_key_denied",
     "crud.product",
     "crud.price",
+    "crud.price_archive",
     "crud.customer",
     "crud.coupon",
     "crud.tax_rate",
     "crud.webhook_endpoint",
+    "filters.subscription_renewal_state",
     "pagination.has_more",
     "pagination.auto_iter",
     "idempotency.replay",
@@ -81,6 +83,9 @@ COVERED: set[str] = {
     "money.partial_refund",
     "money.over_refund_rejected",
     "money.dispute_opened",
+    "usage.record_and_replay",
+    "usage.list_reconciliation",
+    "usage.non_metered_rejected",
     "webhooks.verify_roundtrip",
     "webhooks.reject_tampered",
     "webhooks.reject_stale",
@@ -90,7 +95,13 @@ COVERED: set[str] = {
 # ── shared helpers ───────────────────────────────────────────────────
 
 
-def make_plan(c: BillKit, *, amount_cents: int = 2500, interval: str = "month") -> dict[str, Any]:
+def make_plan(
+    c: BillKit,
+    *,
+    amount_cents: int = 2500,
+    interval: str = "month",
+    usage_type: str | None = None,
+) -> dict[str, Any]:
     """A product + price pair the money specs charge against."""
     product = c.products.create(name=f"Plan {idem_key()}")
     price = c.prices.create(
@@ -98,6 +109,7 @@ def make_plan(c: BillKit, *, amount_cents: int = 2500, interval: str = "month") 
         amount_cents=amount_cents,
         currency="EUR",
         interval=interval,
+        usage_type=usage_type,
     )
     return {"product": product, "price": price}
 
@@ -177,7 +189,9 @@ def test_crud_product(client: BillKit) -> None:
 
     assert client.products.retrieve(created["id"])["name"] == "Round Trip"
     assert client.products.update(created["id"], name="Round Trip v2")["name"] == "Round Trip v2"
-    assert client.products.delete(created["id"])["active"] is False
+    # Archive is the update route: the product has no delete, because an
+    # archived product stays readable.
+    assert client.products.update(created["id"], active=False)["active"] is False
 
 
 def test_crud_price(client: BillKit) -> None:
@@ -191,6 +205,34 @@ def test_crud_price(client: BillKit) -> None:
     assert price["id"] in [p["id"] for p in filtered["data"]]
 
 
+def test_crud_price_archive(client: BillKit) -> None:
+    """[crud.price_archive] archiving a price is readable and repeatable."""
+    plan = make_plan(client, amount_cents=777)
+    price, product = plan["price"], plan["product"]
+
+    archived = client.prices.update(price["id"], active=False)
+    assert archived["id"] == price["id"]
+    assert archived["active"] is False
+
+    # Archiving is not a delete: the row survives, so a subscription still
+    # pointing at it can be read back rather than dangling.
+    assert client.prices.retrieve(price["id"])["active"] is False
+    listed = client.prices.list(product_id=product["id"])
+    assert price["id"] in [p["id"] for p in listed["data"]]
+
+    # Re-archiving returns it unchanged instead of erroring, which is what
+    # makes a retried archive safe.
+    again = client.prices.update(price["id"], active=False)
+    assert again["id"] == price["id"]
+    assert again["active"] is False
+
+    # ``active`` moves both ways, and the money-bearing fields survive the
+    # round trip, which is the immutability claim that actually matters.
+    back = client.prices.update(price["id"], active=True)
+    assert back["active"] is True
+    assert back["amount_cents"] == 777
+
+
 def test_crud_customer(client: BillKit) -> None:
     """[crud.customer] customer round-trips; delete removes it from the list."""
     email = f"cust-{idem_key()}@sdk-it.example.com"
@@ -198,13 +240,16 @@ def test_crud_customer(client: BillKit) -> None:
     assert created["email"] == email
     assert client.customers.update(created["id"], name="Ada L.")["name"] == "Ada L."
 
-    client.customers.delete(created["id"])
+    deleted = client.customers.delete(created["id"])
+    # The customer leaves the API, so the body is a marker, not a row.
+    assert deleted == {"id": created["id"], "object": "customer", "deleted": True}
+
     page = client.customers.list(limit=100)
     assert created["id"] not in [c["id"] for c in page["data"]]
 
 
 def test_crud_coupon(client: BillKit) -> None:
-    """[crud.coupon] coupon creates, validates, updates, deletes."""
+    """[crud.coupon] coupon creates, validates, updates, withdraws."""
     code = f"SAVE{str(int(time.time()))[-8:]}"
     created = client.coupons.create(
         code=code, discount_type="percent", discount_value=25, duration="once"
@@ -213,11 +258,14 @@ def test_crud_coupon(client: BillKit) -> None:
     assert client.coupons.validate(code=code)["valid"] is True
 
     client.coupons.update(created["id"], max_redemptions=5)
-    client.coupons.delete(created["id"])
+    client.coupons.update(created["id"], active=False)
 
-    # A deleted coupon must stop validating, otherwise a revoked discount
-    # would keep applying at checkout.
+    # A withdrawn coupon must stop validating, otherwise a retired discount
+    # would keep applying at checkout...
     assert client.coupons.validate(code=code)["valid"] is False
+    # ...while staying readable, because a discount already applied to a
+    # live subscription has to be traceable to the coupon behind it.
+    assert client.coupons.retrieve(created["id"])["active"] is False
 
 
 def test_crud_tax_rate(client: BillKit) -> None:
@@ -227,7 +275,11 @@ def test_crud_tax_rate(client: BillKit) -> None:
     )
     assert created["rate_basis_points"] == 2100
     assert client.tax_rates.update(created["id"], rate_basis_points=900)["rate_basis_points"] == 900
-    client.tax_rates.delete(created["id"])
+
+    # Retiring is an update, and the rate stays readable: an invoice records
+    # the percentage it charged, not the rate row.
+    assert client.tax_rates.update(created["id"], active=False)["active"] is False
+    assert client.tax_rates.retrieve(created["id"])["active"] is False
 
 
 def test_crud_webhook_endpoint(client: BillKit) -> None:
@@ -246,7 +298,53 @@ def test_crud_webhook_endpoint(client: BillKit) -> None:
     assert rotated["secret"].startswith("whsec_")
     assert rotated["secret"] != created["secret"]
 
-    client.webhook_endpoints.delete(created["id"])
+    # Disabling stops delivery and keeps everything else, so the endpoint
+    # is still listed and can be turned back on.
+    disabled = client.webhook_endpoints.update(created["id"], status="disabled")
+    assert disabled["status"] == "disabled"
+    page = client.webhook_endpoints.list(limit=100)
+    assert created["id"] in [e["id"] for e in page["data"]]
+
+    # Deleting is the other act, and it is a real one: a URL registered by
+    # mistake leaves the account rather than sitting there disabled for good.
+    gone = client.webhook_endpoints.delete(created["id"])
+    assert gone == {"id": created["id"], "object": "webhook_endpoint", "deleted": True}
+    with pytest.raises(ResourceMissingError):
+        client.webhook_endpoints.retrieve(created["id"])
+    after = client.webhook_endpoints.list(limit=100)
+    assert created["id"] not in [e["id"] for e in after["data"]]
+
+
+# ── filters ──────────────────────────────────────────────────────────
+
+
+def test_filters_subscription_renewal_state() -> None:
+    """[filters.subscription_renewal_state] paused lives in renewal_state."""
+    t = provision_tenant("renewal")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+    price = make_plan(c, amount_cents=1500)["price"]
+    checkout_to_active(c, t, price["id"])
+    sub = find_subscription(c, price["id"])
+
+    paused = c.subscriptions.pause(sub["id"])
+    # The whole point: pausing lands in renewal_state and leaves status
+    # alone, because the customer has paid for the period they are in.
+    assert paused["renewal_state"] == "paused"
+    assert paused["status"] == "active"
+
+    by_renewal_state = c.subscriptions.list(renewal_state="paused")
+    assert sub["id"] in [s["id"] for s in by_renewal_state["data"]]
+
+    # ...and it is still an `active` subscription to the status filter.
+    by_status = c.subscriptions.list(status="active")
+    assert sub["id"] in [s["id"] for s in by_status["data"]]
+
+    # `status=paused` is not a value the API accepts. It used to be, and
+    # returned a confident, wrong, empty page; now it is refused so the
+    # mistake is visible.
+    with pytest.raises(InvalidRequestError) as excinfo:
+        c.subscriptions.list(status="paused")
+    assert excinfo.value.param == "status"
 
 
 # ── pagination ───────────────────────────────────────────────────────
@@ -387,6 +485,73 @@ def test_money_dispute_opened(client: BillKit, tenant: ITTenant) -> None:
     assert match, "a dispute should exist for the charged-back payment"
     assert match[0]["status"] == "open"
     assert client.disputes.retrieve(match[0]["id"])["id"] == match[0]["id"]
+
+
+# ── usage ────────────────────────────────────────────────────────────
+
+
+def active_subscription(c: BillKit, t: ITTenant, price_id: str) -> dict[str, Any]:
+    """Mint an ACTIVE subscription on ``price_id`` and return it.
+
+    Same machinery as the money specs: checkout -> settle at the fake
+    Mollie -> deliver the webhook, then find the subscription by price.
+    """
+    checkout_to_active(c, t, price_id)
+    sub = find_subscription(c, price_id)
+    assert sub["status"] == "active"
+    return sub
+
+
+def test_usage_record_and_replay(client: BillKit, tenant: ITTenant) -> None:
+    """[usage.record_and_replay] a usage record posts and replays by key.
+
+    Replaying the same Idempotency-Key must return the same record, not
+    double-count the usage: that is what makes at-least-once reporting
+    pipelines safe to retry.
+    """
+    price = make_plan(client, amount_cents=5, usage_type="metered")["price"]
+    sub = active_subscription(client, tenant, price["id"])
+
+    key = idem_key()
+    record = client.subscriptions.create_usage_record(
+        sub["id"], quantity=42, metadata={"source": "python-it"}, idempotency_key=key
+    )
+    assert record["object"] == "usage_record"
+    assert record["subscription_id"] == sub["id"]
+    assert record["quantity"] == 42
+    assert record["invoice_id"] is None
+
+    replay = client.subscriptions.create_usage_record(
+        sub["id"], quantity=42, metadata={"source": "python-it"}, idempotency_key=key
+    )
+    assert replay["id"] == record["id"]
+
+
+def test_usage_list_reconciliation(client: BillKit, tenant: ITTenant) -> None:
+    """[usage.list_reconciliation] invoice_id=pending returns the posted records."""
+    price = make_plan(client, amount_cents=3, usage_type="metered")["price"]
+    sub = active_subscription(client, tenant, price["id"])
+
+    posted = [
+        client.subscriptions.create_usage_record(sub["id"], quantity=q)["id"] for q in (10, 20, 30)
+    ]
+
+    pending = client.subscriptions.list_usage_records(sub["id"], invoice_id="pending", limit=100)
+    assert pending["object"] == "list"
+    ids = [r["id"] for r in pending["data"]]
+    for record_id in posted:
+        assert record_id in ids
+    # Nothing pending may already claim an invoice.
+    assert all(r["invoice_id"] is None for r in pending["data"])
+
+
+def test_usage_non_metered_rejected(client: BillKit, tenant: ITTenant) -> None:
+    """[usage.non_metered_rejected] posting usage to a licensed subscription is a typed 400."""
+    price = make_plan(client, amount_cents=2500)["price"]
+    sub = active_subscription(client, tenant, price["id"])
+
+    with pytest.raises(InvalidRequestError):
+        client.subscriptions.create_usage_record(sub["id"], quantity=1)
 
 
 # ── webhooks ─────────────────────────────────────────────────────────

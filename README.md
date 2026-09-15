@@ -69,6 +69,43 @@ client.refunds.create(one_shot_payment_id=payment["id"])
 client.refunds.create(one_shot_payment_id=payment["id"], amount_cents=500)
 ```
 
+## Finding paused subscriptions
+
+`status` and `renewal_state` answer different questions, and only one of them knows about pausing. `status` is where the subscription stands with its payments (`incomplete`, `trialing`, `active`, `past_due`, `canceled`). `renewal_state` is what happens when the current period ends (`auto_renew`, `paused`, `canceling`, `stopped`). Pausing sets `renewal_state` and leaves `status` at `active`, because the customer has paid for the period they are in:
+
+```python
+paused = client.subscriptions.list(renewal_state="paused")
+
+# Both filters take a comma-separated list, and carry onto every page:
+for sub in client.subscriptions.iter(status="active,past_due", page_size=100):
+    ...
+```
+
+`status="paused"` is not an accepted value and raises `InvalidRequestError`.
+
+## Retiring something, and deleting something
+
+`delete()` exists on `customers` and `webhook_endpoints`, and it returns `{"id": ..., "object": ..., "deleted": True}` rather than the object: it has left the API, so there is nothing to hand back. A deleted endpoint takes its delivery rows with it, because those are readable only through the endpoint that owns them; the events stay in `client.events`, which is the record of what you were sent.
+
+The catalogue is retired through its update route instead, because it stays readable afterwards. Prices, products, tax rates and coupons take `active=False`. Each of them has to survive: subscriptions renew against a price by id, an invoice records the VAT percentage a tax rate produced, and a redeemed coupon is part of what a customer was charged.
+
+`status="disabled"` on a webhook endpoint is the other half of the pair, not a substitute for deleting. It stops delivery and keeps the endpoint, its secret and its history, and it can be turned back on.
+
+A price accepts `active` and nothing else, because the amount, currency and interval are fixed at creation. `active` itself moves both ways: it decides what new checkouts may buy, not what anyone was charged. Re-sending the value it already has is a no-op, so a retry is safe.
+
+```python
+# Stop selling a price. It stays readable; customers on it keep renewing.
+archived = client.prices.update(price["id"], active=False)
+assert archived["active"] is False
+
+# Stop sending to an endpoint, without losing its signing secret.
+client.webhook_endpoints.update(endpoint["id"], status="disabled")
+
+# Remove a customer. Refused while they hold a subscription that can
+# still charge them.
+client.customers.delete(customer["id"])  # -> {"deleted": True, ...}
+```
+
 ## Async
 
 ```python
@@ -84,12 +121,12 @@ async with AsyncBillKit(api_key="sk_test_...") as client:
 from billkit import BillKit, RetryPolicy
 
 client = BillKit(
-    api_key="sk_test_...",                  # or set BILLKIT_API_KEY
-    base_url="https://api.billkit.eu",   # override for self-hosted
-    timeout=30.0,                          # seconds, or pass httpx.Timeout
+    api_key="sk_test_...",  # or set BILLKIT_API_KEY
+    base_url="https://api.billkit.eu",  # override for self-hosted
+    timeout=30.0,  # seconds, or pass httpx.Timeout
     retry_policy=RetryPolicy(
         max_attempts=5,
-        max_retry_after_seconds=10.0,       # cap 429 Retry-After sleeps
+        max_retry_after_seconds=10.0,  # cap 429 Retry-After sleeps
     ),
 )
 ```
@@ -138,6 +175,23 @@ DEBUG:billkit:BillKit response POST https://api.billkit.eu/v1/customers -> 200 i
 - **WARNING**: one line per retry, with the reason and the delay before the next attempt.
 
 **Never logged:** your API key or the `Authorization` header; request and response **bodies** (they carry customer PII); the **query string** (list filters carry values like `email=`); only the path is logged. The final failure isn't logged either: it's raised as a typed `BillKitError` carrying the status, request id and retry-after, and logging it here too would hand you a duplicate you can't suppress.
+
+### One caveat: httpx's own request line
+
+The promise above covers records **this SDK** writes. `httpx`, the HTTP client underneath, writes its own at `INFO`, and it includes the full URL:
+
+```
+INFO:httpx:HTTP Request: GET https://api.billkit.eu/v1/customers?email=ada@example.com "HTTP/1.1 200 OK"
+```
+
+`basicConfig()` plus a `DEBUG` level on `billkit` is enough to surface it, so turning BillKit's logging on would otherwise put customer emails in your logs from a logger BillKit never touched. There is no per-client switch for it in httpx.
+
+So when you opt this SDK in, it raises the `httpx` and `httpcore` loggers to `WARNING` — **only** if you have not set a level on them yourself, and **only** for the `httpx` client the SDK created. Both exceptions are deliberate:
+
+- If you have configured `httpx` logging, you made a decision and a billing SDK does not get to overrule it. Silence the request line yourself, or accept the query strings.
+- If you passed your own `httpx_client=`, you own its logging as much as its connection pooling.
+
+The check happens when the client is constructed, so configure your logging before you build a `BillKit` / `AsyncBillKit` (the usual startup order).
 
 The logger object is exported if you'd rather wire it up directly:
 

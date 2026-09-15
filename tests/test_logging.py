@@ -69,9 +69,7 @@ def test_debug_logs_request_and_response_when_enabled(
     sync_client: BillKit, caplog: pytest.LogCaptureFixture
 ) -> None:
     respx.post("https://test.billkit.eu/v1/customers").mock(
-        return_value=httpx.Response(
-            200, json={"id": "cus_1"}, headers={"x-request-id": "req_abc"}
-        )
+        return_value=httpx.Response(200, json={"id": "cus_1"}, headers={"x-request-id": "req_abc"})
     )
     with caplog.at_level(logging.DEBUG, logger="billkit"):
         sync_client.customers.create(email="a@b.co")
@@ -164,3 +162,98 @@ async def test_async_transport_logs_the_same_lines(
     messages = [r.getMessage() for r in caplog.records]
     assert any("BillKit request POST" in m for m in messages)
     assert any("BillKit response POST" in m and "-> 200" in m for m in messages)
+
+
+# --- httpx's own INFO line ------------------------------------------
+#
+# The SDK's query-free promise covers records the SDK writes. httpx
+# writes its own, at INFO, carrying the FULL url:
+#
+#   HTTP Request: GET https://api.billkit.eu/v1/customers?email=ada@example.com "HTTP/1.1 200 OK"
+#
+# so an app that turns BillKit logging on the documented way, with
+# `logging.basicConfig()`, gets customer emails in its logs from a
+# logger BillKit never touched. These pin the mitigation and, just as
+# importantly, its limit.
+
+
+@pytest.fixture
+def clean_httpx_loggers() -> object:
+    """Restore the httpx/httpcore levels this module's tests change."""
+    saved = {name: logging.getLogger(name).level for name in ("httpx", "httpcore")}
+    saved_billkit = logger.level
+    yield
+    for name, level in saved.items():
+        logging.getLogger(name).setLevel(level)
+    logger.setLevel(saved_billkit)
+
+
+def test_httpx_logs_are_left_alone_until_the_sdk_is_opted_in(
+    clean_httpx_loggers: object,
+) -> None:
+    from billkit._logging import quiet_leaky_request_logs
+
+    logger.setLevel(logging.NOTSET)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+    assert quiet_leaky_request_logs() == ()
+    assert logging.getLogger("httpx").level == logging.NOTSET
+
+
+def test_opting_the_sdk_in_quiets_httpx_request_lines(clean_httpx_loggers: object) -> None:
+    from billkit._logging import quiet_leaky_request_logs
+
+    logger.setLevel(logging.DEBUG)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+    assert set(quiet_leaky_request_logs()) == {"httpx", "httpcore"}
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+
+
+def test_an_app_configured_httpx_level_is_never_overruled(
+    clean_httpx_loggers: object,
+) -> None:
+    """The limit of the mitigation, and the reason it is safe.
+
+    An app that has deliberately set httpx to INFO has made a decision.
+    A billing SDK does not get to overrule its host's logging config, so
+    the leak is documented in the README instead of being fixed over
+    their head.
+    """
+    from billkit._logging import quiet_leaky_request_logs
+
+    logger.setLevel(logging.DEBUG)
+    logging.getLogger("httpx").setLevel(logging.INFO)
+    logging.getLogger("httpcore").setLevel(logging.NOTSET)
+
+    assert quiet_leaky_request_logs() == ("httpcore",)
+    assert logging.getLogger("httpx").level == logging.INFO
+
+
+def test_constructing_a_client_applies_the_mitigation(clean_httpx_loggers: object) -> None:
+    logger.setLevel(logging.DEBUG)
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
+
+    BillKit(api_key="sk_test_unit", base_url="https://test.billkit.eu")
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+
+
+def test_an_injected_httpx_client_keeps_its_owner_s_logging(
+    clean_httpx_loggers: object,
+) -> None:
+    """Inject your own client and you own its logging, as much as its
+    connection pooling. The SDK only quiets clients it created."""
+    logger.setLevel(logging.DEBUG)
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
+
+    BillKit(
+        api_key="sk_test_unit",
+        base_url="https://test.billkit.eu",
+        httpx_client=httpx.Client(),
+    )
+
+    assert logging.getLogger("httpx").level == logging.NOTSET

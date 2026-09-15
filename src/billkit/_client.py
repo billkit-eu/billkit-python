@@ -63,9 +63,7 @@ def _resolve_api_key(supplied: str | None) -> str:
     env = os.environ.get("BILLKIT_API_KEY")
     if env:
         return env
-    raise ValueError(
-        "No BillKit API key supplied. Pass api_key=... or set BILLKIT_API_KEY."
-    )
+    raise ValueError("No BillKit API key supplied. Pass api_key=... or set BILLKIT_API_KEY.")
 
 
 class AsyncBillKit:

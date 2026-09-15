@@ -57,4 +57,53 @@ logger = logging.getLogger("billkit")
 # real handler ourselves.
 logger.addHandler(logging.NullHandler())
 
-__all__ = ["logger"]
+#: Loggers that undo this module's query-free promise from the outside.
+_LEAKY_LOGGERS = ("httpx", "httpcore")
+
+
+def sdk_logging_configured() -> bool:
+    """True once the application has opted this SDK's logger in.
+
+    "Configured" means the app set a level on ``billkit`` or attached a
+    real (non-null) handler to it — the two things the HOWTO snippet
+    above does. An app that has done neither is still in the default
+    silent state, and nothing below should fire.
+    """
+    if logger.level != logging.NOTSET:
+        return True
+    return any(not isinstance(h, logging.NullHandler) for h in logger.handlers)
+
+
+def quiet_leaky_request_logs() -> tuple[str, ...]:
+    """Stop ``httpx`` echoing the full request URL, query string included.
+
+    The promise this module makes — "only the path is logged" — is one
+    the SDK can keep for its *own* records and cannot keep for anyone
+    else's. ``httpx`` logs every request at INFO as
+    ``HTTP Request: GET https://api.billkit.eu/v1/customers?email=ada@
+    example.com "HTTP/1.1 200 OK"``, using ``httpx._client``'s own
+    module logger. There is no per-client switch for it, no event hook
+    that suppresses it, and nothing about turning BillKit's logging on
+    that should also turn a customer's email address into a log line.
+
+    So: when the app opts this SDK in, and *only* for loggers it has not
+    configured itself, raise ``httpx``/``httpcore`` to WARNING. The
+    ``NOTSET`` check is what keeps this from stomping global config — an
+    app that has deliberately set ``httpx`` to INFO has made a decision,
+    and a billing SDK does not get to overrule it (see the README's
+    logging caveat).
+
+    Returns the logger names actually changed.
+    """
+    if not sdk_logging_configured():
+        return ()
+    changed: list[str] = []
+    for name in _LEAKY_LOGGERS:
+        leaky = logging.getLogger(name)
+        if leaky.level == logging.NOTSET:
+            leaky.setLevel(logging.WARNING)
+            changed.append(name)
+    return tuple(changed)
+
+
+__all__ = ["logger", "quiet_leaky_request_logs", "sdk_logging_configured"]

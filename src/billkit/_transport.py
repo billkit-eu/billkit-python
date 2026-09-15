@@ -20,7 +20,7 @@ from typing import Any
 import httpx
 
 from billkit._errors import APIConnectionError, BillKitError, error_from_response
-from billkit._logging import logger
+from billkit._logging import logger, quiet_leaky_request_logs
 from billkit._retry import DEFAULT_RETRY_POLICY, RetryPolicy, should_retry
 from billkit._version import __version__
 
@@ -213,6 +213,10 @@ class AsyncTransport(_BaseTransport):
         )
         self._owned = httpx_client is None
         self._client = httpx_client or httpx.AsyncClient(timeout=self._timeout)
+        if self._owned:
+            # Only for a client we created. A caller who injected their own
+            # ``httpx.AsyncClient`` owns its logging as much as its pooling.
+            quiet_leaky_request_logs()
 
     async def request(
         self,
@@ -267,9 +271,7 @@ class AsyncTransport(_BaseTransport):
                 ):
                     raise
                 last_exc = exc
-                delay = _retry_delay(
-                    response=response, attempt=attempt, policy=self._retry_policy
-                )
+                delay = _retry_delay(response=response, attempt=attempt, policy=self._retry_policy)
                 _log_retry(method, url, f"HTTP {response.status_code}", attempt, delay)
                 await asyncio.sleep(delay)
         # Not `assert last_exc is not None`: asserts are stripped under
@@ -306,6 +308,9 @@ class SyncTransport(_BaseTransport):
         )
         self._owned = httpx_client is None
         self._client = httpx_client or httpx.Client(timeout=self._timeout)
+        if self._owned:
+            # See AsyncTransport.__init__.
+            quiet_leaky_request_logs()
 
     def request(
         self,
@@ -360,9 +365,7 @@ class SyncTransport(_BaseTransport):
                 ):
                     raise
                 last_exc = exc
-                delay = _retry_delay(
-                    response=response, attempt=attempt, policy=self._retry_policy
-                )
+                delay = _retry_delay(response=response, attempt=attempt, policy=self._retry_policy)
                 _log_retry(method, url, f"HTTP {response.status_code}", attempt, delay)
                 time.sleep(delay)
         # See AsyncTransport.request for why this is not an `assert`.

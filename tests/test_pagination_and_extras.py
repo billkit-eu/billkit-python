@@ -100,12 +100,8 @@ async def test_async_iter_walks_two_pages(async_client: AsyncBillKit) -> None:
 @respx.mock
 async def test_list_deliveries_async(async_client: AsyncBillKit) -> None:
     """The new deliveries route is reachable from the SDK."""
-    route = respx.get(
-        "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries"
-    ).mock(
-        return_value=httpx.Response(
-            200, json={"object": "list", "data": [], "has_more": False}
-        )
+    route = respx.get("https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
     )
     page = await async_client.webhook_endpoints.list_deliveries("we_1")
     assert page["object"] == "list"
@@ -116,8 +112,7 @@ async def test_list_deliveries_async(async_client: AsyncBillKit) -> None:
 def test_redeliver_delivery_posts(sync_client: BillKit) -> None:
     """Redeliver hits the right path with the idempotency header."""
     route = respx.post(
-        "https://test.billkit.eu/v1/webhook_endpoints/we_1/"
-        "deliveries/abc/redeliver"
+        "https://test.billkit.eu/v1/webhook_endpoints/we_1/deliveries/abc/redeliver"
     ).mock(
         return_value=httpx.Response(
             200,

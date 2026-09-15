@@ -102,9 +102,7 @@ def _parse_signature_header(header: str) -> tuple[int, list[str]]:
         elif key == "v1":
             v1_values.append(value)
     if ts_raw is None or not v1_values:
-        raise WebhookVerificationError(
-            f"Malformed BillKit-Signature header: {header!r}"
-        )
+        raise WebhookVerificationError(f"Malformed BillKit-Signature header: {header!r}")
     try:
         ts = int(ts_raw)
     except ValueError as exc:
@@ -112,12 +110,8 @@ def _parse_signature_header(header: str) -> tuple[int, list[str]]:
             f"Malformed BillKit-Signature timestamp: {ts_raw!r}"
         ) from exc
     if ts <= 0:
-        raise WebhookVerificationError(
-            f"Malformed BillKit-Signature timestamp: {ts!r}"
-        )
+        raise WebhookVerificationError(f"Malformed BillKit-Signature timestamp: {ts!r}")
     valid = [v for v in v1_values if _V1_HEX_RE.fullmatch(v) is not None]
     if not valid:
-        raise WebhookVerificationError(
-            f"Malformed BillKit-Signature v1 signature: {v1_values!r}"
-        )
+        raise WebhookVerificationError(f"Malformed BillKit-Signature v1 signature: {v1_values!r}")
     return ts, valid

@@ -8,12 +8,14 @@ resource hits the right path with the right body / params shape."""
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
 
 from billkit import AsyncBillKit, BillKit
-from tests.conftest import last_request_body
+from tests.conftest import assert_idempotency_header, last_request_body
 
 # ─── Coupons ──────────────────────────────────────────────────────
 
@@ -21,9 +23,7 @@ from tests.conftest import last_request_body
 @respx.mock
 def test_coupon_create_and_validate(sync_client: BillKit) -> None:
     create = respx.post("https://test.billkit.eu/v1/coupons").mock(
-        return_value=httpx.Response(
-            200, json={"id": "coup_1", "object": "coupon", "code": "PROMO"}
-        )
+        return_value=httpx.Response(200, json={"id": "coup_1", "object": "coupon", "code": "PROMO"})
     )
     validate = respx.post("https://test.billkit.eu/v1/coupons/validate").mock(
         return_value=httpx.Response(200, json={"valid": True, "discount_cents": 200})
@@ -31,9 +31,7 @@ def test_coupon_create_and_validate(sync_client: BillKit) -> None:
     coupon = sync_client.coupons.create(
         code="PROMO", discount_type="percent", discount_value=10, duration="once"
     )
-    preview = sync_client.coupons.validate(
-        code="PROMO", price_id="price_1", amount_cents=999
-    )
+    preview = sync_client.coupons.validate(code="PROMO", price_id="price_1", amount_cents=999)
     assert coupon["code"] == "PROMO"
     assert preview["valid"] is True
     assert create.called
@@ -93,9 +91,7 @@ def test_audit_logs_list_forwards_filters(sync_client: BillKit) -> None:
     """The ``action`` filter must reach the server as a query param,
     not just disappear into the SDK."""
     route = respx.get("https://test.billkit.eu/v1/audit_logs").mock(
-        return_value=httpx.Response(
-            200, json={"object": "list", "data": [], "has_more": False}
-        )
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
     )
     sync_client.audit_logs.list(action="customer.created", resource_type="customer")
     assert route.called
@@ -160,9 +156,7 @@ def test_billing_portal_session_create(sync_client: BillKit) -> None:
 
 @respx.mock
 def test_billing_portal_session_revoke(sync_client: BillKit) -> None:
-    route = respx.post(
-        "https://test.billkit.eu/v1/billing_portal/sessions/bps_1/revoke"
-    ).mock(
+    route = respx.post("https://test.billkit.eu/v1/billing_portal/sessions/bps_1/revoke").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -198,9 +192,7 @@ def test_customers_create_does_not_send_vat_number(sync_client: BillKit) -> None
 
 @respx.mock
 def test_customers_set_vat_number(sync_client: BillKit) -> None:
-    route = respx.post(
-        "https://test.billkit.eu/v1/customers/cus_1/vat_number"
-    ).mock(
+    route = respx.post("https://test.billkit.eu/v1/customers/cus_1/vat_number").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -370,9 +362,7 @@ def test_checkout_session_create_with_customer_email(sync_client: BillKit) -> No
 
 @respx.mock
 def test_subscription_reactivate_sync(sync_client: BillKit) -> None:
-    route = respx.post(
-        "https://test.billkit.eu/v1/subscriptions/sub_1/reactivate"
-    ).mock(
+    route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/reactivate").mock(
         return_value=httpx.Response(
             200, json={"id": "sub_1", "object": "subscription", "status": "active"}
         )
@@ -592,3 +582,275 @@ def test_prices_create_omits_refund_window_when_none(sync_client: BillKit) -> No
     body = last_request_body(route)
     assert "refund_window_initial_days" not in body
     assert "refund_window_renewal_days" not in body
+
+
+# ─── Usage records (metered billing) ──────────────────────────────
+
+
+@respx.mock
+def test_usage_record_create_sync(sync_client: BillKit) -> None:
+    """Create posts to the nested route with quantity/occurred_at/metadata;
+    omitted optionals are dropped, not sent as null."""
+    route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
+        return_value=httpx.Response(
+            201,
+            json={
+                "id": "ur_1",
+                "object": "usage_record",
+                "subscription_id": "sub_1",
+                "quantity": 42,
+                "invoice_id": None,
+            },
+        )
+    )
+    record = sync_client.subscriptions.create_usage_record(
+        "sub_1", quantity=42, occurred_at=1_700_000_000, metadata={"source": "unit"}
+    )
+    assert record["object"] == "usage_record"
+    body = last_request_body(route)
+    assert body == {
+        "quantity": 42,
+        "occurred_at": 1_700_000_000,
+        "metadata": {"source": "unit"},
+    }
+
+
+@respx.mock
+def test_usage_record_create_minimal_body_and_idempotency(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
+        return_value=httpx.Response(201, json={"id": "ur_1", "object": "usage_record"})
+    )
+    sync_client.subscriptions.create_usage_record("sub_1", quantity=1, idempotency_key="usage-1")
+    body = last_request_body(route)
+    assert body == {"quantity": 1}
+    assert route.calls.last.request.headers["Idempotency-Key"] == "usage-1"
+
+
+@respx.mock
+def test_usage_record_list_sync(sync_client: BillKit) -> None:
+    """List GETs the nested route and forwards the invoice_id filter."""
+    route = respx.get(
+        "https://test.billkit.eu/v1/subscriptions/sub_1/usage_records",
+        params={"invoice_id": "pending", "limit": "25"},
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"object": "list", "data": [{"id": "ur_1"}], "has_more": False}
+        )
+    )
+    page = sync_client.subscriptions.list_usage_records("sub_1", invoice_id="pending", limit=25)
+    assert page["data"][0]["id"] == "ur_1"
+    assert route.called
+
+
+@respx.mock
+def test_usage_record_iter_sync(sync_client: BillKit) -> None:
+    respx.get("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
+        return_value=httpx.Response(
+            200, json={"object": "list", "data": [{"id": "ur_1"}], "has_more": False}
+        )
+    )
+    assert [r["id"] for r in sync_client.subscriptions.iter_usage_records("sub_1")] == ["ur_1"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_usage_record_create_async(async_client: AsyncBillKit) -> None:
+    respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
+        return_value=httpx.Response(
+            201, json={"id": "ur_1", "object": "usage_record", "quantity": 7}
+        )
+    )
+    record = await async_client.subscriptions.create_usage_record("sub_1", quantity=7)
+    assert record["quantity"] == 7
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_usage_record_list_async(async_client: AsyncBillKit) -> None:
+    respx.get("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    page = await async_client.subscriptions.list_usage_records("sub_1")
+    assert page["object"] == "list"
+
+
+@respx.mock
+def test_prices_create_carries_usage_type(sync_client: BillKit) -> None:
+    """``usage_type="metered"`` reaches the create body; omitting it drops
+    the key so the server defaults to licensed."""
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(
+            200, json={"id": "price_1", "object": "price", "usage_type": "metered"}
+        )
+    )
+    sync_client.prices.create(
+        product_id="prod_api",
+        amount_cents=5,
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+    )
+    assert last_request_body(route)["usage_type"] == "metered"
+
+
+@respx.mock
+def test_prices_create_omits_usage_type_when_none(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price"})
+    )
+    sync_client.prices.create(
+        product_id="prod_1", amount_cents=999, currency="EUR", interval="month"
+    )
+    assert "usage_type" not in last_request_body(route)
+
+
+# ─── Price archival (POST /v1/prices/{id}) ────────────────────────
+
+
+@respx.mock
+def test_price_update_archives(sync_client: BillKit) -> None:
+    """``update(active=False)`` is the archive, and it returns the row.
+
+    The price stays readable, so callers read ``active`` off the
+    response instead of re-fetching. It was a ``DELETE`` until the verb
+    was corrected: nothing was ever deleted, and subscriptions renew
+    against the price by id.
+    """
+    route = respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price", "active": False})
+    )
+    archived = sync_client.prices.update("price_1", active=False)
+    assert archived["active"] is False
+    request = route.calls.last.request
+    assert request.method == "POST"
+    assert json.loads(request.read()) == {"active": False}
+    assert_idempotency_header(request)
+
+
+@respx.mock
+def test_price_update_honours_explicit_idempotency_key(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "active": False})
+    )
+    sync_client.prices.update("price_1", active=False, idempotency_key="archive-1")
+    assert route.calls.last.request.headers["Idempotency-Key"] == "archive-1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_price_update_async(async_client: AsyncBillKit) -> None:
+    respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "active": False})
+    )
+    archived = await async_client.prices.update("price_1", active=False)
+    assert archived["active"] is False
+
+
+@respx.mock
+def test_price_update_puts_a_price_back_on_sale(sync_client: BillKit) -> None:
+    """``active`` moves both ways.
+
+    It decides what new checkouts may buy and nothing else, so neither
+    direction can change what a past charge was made under, which is what
+    price immutability actually protects.
+    """
+    route = respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price", "active": True})
+    )
+    back = sync_client.prices.update("price_1", active=True)
+    assert back["active"] is True
+    assert json.loads(route.calls.last.request.read()) == {"active": True}
+
+
+def test_delete_is_only_where_the_object_leaves(
+    sync_client: BillKit, async_client: AsyncBillKit
+) -> None:
+    """The catalogue is retired through its update route.
+
+    Each of those used to carry a ``delete()``. None of them deleted
+    anything: every one of those rows stays readable afterwards, which
+    is why they have to. Customers and webhook endpoints really do leave
+    the API, so they keep the verb.
+    """
+    for client in (sync_client, async_client):
+        for name in ("prices", "products", "coupons", "tax_rates"):
+            resource = getattr(client, name)
+            assert not hasattr(resource, "delete"), f"{name}.delete should not exist"
+            assert hasattr(resource, "update")
+        assert hasattr(client.customers, "delete")
+        # Configuration, not a record of money: a mistyped URL is removed.
+        # Disabling stays beside it as the reversible act.
+        assert hasattr(client.webhook_endpoints, "delete")
+        assert hasattr(client.webhook_endpoints, "update")
+
+
+@respx.mock
+def test_delete_webhook_endpoint_sends_delete(sync_client: BillKit) -> None:
+    route = respx.delete("https://test.billkit.eu/v1/webhook_endpoints/we_1").mock(
+        return_value=httpx.Response(
+            200, json={"id": "we_1", "object": "webhook_endpoint", "deleted": True}
+        )
+    )
+    gone = sync_client.webhook_endpoints.delete("we_1", idempotency_key="drop-1")
+    assert gone["deleted"] is True
+    assert route.calls.last.request.headers["idempotency-key"] == "drop-1"
+
+
+# ─── Subscription list filters ────────────────────────────────────
+
+
+@respx.mock
+def test_subscription_list_sends_renewal_state(sync_client: BillKit) -> None:
+    """``renewal_state=paused`` is the only way to find paused rows.
+
+    Pausing sets ``renewal_state`` and leaves ``status`` at ``active``,
+    and the API rejects ``status=paused`` outright.
+    """
+    route = respx.get("https://test.billkit.eu/v1/subscriptions").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    sync_client.subscriptions.list(renewal_state="paused")
+    params = route.calls.last.request.url.params
+    assert params["renewal_state"] == "paused"
+    assert "status" not in params
+
+
+@respx.mock
+def test_subscription_list_sends_customer_and_csv_status(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/subscriptions").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    sync_client.subscriptions.list(customer_id="cus_1", status="active,past_due", limit=25)
+    params = route.calls.last.request.url.params
+    assert params["customer_id"] == "cus_1"
+    assert params["status"] == "active,past_due"
+    assert params["limit"] == "25"
+
+
+@respx.mock
+def test_subscription_iter_carries_filter_on_every_page(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/subscriptions").mock(
+        side_effect=[
+            httpx.Response(
+                200, json={"object": "list", "data": [{"id": "sub_1"}], "has_more": True}
+            ),
+            httpx.Response(
+                200, json={"object": "list", "data": [{"id": "sub_2"}], "has_more": False}
+            ),
+        ]
+    )
+    walked = [s["id"] for s in sync_client.subscriptions.iter(renewal_state="paused", page_size=1)]
+    assert walked == ["sub_1", "sub_2"]
+    assert all(c.request.url.params["renewal_state"] == "paused" for c in route.calls)
+    # Page 2 carries the cursor alongside the filter.
+    assert route.calls[1].request.url.params["starting_after"] == "sub_1"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_subscription_list_renewal_state_async(async_client: AsyncBillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/subscriptions").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    await async_client.subscriptions.list(renewal_state="paused,canceling")
+    assert route.calls.last.request.url.params["renewal_state"] == "paused,canceling"

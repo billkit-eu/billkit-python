@@ -49,12 +49,16 @@ def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
 
 
-def _list_params(
-    *, limit: int | None, starting_after: str | None, ending_before: str | None
-) -> dict[str, Any]:
-    return _drop_none(
-        {"limit": limit, "starting_after": starting_after, "ending_before": ending_before}
-    )
+def _list_params(*, limit: int | None, starting_after: str | None) -> dict[str, Any]:
+    """Build the query for a list call.
+
+    Deliberately only ``limit`` + ``starting_after``: BillKit's cursor
+    pagination is forward-only (``api/billkit/api/pagination.py`` binds
+    nothing else). An ``ending_before`` used to be accepted here and sent
+    on the wire, where the server ignored it and returned page 1 — a
+    backwards page that silently re-served the first one.
+    """
+    return _drop_none({"limit": limit, "starting_after": starting_after})
 
 
 # ─── Async resources ───────────────────────────────────────────────
@@ -168,6 +172,15 @@ class AsyncCustomers:
     async def delete(
         self, customer_id: str, *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
+        """Delete a customer. Returns ``{"id", "object", "deleted": True}``.
+
+        The customer leaves the API: :meth:`retrieve` 404s and they drop
+        out of :meth:`list`, which is why the response is a marker and
+        not the customer. Their payments, invoices and refunds are
+        untouched, and so is their personal data — :meth:`purge` is the
+        GDPR erasure. Refused while they hold a subscription that can
+        still charge them.
+        """
         return await self._t.request(
             "DELETE", f"/v1/customers/{customer_id}", idempotency_key=idempotency_key
         )
@@ -177,14 +190,11 @@ class AsyncCustomers:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/customers",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -245,10 +255,14 @@ class AsyncProducts:
         active: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Patch mutable product fields.
+        """Patch mutable product fields, or archive the product.
 
-        Pass only the fields you want to change. Use ``active=False``
-        to stop selling a product without deleting historical data.
+        Pass only the fields you want to change. ``active=False``
+        archives: the product stops being offered, a checkout against
+        any of its prices is refused, and it emits ``product.archived``.
+        It keeps its id and stays readable, because what was sold under
+        it has to be, which is why there is no delete. ``active=True``
+        un-archives.
         """
         body = _drop_none(
             {
@@ -266,28 +280,17 @@ class AsyncProducts:
             idempotency_key=idempotency_key,
         )
 
-    async def delete(
-        self, product_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
-        """Archive a product and return its final representation."""
-        return await self._t.request(
-            "DELETE", f"/v1/products/{product_id}", idempotency_key=idempotency_key
-        )
-
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         """List products in reverse creation order."""
         return await self._t.request(
             "GET",
             "/v1/products",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -315,6 +318,7 @@ class AsyncPrices:
         refund_window_initial_days: int | None = None,
         refund_window_renewal_days: int | None = None,
         tax_behavior: str | None = None,
+        usage_type: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Create a price for an existing product.
@@ -338,6 +342,15 @@ class AsyncPrices:
         rate configured for the buyer's country. Set it explicitly when
         the amount you advertise has to be the amount charged regardless
         of what tax rates exist now or later.
+
+        ``usage_type`` selects the billing model. ``"licensed"`` (the
+        default when ``None``) bills ``amount_cents`` per period
+        regardless of consumption. ``"metered"`` bills ``amount_cents``
+        **per reported unit**: post consumption with
+        :meth:`AsyncSubscriptions.create_usage_record` and the renewal
+        invoice charges ``amount_cents x sum(quantity)`` for the
+        period. Metered prices must be ``interval="month"``, carry
+        ``amount_cents > 0``, and cannot have ``trial_days``.
         """
         body = _drop_none(
             {
@@ -352,6 +365,7 @@ class AsyncPrices:
                 "refund_window_initial_days": refund_window_initial_days,
                 "refund_window_renewal_days": refund_window_renewal_days,
                 "tax_behavior": tax_behavior,
+                "usage_type": usage_type,
             }
         )
         return await self._t.request(
@@ -361,13 +375,41 @@ class AsyncPrices:
     async def retrieve(self, price_id: str) -> dict[str, Any]:
         return await self._t.request("GET", f"/v1/prices/{price_id}")
 
+    async def update(
+        self, price_id: str, *, active: bool, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Archive a price so it stops selling, or put it back on sale.
+
+        Pass ``active=False`` to archive. The price keeps its id and is
+        still returned by :meth:`retrieve` and :meth:`list`, because
+        subscriptions renew against it by id and what they are charged
+        has to stay readable. Subscriptions already on the price go on
+        renewing against it; what stops is new business, so a checkout
+        against it is refused and it is no longer offered as a plan
+        change.
+
+        Pass ``active=True`` to undo that. ``amount_cents``, ``currency``
+        and ``interval`` are fixed at creation and none of them move here,
+        so neither direction can change what a past charge was made under.
+        To charge something different, create a new price.
+
+        Sending the value a price already has returns it unchanged and
+        emits no second event, which makes a retry safe. Archiving emits
+        ``price.archived``; putting one back emits ``price.updated``.
+        """
+        return await self._t.request(
+            "POST",
+            f"/v1/prices/{price_id}",
+            json_body={"active": active},
+            idempotency_key=idempotency_key,
+        )
+
     async def list(
         self,
         *,
         product_id: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         """List prices, optionally narrowed to one product.
 
@@ -375,9 +417,7 @@ class AsyncPrices:
         /v1/prices?product_id=...``), which beats listing everything and
         filtering client-side once a tenant has more than a page of prices.
         """
-        params = _list_params(
-            limit=limit, starting_after=starting_after, ending_before=ending_before
-        )
+        params = _list_params(limit=limit, starting_after=starting_after)
         if product_id is not None:
             params["product_id"] = product_id
         return await self._t.request("GET", "/v1/prices", params=params)
@@ -562,21 +602,65 @@ class AsyncSubscriptions:
     async def list(
         self,
         *,
+        customer_id: str | None = None,
+        status: str | None = None,
+        renewal_state: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
-        return await self._t.request(
-            "GET",
-            "/v1/subscriptions",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
-        )
+        """List subscriptions, newest first, optionally filtered.
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
-        """Walk every page of ``list()`` and yield each subscription."""
-        return aiterate(self.list, page_size=page_size)
+        ``status`` and ``renewal_state`` each take a comma-separated
+        list (``status="active,past_due"``). An unrecognised value is a
+        400 naming the ones that work, rather than being ignored.
+
+        The two answer different questions, and confusing them is the
+        usual mistake here. ``status`` is where the subscription stands
+        with its payments: ``incomplete``, ``trialing``, ``active``,
+        ``past_due``, ``canceled``. ``renewal_state`` is what happens at
+        the end of the current period: ``auto_renew``, ``paused``,
+        ``canceling``, ``stopped``. A paused subscription still reads as
+        ``active``, because the customer has paid for the period they
+        are in, so ``renewal_state="paused"`` is how you find paused
+        ones. ``status="paused"`` is not accepted and raises
+        :class:`~billkit.InvalidRequestError`.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(
+            _drop_none(
+                {
+                    "customer_id": customer_id,
+                    "status": status,
+                    "renewal_state": renewal_state,
+                }
+            )
+        )
+        return await self._t.request("GET", "/v1/subscriptions", params=params)
+
+    def iter(
+        self,
+        *,
+        customer_id: str | None = None,
+        status: str | None = None,
+        renewal_state: str | None = None,
+        page_size: int | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Walk every page of ``list()`` and yield each subscription.
+
+        The filters are carried onto every page request, so a filtered
+        walk narrows server-side instead of paging the whole history and
+        discarding rows locally.
+        """
+
+        async def _bound(**kwargs: Any) -> dict[str, Any]:
+            return await self.list(
+                customer_id=customer_id,
+                status=status,
+                renewal_state=renewal_state,
+                **kwargs,
+            )
+
+        return aiterate(_bound, page_size=page_size)
 
     async def cancel(
         self, subscription_id: str, *, idempotency_key: str | None = None
@@ -622,9 +706,7 @@ class AsyncSubscriptions:
             idempotency_key=idempotency_key,
         )
 
-    async def preview_update(
-        self, subscription_id: str, *, target_price_id: str
-    ) -> dict[str, Any]:
+    async def preview_update(self, subscription_id: str, *, target_price_id: str) -> dict[str, Any]:
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{subscription_id}/preview_update",
@@ -658,6 +740,75 @@ class AsyncSubscriptions:
             json_body={"return_url": return_url},
             idempotency_key=idempotency_key,
         )
+
+    async def create_usage_record(
+        self,
+        subscription_id: str,
+        *,
+        quantity: int,
+        occurred_at: int | None = None,
+        metadata: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Report consumption against a metered subscription.
+
+        Only valid when the subscription's price is
+        ``usage_type="metered"``; a licensed subscription is rejected
+        with ``400 parameter_invalid``. Records accumulate until the
+        renewal invoice rolls them up (``amount_cents x sum(quantity)``);
+        the record's ``invoice_id`` stays ``None`` until then.
+
+        ``quantity`` is the number of units consumed (1..1_000_000).
+        ``occurred_at`` (epoch seconds) backdates batched reporting;
+        omit it to let the server stamp receipt time.
+
+        Supports ``Idempotency-Key`` replay: retrying with the same key
+        returns the same record instead of double-counting the usage,
+        which is what makes at-least-once reporting pipelines safe.
+        """
+        body = _drop_none({"quantity": quantity, "occurred_at": occurred_at, "metadata": metadata})
+        return await self._t.request(
+            "POST",
+            f"/v1/subscriptions/{subscription_id}/usage_records",
+            json_body=body,
+            idempotency_key=idempotency_key,
+        )
+
+    async def list_usage_records(
+        self,
+        subscription_id: str,
+        *,
+        invoice_id: str | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+    ) -> dict[str, Any]:
+        """List usage records for one subscription.
+
+        ``invoice_id`` filters by billing state: ``"pending"`` selects
+        records not yet rolled into an invoice, and a concrete invoice
+        id selects the records that invoice billed. ``None`` lists
+        everything.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        if invoice_id is not None:
+            params["invoice_id"] = invoice_id
+        return await self._t.request(
+            "GET", f"/v1/subscriptions/{subscription_id}/usage_records", params=params
+        )
+
+    def iter_usage_records(
+        self,
+        subscription_id: str,
+        *,
+        invoice_id: str | None = None,
+        page_size: int | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Walk every page of ``list_usage_records()`` for one subscription."""
+
+        async def _bound(**kwargs: Any) -> dict[str, Any]:
+            return await self.list_usage_records(subscription_id, invoice_id=invoice_id, **kwargs)
+
+        return aiterate(_bound, page_size=page_size)
 
 
 class AsyncRefunds:
@@ -701,14 +852,11 @@ class AsyncRefunds:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/refunds",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -737,14 +885,11 @@ class AsyncDisputes:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/disputes",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -787,6 +932,13 @@ class AsyncWebhookEndpoints:
         status: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Patch an endpoint, or stop delivery with ``status="disabled"``.
+
+        Disabling keeps the endpoint, its signing secret and its delivery
+        history, and ``status="enabled"`` resumes. Use :meth:`delete` when
+        the endpoint should not exist at all: disabling is reversible and
+        deleting is not.
+        """
         body = _drop_none(
             {
                 "url": url,
@@ -805,6 +957,18 @@ class AsyncWebhookEndpoints:
     async def delete(
         self, endpoint_id: str, *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
+        """Delete an endpoint. Returns ``{"deleted": True}``, not the endpoint.
+
+        A URL registered by mistake should not be a permanent fixture of
+        the account, so this removes it: :meth:`retrieve` 404s afterwards
+        and it is gone from :meth:`list`. Its delivery attempts go with
+        it, because they are readable only through the endpoint that owns
+        them. The events themselves are untouched and still in
+        ``client.events``, so what you were sent stays on record.
+
+        Use :meth:`update` with ``status="disabled"`` if you only want
+        delivery to stop.
+        """
         return await self._t.request(
             "DELETE",
             f"/v1/webhook_endpoints/{endpoint_id}",
@@ -825,14 +989,11 @@ class AsyncWebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/webhook_endpoints",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -845,7 +1006,6 @@ class AsyncWebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         """List per-attempt delivery records for one endpoint.
 
@@ -856,9 +1016,7 @@ class AsyncWebhookEndpoints:
         return await self._t.request(
             "GET",
             f"/v1/webhook_endpoints/{endpoint_id}/deliveries",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter_deliveries(
@@ -918,12 +1076,9 @@ class AsyncEvents:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
         type: str | None = None,
     ) -> dict[str, Any]:
-        params = _list_params(
-            limit=limit, starting_after=starting_after, ending_before=ending_before
-        )
+        params = _list_params(limit=limit, starting_after=starting_after)
         if type is not None:
             params["type"] = type
         return await self._t.request("GET", "/v1/events", params=params)
@@ -1067,6 +1222,13 @@ class AsyncCoupons:
         min_amount_cents: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Patch a coupon's limits, or withdraw it with ``active=False``.
+
+        A withdrawn code is refused at checkout while the coupon stays
+        readable and discounts already applied keep working out, which
+        is why there is no delete: a redeemed coupon is part of what a
+        customer was charged. ``active=True`` brings the campaign back.
+        """
         body = _drop_none(
             {
                 "active": active,
@@ -1081,13 +1243,6 @@ class AsyncCoupons:
             f"/v1/coupons/{coupon_id}",
             json_body=body,
             idempotency_key=idempotency_key,
-        )
-
-    async def delete(
-        self, coupon_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
-        return await self._t.request(
-            "DELETE", f"/v1/coupons/{coupon_id}", idempotency_key=idempotency_key
         )
 
     async def validate(
@@ -1121,14 +1276,11 @@ class AsyncCoupons:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/coupons",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -1175,6 +1327,13 @@ class AsyncTaxRates:
         active: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Correct a rate, retire it with ``active=False``, or bring one back.
+
+        Retiring is how you stop charging VAT in a country. The rate
+        stays readable, because an invoice records the percentage it
+        charged and you have to be able to point at the rate that
+        produced it, which is why there is no delete.
+        """
         body = _drop_none(
             {
                 "rate_basis_points": rate_basis_points,
@@ -1190,28 +1349,16 @@ class AsyncTaxRates:
             idempotency_key=idempotency_key,
         )
 
-    async def delete(
-        self, tax_rate_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
-        return await self._t.request(
-            "DELETE",
-            f"/v1/tax_rates/{tax_rate_id}",
-            idempotency_key=idempotency_key,
-        )
-
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/tax_rates",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -1238,14 +1385,11 @@ class AsyncInvoices:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/invoices",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -1266,14 +1410,11 @@ class AsyncAuditLogs:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
         action: str | None = None,
         resource_type: str | None = None,
         actor_id: str | None = None,
     ) -> dict[str, Any]:
-        params = _list_params(
-            limit=limit, starting_after=starting_after, ending_before=ending_before
-        )
+        params = _list_params(limit=limit, starting_after=starting_after)
         for key, value in (
             ("action", action),
             ("resource_type", resource_type),
@@ -1321,14 +1462,11 @@ class AsyncPayments:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return await self._t.request(
             "GET",
             "/v1/payments",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -1467,9 +1605,16 @@ class Customers:
             idempotency_key=idempotency_key,
         )
 
-    def delete(
-        self, customer_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+    def delete(self, customer_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Delete a customer. Returns ``{"id", "object", "deleted": True}``.
+
+        The customer leaves the API: :meth:`retrieve` 404s and they drop
+        out of :meth:`list`, which is why the response is a marker and
+        not the customer. Their payments, invoices and refunds are
+        untouched, and so is their personal data — :meth:`purge` is the
+        GDPR erasure. Refused while they hold a subscription that can
+        still charge them.
+        """
         return self._t.request(
             "DELETE", f"/v1/customers/{customer_id}", idempotency_key=idempotency_key
         )
@@ -1479,14 +1624,11 @@ class Customers:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/customers",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -1558,26 +1700,17 @@ class Products:
             idempotency_key=idempotency_key,
         )
 
-    def delete(self, product_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
-        """Archive a product and return its final representation."""
-        return self._t.request(
-            "DELETE", f"/v1/products/{product_id}", idempotency_key=idempotency_key
-        )
-
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         """List products in reverse creation order."""
         return self._t.request(
             "GET",
             "/v1/products",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -1605,6 +1738,7 @@ class Prices:
         refund_window_initial_days: int | None = None,
         refund_window_renewal_days: int | None = None,
         tax_behavior: str | None = None,
+        usage_type: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Create a price for an existing product. See :class:`AsyncPrices`."""
@@ -1621,6 +1755,7 @@ class Prices:
                 "refund_window_initial_days": refund_window_initial_days,
                 "refund_window_renewal_days": refund_window_renewal_days,
                 "tax_behavior": tax_behavior,
+                "usage_type": usage_type,
             }
         )
         return self._t.request(
@@ -1630,13 +1765,23 @@ class Prices:
     def retrieve(self, price_id: str) -> dict[str, Any]:
         return self._t.request("GET", f"/v1/prices/{price_id}")
 
+    def update(
+        self, price_id: str, *, active: bool, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Archive a price, or put it back on sale. See :class:`AsyncPrices`."""
+        return self._t.request(
+            "POST",
+            f"/v1/prices/{price_id}",
+            json_body={"active": active},
+            idempotency_key=idempotency_key,
+        )
+
     def list(
         self,
         *,
         product_id: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         """List prices, optionally narrowed to one product.
 
@@ -1644,9 +1789,7 @@ class Prices:
         /v1/prices?product_id=...``), which beats listing everything and
         filtering client-side once a tenant has more than a page of prices.
         """
-        params = _list_params(
-            limit=limit, starting_after=starting_after, ending_before=ending_before
-        )
+        params = _list_params(limit=limit, starting_after=starting_after)
         if product_id is not None:
             params["product_id"] = product_id
         return self._t.request("GET", "/v1/prices", params=params)
@@ -1763,43 +1906,64 @@ class Subscriptions:
     def list(
         self,
         *,
+        customer_id: str | None = None,
+        status: str | None = None,
+        renewal_state: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
-        return self._t.request(
-            "GET",
-            "/v1/subscriptions",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+        """List subscriptions, newest first. See :class:`AsyncSubscriptions`.
+
+        Paused subscriptions are found with ``renewal_state="paused"``;
+        ``status="paused"`` is not an accepted value.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(
+            _drop_none(
+                {
+                    "customer_id": customer_id,
+                    "status": status,
+                    "renewal_state": renewal_state,
+                }
+            )
         )
+        return self._t.request("GET", "/v1/subscriptions", params=params)
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        customer_id: str | None = None,
+        status: str | None = None,
+        renewal_state: str | None = None,
+        page_size: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
         """Walk every page of ``list()`` and yield each subscription."""
-        return paginate(self.list, page_size=page_size)
 
-    def cancel(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        def _bound(**kwargs: Any) -> dict[str, Any]:
+            return self.list(
+                customer_id=customer_id,
+                status=status,
+                renewal_state=renewal_state,
+                **kwargs,
+            )
+
+        return paginate(_bound, page_size=page_size)
+
+    def cancel(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{subscription_id}/cancel",
             idempotency_key=idempotency_key,
         )
 
-    def pause(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+    def pause(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{subscription_id}/pause",
             idempotency_key=idempotency_key,
         )
 
-    def resume(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+    def resume(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{subscription_id}/resume",
@@ -1821,9 +1985,7 @@ class Subscriptions:
             idempotency_key=idempotency_key,
         )
 
-    def preview_update(
-        self, subscription_id: str, *, target_price_id: str
-    ) -> dict[str, Any]:
+    def preview_update(self, subscription_id: str, *, target_price_id: str) -> dict[str, Any]:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{subscription_id}/preview_update",
@@ -1857,6 +2019,56 @@ class Subscriptions:
             json_body={"return_url": return_url},
             idempotency_key=idempotency_key,
         )
+
+    def create_usage_record(
+        self,
+        subscription_id: str,
+        *,
+        quantity: int,
+        occurred_at: int | None = None,
+        metadata: dict[str, str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Report consumption against a metered subscription.
+        See :meth:`AsyncSubscriptions.create_usage_record`."""
+        body = _drop_none({"quantity": quantity, "occurred_at": occurred_at, "metadata": metadata})
+        return self._t.request(
+            "POST",
+            f"/v1/subscriptions/{subscription_id}/usage_records",
+            json_body=body,
+            idempotency_key=idempotency_key,
+        )
+
+    def list_usage_records(
+        self,
+        subscription_id: str,
+        *,
+        invoice_id: str | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+    ) -> dict[str, Any]:
+        """List usage records for one subscription.
+        See :meth:`AsyncSubscriptions.list_usage_records`."""
+        params = _list_params(limit=limit, starting_after=starting_after)
+        if invoice_id is not None:
+            params["invoice_id"] = invoice_id
+        return self._t.request(
+            "GET", f"/v1/subscriptions/{subscription_id}/usage_records", params=params
+        )
+
+    def iter_usage_records(
+        self,
+        subscription_id: str,
+        *,
+        invoice_id: str | None = None,
+        page_size: int | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Walk every page of ``list_usage_records()`` for one subscription."""
+
+        def _bound(**kwargs: Any) -> dict[str, Any]:
+            return self.list_usage_records(subscription_id, invoice_id=invoice_id, **kwargs)
+
+        return paginate(_bound, page_size=page_size)
 
 
 class Refunds:
@@ -1900,14 +2112,11 @@ class Refunds:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/refunds",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -1936,14 +2145,11 @@ class Disputes:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/disputes",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -2001,9 +2207,8 @@ class WebhookEndpoints:
             idempotency_key=idempotency_key,
         )
 
-    def delete(
-        self, endpoint_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+    def delete(self, endpoint_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Delete an endpoint. See :class:`AsyncWebhookEndpoints`."""
         return self._t.request(
             "DELETE",
             f"/v1/webhook_endpoints/{endpoint_id}",
@@ -2024,14 +2229,11 @@ class WebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/webhook_endpoints",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -2044,15 +2246,12 @@ class WebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         """List per-attempt delivery records for one endpoint."""
         return self._t.request(
             "GET",
             f"/v1/webhook_endpoints/{endpoint_id}/deliveries",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter_deliveries(
@@ -2111,12 +2310,9 @@ class Events:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
         type: str | None = None,
     ) -> dict[str, Any]:
-        params = _list_params(
-            limit=limit, starting_after=starting_after, ending_before=ending_before
-        )
+        params = _list_params(limit=limit, starting_after=starting_after)
         if type is not None:
             params["type"] = type
         return self._t.request("GET", "/v1/events", params=params)
@@ -2254,11 +2450,6 @@ class Coupons:
             idempotency_key=idempotency_key,
         )
 
-    def delete(self, coupon_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
-        return self._t.request(
-            "DELETE", f"/v1/coupons/{coupon_id}", idempotency_key=idempotency_key
-        )
-
     def validate(
         self,
         *,
@@ -2283,14 +2474,11 @@ class Coupons:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/coupons",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -2352,24 +2540,16 @@ class TaxRates:
             idempotency_key=idempotency_key,
         )
 
-    def delete(self, tax_rate_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
-        return self._t.request(
-            "DELETE", f"/v1/tax_rates/{tax_rate_id}", idempotency_key=idempotency_key
-        )
-
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/tax_rates",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -2390,14 +2570,11 @@ class Invoices:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/invoices",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -2418,14 +2595,11 @@ class AuditLogs:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
         action: str | None = None,
         resource_type: str | None = None,
         actor_id: str | None = None,
     ) -> dict[str, Any]:
-        params = _list_params(
-            limit=limit, starting_after=starting_after, ending_before=ending_before
-        )
+        params = _list_params(limit=limit, starting_after=starting_after)
         for key, value in (
             ("action", action),
             ("resource_type", resource_type),
@@ -2466,14 +2640,11 @@ class Payments:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        ending_before: str | None = None,
     ) -> dict[str, Any]:
         return self._t.request(
             "GET",
             "/v1/payments",
-            params=_list_params(
-                limit=limit, starting_after=starting_after, ending_before=ending_before
-            ),
+            params=_list_params(limit=limit, starting_after=starting_after),
         )
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -2500,9 +2671,7 @@ class BillingPortalSessions:
             idempotency_key=idempotency_key,
         )
 
-    def revoke(
-        self, session_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+    def revoke(self, session_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         return self._t.request(
             "POST",
             f"/v1/billing_portal/sessions/{session_id}/revoke",

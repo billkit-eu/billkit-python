@@ -41,9 +41,7 @@ def test_str_payload_accepted(sample_event_body: bytes, webhook_secret: str) -> 
     assert event["id"] == "evt_1"
 
 
-def test_replay_outside_tolerance_rejected(
-    sample_event_body: bytes, webhook_secret: str
-) -> None:
+def test_replay_outside_tolerance_rejected(sample_event_body: bytes, webhook_secret: str) -> None:
     stale_header = _sign(sample_event_body, webhook_secret, ts=int(time.time()) - 600)
     with pytest.raises(WebhookVerificationError, match="tolerance"):
         WebhookSignature.verify(
@@ -53,9 +51,7 @@ def test_replay_outside_tolerance_rejected(
         )
 
 
-def test_tampered_body_rejected(
-    sample_event_body: bytes, webhook_secret: str
-) -> None:
+def test_tampered_body_rejected(sample_event_body: bytes, webhook_secret: str) -> None:
     header = _sign(sample_event_body, webhook_secret)
     tampered = sample_event_body.replace(b"cus_1", b"cus_9")
     with pytest.raises(WebhookVerificationError, match="mismatch"):
@@ -66,9 +62,7 @@ def test_tampered_body_rejected(
         )
 
 
-def test_wrong_secret_rejected(
-    sample_event_body: bytes, webhook_secret: str
-) -> None:
+def test_wrong_secret_rejected(sample_event_body: bytes, webhook_secret: str) -> None:
     header = _sign(sample_event_body, webhook_secret)
     with pytest.raises(WebhookVerificationError, match="mismatch"):
         WebhookSignature.verify(
@@ -78,9 +72,7 @@ def test_wrong_secret_rejected(
         )
 
 
-def test_missing_header_rejected(
-    sample_event_body: bytes, webhook_secret: str
-) -> None:
+def test_missing_header_rejected(sample_event_body: bytes, webhook_secret: str) -> None:
     with pytest.raises(WebhookVerificationError, match="Missing"):
         WebhookSignature.verify(
             payload=sample_event_body,
@@ -89,9 +81,7 @@ def test_missing_header_rejected(
         )
 
 
-def test_malformed_header_rejected(
-    sample_event_body: bytes, webhook_secret: str
-) -> None:
+def test_malformed_header_rejected(sample_event_body: bytes, webhook_secret: str) -> None:
     with pytest.raises(WebhookVerificationError, match="Malformed"):
         WebhookSignature.verify(
             payload=sample_event_body,
@@ -100,9 +90,7 @@ def test_malformed_header_rejected(
         )
 
 
-def test_malformed_v1_hex_rejected(
-    sample_event_body: bytes, webhook_secret: str
-) -> None:
+def test_malformed_v1_hex_rejected(sample_event_body: bytes, webhook_secret: str) -> None:
     header = f"t={int(time.time())},v1={'z' * 64}"
     with pytest.raises(WebhookVerificationError, match="Malformed"):
         WebhookSignature.verify(
@@ -118,9 +106,7 @@ def test_non_json_body_rejected_after_signature_passes(
     body = b"<html>not json</html>"
     header = _sign(body, webhook_secret)
     with pytest.raises(WebhookVerificationError, match="JSON"):
-        WebhookSignature.verify(
-            payload=body, signature_header=header, secret=webhook_secret
-        )
+        WebhookSignature.verify(payload=body, signature_header=header, secret=webhook_secret)
 
 
 def test_accepts_when_any_of_multiple_v1_matches(
