@@ -9,6 +9,7 @@ resource hits the right path with the right body / params shape."""
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -854,3 +855,244 @@ async def test_subscription_list_renewal_state_async(async_client: AsyncBillKit)
     )
     await async_client.subscriptions.list(renewal_state="paused,canceling")
     assert route.calls.last.request.url.params["renewal_state"] == "paused,canceling"
+
+
+# ─── Metered pricing: sub-cent rates, tiers, dedupe, summary ───────
+#
+# The one thing in this section that can silently corrupt money is the
+# decimal rate reaching the wire as a JSON number, so that is asserted on
+# the raw bytes rather than on the decoded body.
+
+
+@respx.mock
+def test_price_create_sends_unit_amount_decimal_as_a_string(sync_client: BillKit) -> None:
+    """€0.0002 per unit: 0.02 cents, which no integer can express.
+
+    Asserted against the raw request bytes because the risk is exactly
+    that it serialises as a JSON number. A reader parsing `0.02` into a
+    double gets a value that is not 0.02, and the rate is wrong before it
+    has been multiplied by anything.
+    """
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(
+            200, json={"id": "price_1", "object": "price", "unit_amount_decimal": "0.02"}
+        )
+    )
+    sync_client.prices.create(
+        product_id="prod_api",
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+        unit_amount_decimal="0.02",
+    )
+    raw = route.calls.last.request.read().decode()
+    assert '"unit_amount_decimal":"0.02"' in raw.replace(" ", "")
+    body = last_request_body(route)
+    assert body["unit_amount_decimal"] == "0.02"
+    # A price priced by the decimal sends no integer amount at all.
+    assert "amount_cents" not in body
+
+
+@respx.mock
+def test_price_create_accepts_a_decimal_without_exponent_notation(sync_client: BillKit) -> None:
+    """``str(Decimal("1E-12"))`` is "1E-12", which the API refuses.
+
+    It refuses it because an echoed "0.000000000001" would not be the
+    string the caller sent, so the SDK formats with ``f`` instead.
+    """
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price"})
+    )
+    sync_client.prices.create(
+        product_id="prod_api",
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+        unit_amount_decimal=Decimal("0.000000000001"),
+    )
+    assert last_request_body(route)["unit_amount_decimal"] == "0.000000000001"
+
+
+@respx.mock
+def test_price_create_refuses_a_float_rate(sync_client: BillKit) -> None:
+    """Refused rather than coerced, and refused before any HTTP call.
+
+    Coercing would work for the values that happen to round-trip through a
+    double and silently mis-price the ones that do not, which is the worst
+    of the three available behaviours.
+    """
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(200, json={"id": "price_1"})
+    )
+    with pytest.raises(TypeError) as excinfo:
+        sync_client.prices.create(
+            product_id="prod_api",
+            currency="EUR",
+            interval="month",
+            usage_type="metered",
+            unit_amount_decimal=0.0002,  # type: ignore[arg-type]
+        )
+    assert "float" in str(excinfo.value)
+    assert not route.called
+
+
+@respx.mock
+def test_price_create_sends_a_tier_table(sync_client: BillKit) -> None:
+    """Bands round-trip as sent, including ``up_to: "inf"`` on the last."""
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price"})
+    )
+    sync_client.prices.create(
+        product_id="prod_api",
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+        billing_scheme="tiered",
+        tiers_mode="graduated",
+        tiers=[
+            {"up_to": 1000, "unit_amount": 1},
+            {"up_to": "inf", "unit_amount_decimal": Decimal("0.5"), "flat_amount": 500},
+        ],
+    )
+    body = last_request_body(route)
+    assert body["billing_scheme"] == "tiered"
+    assert body["tiers_mode"] == "graduated"
+    assert body["tiers"] == [
+        {"up_to": 1000, "unit_amount": 1},
+        {"up_to": "inf", "unit_amount_decimal": "0.5", "flat_amount": 500},
+    ]
+
+
+@respx.mock
+def test_tier_normalisation_does_not_mutate_the_callers_table(sync_client: BillKit) -> None:
+    """A price definition is usually a module constant, so rewriting its
+    dicts in place would change what the NEXT call sends."""
+    respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(200, json={"id": "price_1"})
+    )
+    tiers = [{"up_to": "inf", "unit_amount_decimal": Decimal("0.5")}]
+    sync_client.prices.create(
+        product_id="prod_api",
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+        billing_scheme="tiered",
+        tiers_mode="volume",
+        tiers=tiers,
+    )
+    assert tiers == [{"up_to": "inf", "unit_amount_decimal": Decimal("0.5")}]
+
+
+@respx.mock
+def test_price_create_refuses_a_float_inside_a_tier(sync_client: BillKit) -> None:
+    """The guard has to reach inside the table too — that is where a rate
+    is most likely to be typed as a literal."""
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(200, json={"id": "price_1"})
+    )
+    with pytest.raises(TypeError) as excinfo:
+        sync_client.prices.create(
+            product_id="prod_api",
+            currency="EUR",
+            interval="month",
+            usage_type="metered",
+            billing_scheme="tiered",
+            tiers_mode="graduated",
+            tiers=[{"up_to": "inf", "unit_amount_decimal": 0.5}],
+        )
+    assert "tiers[0].unit_amount_decimal" in str(excinfo.value)
+    assert not route.called
+
+
+@respx.mock
+def test_price_create_carries_refund_on_cancel(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(
+            200, json={"id": "price_1", "object": "price", "refund_on_cancel": "prorated"}
+        )
+    )
+    sync_client.prices.create(
+        product_id="prod_1",
+        amount_cents=1499,
+        currency="EUR",
+        interval="month",
+        refund_on_cancel="prorated",
+    )
+    assert last_request_body(route)["refund_on_cancel"] == "prorated"
+
+
+@respx.mock
+def test_usage_record_create_carries_identifier(sync_client: BillKit) -> None:
+    """The dedupe the Idempotency-Key cannot do.
+
+    A job runner replaying its own task sends a NEW request with a NEW
+    key, so only a natural key stops the second report being a second
+    charge.
+    """
+    route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
+        return_value=httpx.Response(
+            201, json={"id": "ur_1", "object": "usage_record", "identifier": "job-42"}
+        )
+    )
+    sync_client.subscriptions.create_usage_record("sub_1", quantity=10, identifier="job-42")
+    assert last_request_body(route) == {"quantity": 10, "identifier": "job-42"}
+
+
+@respx.mock
+def test_usage_record_create_omits_identifier_when_none(sync_client: BillKit) -> None:
+    """Dedupe is opt-in: two identical reports at different times are
+    legitimately two records."""
+    route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
+        return_value=httpx.Response(201, json={"id": "ur_1"})
+    )
+    sync_client.subscriptions.create_usage_record("sub_1", quantity=10)
+    assert "identifier" not in last_request_body(route)
+
+
+@respx.mock
+def test_usage_summary_sync(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/subscriptions/sub_1/usage_summary").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "object": "usage_summary",
+                "pending_quantity": 3,
+                "gross_cents": 15,
+                "will_charge": False,
+                "minimum_charge_cents": 100,
+            },
+        )
+    )
+    summary = sync_client.subscriptions.retrieve_usage_summary("sub_1")
+    assert summary["object"] == "usage_summary"
+    # The point of the endpoint: €0.15 of usage will not be charged this
+    # cycle, and the caller can see that before promising an amount.
+    assert summary["will_charge"] is False
+    assert route.called
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_usage_summary_async(async_client: AsyncBillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/subscriptions/sub_1/usage_summary").mock(
+        return_value=httpx.Response(200, json={"object": "usage_summary", "will_charge": True})
+    )
+    summary = await async_client.subscriptions.retrieve_usage_summary("sub_1")
+    assert summary["will_charge"] is True
+    assert route.called
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_price_create_metered_decimal_async(async_client: AsyncBillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price"})
+    )
+    await async_client.prices.create(
+        product_id="prod_api",
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+        unit_amount_decimal="0.02",
+    )
+    assert last_request_body(route)["unit_amount_decimal"] == "0.02"

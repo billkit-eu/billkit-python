@@ -14,6 +14,7 @@ same method signatures so code reading either side feels the same.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
+from decimal import Decimal
 from typing import Any, Protocol
 
 from billkit._pagination import aiterate, paginate
@@ -47,6 +48,61 @@ class _SyncRequester(Protocol):
 
 def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _decimal_field(value: str | int | Decimal, *, field: str) -> str:
+    """Render a sub-minor-unit rate as the string the API requires.
+
+    The API takes these rates as **strings** and returns them as strings,
+    and that is not a stylistic choice: a rate like 0.0002 has no exact
+    binary form, so the moment it becomes a float it is a different
+    number. JSON has only floats, which is why the field never travels as
+    a JSON number in either direction.
+
+    A ``float`` argument is therefore refused outright rather than
+    coerced. Accepting one would work for the values that happen to
+    round-trip and silently mis-price the ones that do not, which is the
+    worst of the three possible behaviours.
+
+    ``Decimal`` is formatted with ``f`` rather than ``str()``: ``str()``
+    renders small values in exponent notation (``1E-12``), which the API
+    rejects because "1E-12" echoed back as "0.000000000001" would not be
+    the string the caller sent.
+    """
+    if isinstance(value, float):
+        raise TypeError(
+            f"{field} must be a str, int or Decimal, not a float. A float cannot hold "
+            "a rate like 0.0002 exactly, so it would be corrupted before it was ever "
+            f'multiplied by a quantity. Pass it as a string: "{value!r}".'
+        )
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"{field} must be a finite decimal, got {value!r}.")
+        return format(value, "f")
+    if isinstance(value, bool):
+        raise TypeError(f"{field} must be a str, int or Decimal, not a bool.")
+    if isinstance(value, int):
+        return str(value)
+    return value
+
+
+def _normalize_tiers(tiers: list[dict[str, Any]], *, field: str) -> list[dict[str, Any]]:
+    """Copy a tier table, rendering each band's decimal rate as a string.
+
+    Copies rather than mutates: the caller's price definition is often a
+    module-level constant, and rewriting its dicts in place would change
+    what the *next* call sends.
+    """
+    out: list[dict[str, Any]] = []
+    for index, tier in enumerate(tiers):
+        band = dict(tier)
+        raw = band.get("unit_amount_decimal")
+        if raw is not None:
+            band["unit_amount_decimal"] = _decimal_field(
+                raw, field=f"{field}[{index}].unit_amount_decimal"
+            )
+        out.append(band)
+    return out
 
 
 def _list_params(*, limit: int | None, starting_after: str | None) -> dict[str, Any]:
@@ -190,12 +246,21 @@ class AsyncCustomers:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        provisional: bool | None = None,
     ) -> dict[str, Any]:
-        return await self._t.request(
-            "GET",
-            "/v1/customers",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List customers, newest first.
+
+        ``provisional`` filters on whether the customer ever completed a
+        payment. A checkout that captures an email commits its Customer
+        before the charge, so a checkout nobody finished leaves a row
+        behind: pass ``False`` for real customers only, ``True`` for the
+        abandoned ones (the cart-recovery worklist), or omit for both.
+        Abandoned rows are swept after the tenant's retention window.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        if provisional is not None:
+            params["provisional"] = "true" if provisional else "false"
+        return await self._t.request("GET", "/v1/customers", params=params)
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
         """Walk every page of ``list()`` and yield each customer.
@@ -225,15 +290,25 @@ class AsyncProducts:
         description: str | None = None,
         marketing_features: list[str] | None = None,
         metadata: dict[str, str] | None = None,
+        allow_promotion_codes: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create a catalog product and return the product object."""
+        """Create a catalog product and return the product object.
+
+        ``allow_promotion_codes`` lets a *buyer* type a coupon code at the
+        embedded checkout for this product. Defaults to ``False``. A coupon
+        you apply yourself, by passing ``coupon_code`` when you create a
+        Checkout Session, is unaffected — that is you discounting your own
+        sale. Either way the code is redeemed only once the payment
+        settles, so an abandoned checkout never uses one up.
+        """
         body = _drop_none(
             {
                 "name": name,
                 "description": description,
                 "marketing_features": marketing_features,
                 "metadata": metadata,
+                "allow_promotion_codes": allow_promotion_codes,
             }
         )
         return await self._t.request(
@@ -253,6 +328,7 @@ class AsyncProducts:
         marketing_features: list[str] | None = None,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
+        allow_promotion_codes: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Patch mutable product fields, or archive the product.
@@ -271,6 +347,7 @@ class AsyncProducts:
                 "marketing_features": marketing_features,
                 "metadata": metadata,
                 "active": active,
+                "allow_promotion_codes": allow_promotion_codes,
             }
         )
         return await self._t.request(
@@ -308,13 +385,18 @@ class AsyncPrices:
         self,
         *,
         product_id: str,
-        amount_cents: int,
+        amount_cents: int | None = None,
         currency: str,
         interval: str,
+        unit_amount_decimal: str | int | Decimal | None = None,
+        billing_scheme: str | None = None,
+        tiers_mode: str | None = None,
+        tiers: list[dict[str, Any]] | None = None,
         metadata: dict[str, str] | None = None,
         trial_days: int | None = None,
         trial_verification_cents: int | None = None,
         payment_methods: list[str] | None = None,
+        refund_on_cancel: str | None = None,
         refund_window_initial_days: int | None = None,
         refund_window_renewal_days: int | None = None,
         tax_behavior: str | None = None,
@@ -343,25 +425,88 @@ class AsyncPrices:
         the amount you advertise has to be the amount charged regardless
         of what tax rates exist now or later.
 
+        ``refund_on_cancel`` decides what a cancellation refunds without
+        being asked: ``"none"`` (the default) nothing, ``"full"`` the whole
+        last charge, ``"prorated"`` the unused part of the current period.
+        Both non-none modes also end access immediately, and both are still
+        bounded by the refund window. Metered prices must leave this at
+        ``"none"`` — see below.
+
         ``usage_type`` selects the billing model. ``"licensed"`` (the
         default when ``None``) bills ``amount_cents`` per period
-        regardless of consumption. ``"metered"`` bills ``amount_cents``
-        **per reported unit**: post consumption with
-        :meth:`AsyncSubscriptions.create_usage_record` and the renewal
-        invoice charges ``amount_cents x sum(quantity)`` for the
-        period. Metered prices must be ``interval="month"``, carry
-        ``amount_cents > 0``, and cannot have ``trial_days``.
+        regardless of consumption. ``"metered"`` bills **per reported
+        unit**: post consumption with
+        :meth:`AsyncSubscriptions.create_usage_record`, and at each period
+        close BillKit invoices the period's total and charges the stored
+        mandate. Metered prices must be ``interval="month"``, cannot have
+        ``trial_days``, and cannot set ``refund_on_cancel`` (ending access
+        mid-period would strand usage that has not been billed yet).
+
+        **Three ways to price a metered unit**, and exactly one of them per
+        price:
+
+        ``amount_cents``
+            Whole minor units per unit. ``amount_cents=5`` is €0.05 each.
+
+        ``unit_amount_decimal``
+            A rate finer than one minor unit, in minor units, to 12 decimal
+            places. ``"0.02"`` is 0.02 cents, i.e. €0.0002 per unit — the
+            canonical per-API-call price, and not expressible as an integer.
+            Pass a ``str``, an ``int`` or a ``Decimal``; a ``float`` raises
+            ``TypeError``, because a float cannot hold 0.0002 exactly and
+            would corrupt the rate before it was ever multiplied. The period's
+            whole quantity is multiplied by the rate and rounded **once**, at
+            the invoice.
+
+        ``billing_scheme="tiered"`` with ``tiers`` and ``tiers_mode``
+            Price by bands. ``tiers_mode="graduated"`` prices the units
+            inside each band; ``"volume"`` lets the period total pick one
+            band which then prices every unit. The same table under the two
+            modes is a different bill, so the mode is required rather than
+            defaulted. Each band is a dict: ``up_to`` (a positive int, or
+            ``"inf"`` on the last band, which is mandatory because a bounded
+            top band cannot price the usage above it), plus ``unit_amount``
+            (whole minor units), ``unit_amount_decimal`` (same float rule as
+            above) and/or ``flat_amount`` charged once for reaching the band.
+            Write a free band as ``unit_amount=0``. A tiered price sends no
+            ``amount_cents``::
+
+                await client.prices.create(
+                    product_id="prod_api",
+                    currency="EUR",
+                    interval="month",
+                    usage_type="metered",
+                    billing_scheme="tiered",
+                    tiers_mode="graduated",
+                    tiers=[
+                        {"up_to": 1000, "unit_amount": 1},
+                        {"up_to": "inf", "unit_amount_decimal": "0.5"},
+                    ],
+                )
+
+        ``amount_cents`` is keyword-optional for that reason, not because it
+        is optional in general: a price with none of the three is refused
+        server-side with ``parameter_missing``.
         """
         body = _drop_none(
             {
                 "product_id": product_id,
                 "amount_cents": amount_cents,
+                "unit_amount_decimal": (
+                    None
+                    if unit_amount_decimal is None
+                    else _decimal_field(unit_amount_decimal, field="unit_amount_decimal")
+                ),
                 "currency": currency,
                 "interval": interval,
+                "billing_scheme": billing_scheme,
+                "tiers_mode": tiers_mode,
+                "tiers": None if tiers is None else _normalize_tiers(tiers, field="tiers"),
                 "metadata": metadata,
                 "trial_days": trial_days,
                 "trial_verification_cents": trial_verification_cents,
                 "payment_methods": payment_methods,
+                "refund_on_cancel": refund_on_cancel,
                 "refund_window_initial_days": refund_window_initial_days,
                 "refund_window_renewal_days": refund_window_renewal_days,
                 "tax_behavior": tax_behavior,
@@ -462,8 +607,9 @@ class AsyncCheckoutSessions:
         and is carried onto the auto-created Customer row; rename an
         existing customer via ``customers.update`` instead.
 
-        ``method`` pins the Mollie payment method (``"creditcard"`` or
-        ``"directdebit"``); ``None`` lets Mollie pick. ``coupon_code`` is
+        ``method`` pins the Mollie payment method (``"creditcard"``,
+        ``"directdebit"``, ``"ideal"`` or ``"applepay"``); ``None`` lets
+        Mollie pick. ``coupon_code`` is
         atomically claimed at session creation. ``trial_days_override``
         replaces the price's trial for this session only and is server
         capped at ``2 * max(price.trial_days, 14)`` (``0`` disables a
@@ -747,6 +893,7 @@ class AsyncSubscriptions:
         *,
         quantity: int,
         occurred_at: int | None = None,
+        identifier: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -754,19 +901,42 @@ class AsyncSubscriptions:
 
         Only valid when the subscription's price is
         ``usage_type="metered"``; a licensed subscription is rejected
-        with ``400 parameter_invalid``. Records accumulate until the
-        renewal invoice rolls them up (``amount_cents x sum(quantity)``);
-        the record's ``invoice_id`` stays ``None`` until then.
+        with ``400 parameter_invalid``. Records accumulate until the next
+        period close rolls them into one invoice line; the record's
+        ``invoice_id`` stays ``None`` until then.
 
         ``quantity`` is the number of units consumed (1..1_000_000).
         ``occurred_at`` (epoch seconds) backdates batched reporting;
         omit it to let the server stamp receipt time.
 
-        Supports ``Idempotency-Key`` replay: retrying with the same key
-        returns the same record instead of double-counting the usage,
-        which is what makes at-least-once reporting pipelines safe.
+        **Two dedupe mechanisms, for two different failures**, and they are
+        not interchangeable:
+
+        ``idempotency_key``
+            Covers a retry of *this HTTP request*. The SDK generates one
+            per call and reuses it across its own retries, so a timeout
+            inside :mod:`billkit` can never double-count.
+
+        ``identifier``
+            Covers a retry of *your own call* — a job runner replaying a
+            task, a queue delivering twice, your code re-invoking after its
+            own timeout. Those arrive at the API as a genuinely new request
+            with a new key, so the transport-level key cannot see them.
+            Pass the id of whatever you are metering; it is unique within
+            the subscription, and a second report of the same identifier
+            returns the first record unchanged rather than billing twice.
+
+        If your reporting pipeline is at-least-once, ``identifier`` is the
+        one that matters.
         """
-        body = _drop_none({"quantity": quantity, "occurred_at": occurred_at, "metadata": metadata})
+        body = _drop_none(
+            {
+                "quantity": quantity,
+                "occurred_at": occurred_at,
+                "identifier": identifier,
+                "metadata": metadata,
+            }
+        )
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{subscription_id}/usage_records",
@@ -809,6 +979,27 @@ class AsyncSubscriptions:
             return await self.list_usage_records(subscription_id, invoice_id=invoice_id, **kwargs)
 
         return aiterate(_bound, page_size=page_size)
+
+    async def retrieve_usage_summary(self, subscription_id: str) -> dict[str, Any]:
+        """Price the usage that is pending, before the close bills it.
+
+        :meth:`list_usage_records` with ``invoice_id="pending"`` tells you
+        the quantity. This tells you the money: ``pending_quantity`` and
+        ``pending_record_count``, then ``net_cents`` / ``tax_cents`` /
+        ``gross_cents`` computed through the same rate or tier table and the
+        same VAT resolution the close itself uses.
+
+        Read ``will_charge`` before you promise a customer an amount. A
+        period whose total is under ``minimum_charge_cents`` (€1.00) is not
+        charged at all, because the payment provider would refuse it. The
+        usage is **not** lost: it stays pending and rolls into the next
+        period, which is then billed for both. Without this field the only
+        record of that decision was a server log line.
+
+        ``open_invoice_id`` names an earlier cycle that is invoiced and
+        still unsettled; while one is open, this period cannot be charged.
+        """
+        return await self._t.request("GET", f"/v1/subscriptions/{subscription_id}/usage_summary")
 
 
 class AsyncRefunds:
@@ -1653,15 +1844,25 @@ class Products:
         description: str | None = None,
         marketing_features: list[str] | None = None,
         metadata: dict[str, str] | None = None,
+        allow_promotion_codes: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create a catalog product and return the product object."""
+        """Create a catalog product and return the product object.
+
+        ``allow_promotion_codes`` lets a *buyer* type a coupon code at the
+        embedded checkout for this product. Defaults to ``False``. A coupon
+        you apply yourself, by passing ``coupon_code`` when you create a
+        Checkout Session, is unaffected — that is you discounting your own
+        sale. Either way the code is redeemed only once the payment
+        settles, so an abandoned checkout never uses one up.
+        """
         body = _drop_none(
             {
                 "name": name,
                 "description": description,
                 "marketing_features": marketing_features,
                 "metadata": metadata,
+                "allow_promotion_codes": allow_promotion_codes,
             }
         )
         return self._t.request(
@@ -1681,6 +1882,7 @@ class Products:
         marketing_features: list[str] | None = None,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
+        allow_promotion_codes: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Patch mutable product fields."""
@@ -1691,6 +1893,7 @@ class Products:
                 "marketing_features": marketing_features,
                 "metadata": metadata,
                 "active": active,
+                "allow_promotion_codes": allow_promotion_codes,
             }
         )
         return self._t.request(
@@ -1728,13 +1931,18 @@ class Prices:
         self,
         *,
         product_id: str,
-        amount_cents: int,
+        amount_cents: int | None = None,
         currency: str,
         interval: str,
+        unit_amount_decimal: str | int | Decimal | None = None,
+        billing_scheme: str | None = None,
+        tiers_mode: str | None = None,
+        tiers: list[dict[str, Any]] | None = None,
         metadata: dict[str, str] | None = None,
         trial_days: int | None = None,
         trial_verification_cents: int | None = None,
         payment_methods: list[str] | None = None,
+        refund_on_cancel: str | None = None,
         refund_window_initial_days: int | None = None,
         refund_window_renewal_days: int | None = None,
         tax_behavior: str | None = None,
@@ -1746,12 +1954,21 @@ class Prices:
             {
                 "product_id": product_id,
                 "amount_cents": amount_cents,
+                "unit_amount_decimal": (
+                    None
+                    if unit_amount_decimal is None
+                    else _decimal_field(unit_amount_decimal, field="unit_amount_decimal")
+                ),
                 "currency": currency,
                 "interval": interval,
+                "billing_scheme": billing_scheme,
+                "tiers_mode": tiers_mode,
+                "tiers": None if tiers is None else _normalize_tiers(tiers, field="tiers"),
                 "metadata": metadata,
                 "trial_days": trial_days,
                 "trial_verification_cents": trial_verification_cents,
                 "payment_methods": payment_methods,
+                "refund_on_cancel": refund_on_cancel,
                 "refund_window_initial_days": refund_window_initial_days,
                 "refund_window_renewal_days": refund_window_renewal_days,
                 "tax_behavior": tax_behavior,
@@ -2026,12 +2243,20 @@ class Subscriptions:
         *,
         quantity: int,
         occurred_at: int | None = None,
+        identifier: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Report consumption against a metered subscription.
         See :meth:`AsyncSubscriptions.create_usage_record`."""
-        body = _drop_none({"quantity": quantity, "occurred_at": occurred_at, "metadata": metadata})
+        body = _drop_none(
+            {
+                "quantity": quantity,
+                "occurred_at": occurred_at,
+                "identifier": identifier,
+                "metadata": metadata,
+            }
+        )
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{subscription_id}/usage_records",
@@ -2069,6 +2294,11 @@ class Subscriptions:
             return self.list_usage_records(subscription_id, invoice_id=invoice_id, **kwargs)
 
         return paginate(_bound, page_size=page_size)
+
+    def retrieve_usage_summary(self, subscription_id: str) -> dict[str, Any]:
+        """Price the pending usage before the close bills it.
+        See :meth:`AsyncSubscriptions.retrieve_usage_summary`."""
+        return self._t.request("GET", f"/v1/subscriptions/{subscription_id}/usage_summary")
 
 
 class Refunds:

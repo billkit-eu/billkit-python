@@ -69,6 +69,64 @@ client.refunds.create(one_shot_payment_id=payment["id"])
 client.refunds.create(one_shot_payment_id=payment["id"], amount_cents=500)
 ```
 
+## Metered billing
+
+A metered price charges for what was consumed. You report usage, and at each period close BillKit invoices the period's total and charges the stored mandate.
+
+There are three ways to price a unit, and a price uses exactly one of them.
+
+```python
+# 1. Whole minor units: 5 cents per unit.
+client.prices.create(
+    product_id=product["id"], amount_cents=5,
+    currency="EUR", interval="month", usage_type="metered",
+)
+
+# 2. Finer than a minor unit. "0.02" is 0.02 CENTS, i.e. EUR 0.0002 per unit
+#    -- the canonical per-API-call price, which no integer can express.
+client.prices.create(
+    product_id=product["id"], unit_amount_decimal="0.02",
+    currency="EUR", interval="month", usage_type="metered",
+)
+
+# 3. By bands. "graduated" prices the units inside each band; "volume" lets
+#    the period total pick one band which then prices every unit. The same
+#    table under the two modes is a different bill, so the mode is required.
+client.prices.create(
+    product_id=product["id"], currency="EUR", interval="month",
+    usage_type="metered", billing_scheme="tiered", tiers_mode="graduated",
+    tiers=[
+        {"up_to": 1000, "unit_amount": 1},        # first 1,000 at EUR 0.01
+        {"up_to": "inf", "unit_amount_decimal": "0.5"},  # then EUR 0.005
+    ],
+)
+```
+
+**`unit_amount_decimal` is a string, and a `float` is refused.** Pass `str`, `int` or `Decimal`; a float raises `TypeError`. A float cannot hold 0.0002 exactly, so accepting one would work for the values that happen to round-trip and silently mis-price the ones that do not. The same rule applies inside a tier.
+
+### Reporting usage, exactly once
+
+```python
+client.subscriptions.create_usage_record(
+    sub["id"],
+    quantity=1200,
+    identifier="job-2026-09-19T10:00Z",  # your id for what you are metering
+)
+```
+
+Two dedupe mechanisms, for two different failures. The `Idempotency-Key` the SDK sends covers a retry of *that HTTP request*, including its own internal retries. `identifier` covers a retry of *your* call -- a job runner replaying a task, a queue delivering twice, your code re-invoking after its own timeout -- which reaches the API as a genuinely new request with a new key. A second report of the same identifier returns the first record unchanged rather than billing twice. If your reporting pipeline is at-least-once, `identifier` is the one that matters.
+
+### Knowing what the next invoice will be
+
+```python
+summary = client.subscriptions.retrieve_usage_summary(sub["id"])
+summary["pending_quantity"]  # 3
+summary["gross_cents"]       # 15
+summary["will_charge"]       # False
+```
+
+Check `will_charge` before you promise a customer an amount. A period whose total is under `minimum_charge_cents` (EUR 1.00) is **not** charged, because the payment provider would refuse it. The usage is not lost: it stays pending and rolls into the next period, which is then billed for both. `open_invoice_id` names an earlier cycle that is invoiced and still unsettled; while one is open, this period cannot be charged.
+
 ## Finding paused subscriptions
 
 `status` and `renewal_state` answer different questions, and only one of them knows about pausing. `status` is where the subscription stands with its payments (`incomplete`, `trialing`, `active`, `past_due`, `canceled`). `renewal_state` is what happens when the current period ends (`auto_renew`, `paused`, `canceling`, `stopped`). Pausing sets `renewal_state` and leaves `status` at `active`, because the customer has paid for the period they are in:

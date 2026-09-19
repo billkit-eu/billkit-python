@@ -10,6 +10,56 @@ so the numbers will diverge after this first release.
 
 Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
+## [0.3.0]
+
+### Added
+- **Metered pricing below one minor unit.** `prices.create(...)` takes
+  `unit_amount_decimal`: a per-unit rate in **minor units** with up to 12
+  decimal places, so "€0.0002 per API call" (`"0.02"`, i.e. 0.02 cents) is
+  finally expressible. `amount_cents` is an integer and could never say it.
+  Metered prices only.
+
+  It is sent **as a string**, and it is accepted as `str`, `int` or `Decimal`.
+  A `float` raises `TypeError` instead of being coerced: a float cannot hold
+  0.0002 exactly, so coercing would work for the values that happen to
+  round-trip and silently mis-price the ones that do not. A `Decimal` is
+  formatted with `f`, never `str()`, because `str(Decimal("1E-12"))` is
+  `"1E-12"` and the API refuses exponent notation — an echoed
+  `"0.000000000001"` would not be the string you sent.
+- **Tiered pricing.** `prices.create(billing_scheme="tiered", tiers_mode=...,
+  tiers=[...])`. `tiers_mode="graduated"` prices the units inside each band;
+  `"volume"` lets the period total pick one band which then prices every unit.
+  The same table under the two modes is a different bill, so the mode is
+  required rather than defaulted. Each band's `unit_amount_decimal` gets the
+  same float guard, and the tier list is copied rather than rewritten in place
+  (a price definition is usually a module constant).
+- **`identifier` on `subscriptions.create_usage_record(...)`**, for the retry
+  an `Idempotency-Key` cannot catch. The key covers a retry of one HTTP
+  request; `identifier` covers a retry of *your own* call — a job runner
+  replaying a task, a queue delivering twice — which arrives as a genuinely
+  new request with a new key. It is unique within the subscription, and a
+  second report of the same identifier returns the first record unchanged
+  rather than billing twice. If your pipeline is at-least-once, this is the
+  one that matters.
+- **`subscriptions.retrieve_usage_summary(subscription_id)`**, the money view
+  of pending usage: `pending_quantity`, `net_cents` / `tax_cents` /
+  `gross_cents` computed through the same rate or tier table the period close
+  uses, and `will_charge`. Read `will_charge` before promising a customer an
+  amount: a period under `minimum_charge_cents` (€1.00) is **not** charged,
+  because the provider would refuse it, and the usage rolls into the next
+  period instead. Previously the only record of that decision was a server log
+  line. `open_invoice_id` names an earlier cycle still unsettled.
+- **`refund_on_cancel` on `prices.create(...)`.** Server-side since the
+  `0066` migration and unreachable from this SDK until now. `"full"` or
+  `"prorated"` issues the refund a cancellation promised without anyone having
+  to remember to. Metered prices must leave it at `"none"`.
+
+### Changed
+- `prices.create(amount_cents=...)` is now keyword-**optional**, because a
+  price can be priced by `unit_amount_decimal` or by `tiers` instead. Exactly
+  one of the three is required, and the server refuses a price with none of
+  them (`parameter_missing`). Existing calls are unaffected.
+
 ## [0.2.1]
 
 ### Changed
