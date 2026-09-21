@@ -1,6 +1,6 @@
 {
   "$comment": "Machine-readable scenario matrix every SDK integration suite must cover. See SCENARIOS.md for the rationale and for how to add one. Each suite asserts it implements every scenario in ITS OWN family, so adding an entry fails the other SDKs in that family until they catch up. Families: 'server' (node/python/php), 'browser' (js/react), 'framework' (laravel).",
-  "version": 2,
+  "version": 3,
   "families": {
     "server": ["node", "python", "php"],
     "browser": ["js", "react"],
@@ -18,6 +18,9 @@
     { "id": "crud.coupon", "family": "server", "group": "crud", "summary": "Coupon create/validate/update; withdrawn with active:false, after which the code stops validating." },
     { "id": "crud.tax_rate", "family": "server", "group": "crud", "summary": "Tax rate create/retrieve/update; retired with active:false and still readable." },
     { "id": "crud.webhook_endpoint", "family": "server", "group": "crud", "summary": "Webhook endpoint create/retrieve/update/rotate-secret; disabled with status:disabled and still listed, then really deleted with DELETE, which answers {deleted:true} and drops it from the list." },
+    { "id": "crud.price_decimal_rate", "family": "server", "group": "crud", "summary": "A metered price declared with a 12-dp unit_amount_decimal round-trips byte-identical as a STRING. The one case where a client-side float silently corrupts money." },
+    { "id": "crud.price_tiered", "family": "server", "group": "crud", "summary": "A tiered metered price round-trips billing_scheme, tiers_mode and every tier, with each tier's unit_amount_decimal still a string." },
+    { "id": "crud.credit_note_absent_until_refunded", "family": "server", "group": "crud", "summary": "credit_notes lists empty for a fresh tenant and 404s an unknown id — there is no create, because issuance is refund-driven." },
 
     { "id": "filters.subscription_renewal_state", "family": "server", "group": "filters", "summary": "A paused subscription is found by renewal_state=paused while its status stays active; status=paused maps to the invalid-request exception." },
 
@@ -34,10 +37,14 @@
     { "id": "money.partial_refund", "family": "server", "group": "money", "summary": "Partial refund books and leaves the remainder refundable." },
     { "id": "money.over_refund_rejected", "family": "server", "group": "money", "summary": "Refunding beyond the remaining balance is rejected." },
     { "id": "money.dispute_opened", "family": "server", "group": "money", "summary": "Chargeback + webhook opens a listable, retrievable dispute." },
+    { "id": "money.credit_note_for_refund", "family": "server", "group": "money", "summary": "A SETTLED refund issues a credit note the SDK can list (filtered by invoice_id) and retrieve, with its own CN- number series and parts summing to its total." },
+    { "id": "money.void_refused_on_paid_invoice", "family": "server", "group": "money", "summary": "invoices.void on a PAID invoice maps to the conflict exception carrying code invoice_not_voidable: voiding claims a sale was never owed, which is false once money moved." },
 
     { "id": "usage.record_and_replay", "family": "server", "group": "usage", "summary": "A usage record posts to a metered subscription; replaying the same Idempotency-Key returns the same record." },
     { "id": "usage.list_reconciliation", "family": "server", "group": "usage", "summary": "Listing with invoice_id=pending returns the posted, not-yet-invoiced records." },
     { "id": "usage.non_metered_rejected", "family": "server", "group": "usage", "summary": "Posting usage to a licensed-price subscription maps to the invalid-request exception." },
+    { "id": "usage.dedupe_identifier", "family": "server", "group": "usage", "summary": "A second report carrying the same identifier under a DIFFERENT Idempotency-Key returns the record already on file rather than double-billing." },
+    { "id": "usage.summary_forecast", "family": "server", "group": "usage", "summary": "usage_summary reports the pending quantity and the net/tax/gross the next close will bill, so the minimum-charge rollforward is visible before it happens." },
 
     { "id": "webhooks.verify_roundtrip", "family": "server", "group": "webhooks", "summary": "A correctly signed payload verifies." },
     { "id": "webhooks.reject_tampered", "family": "server", "group": "webhooks", "summary": "A mutated body fails verification." },

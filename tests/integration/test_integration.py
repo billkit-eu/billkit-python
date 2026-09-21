@@ -72,6 +72,9 @@ COVERED: set[str] = {
     "crud.coupon",
     "crud.tax_rate",
     "crud.webhook_endpoint",
+    "crud.price_decimal_rate",
+    "crud.price_tiered",
+    "crud.credit_note_absent_until_refunded",
     "filters.subscription_renewal_state",
     "pagination.has_more",
     "pagination.auto_iter",
@@ -83,9 +86,13 @@ COVERED: set[str] = {
     "money.partial_refund",
     "money.over_refund_rejected",
     "money.dispute_opened",
+    "money.credit_note_for_refund",
+    "money.void_refused_on_paid_invoice",
     "usage.record_and_replay",
     "usage.list_reconciliation",
     "usage.non_metered_rejected",
+    "usage.dedupe_identifier",
+    "usage.summary_forecast",
     "webhooks.verify_roundtrip",
     "webhooks.reject_tampered",
     "webhooks.reject_stale",
@@ -315,6 +322,64 @@ def test_crud_webhook_endpoint(client: BillKit) -> None:
     assert created["id"] not in [e["id"] for e in after["data"]]
 
 
+def test_crud_price_decimal_rate(client: BillKit) -> None:
+    """[crud.price_decimal_rate] a 12-dp rate round-trips byte-identical, as a string.
+
+    The one scenario that can silently corrupt money: a ``float`` anywhere on
+    the path rounds a per-call rate away, and the resulting invoice is wrong
+    by orders of magnitude rather than by a cent.
+    """
+    product = client.products.create(name=f"Metered {idem_key()}")
+    rate = "0.000000000001"  # twelve decimal places, in MINOR units
+    price = client.prices.create(
+        product_id=product["id"],
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+        unit_amount_decimal=rate,
+    )
+    assert isinstance(price["unit_amount_decimal"], str)
+    assert price["unit_amount_decimal"] == rate
+
+    # The read path is a separate serializer, so assert it separately.
+    fetched = client.prices.retrieve(price["id"])
+    assert isinstance(fetched["unit_amount_decimal"], str)
+    assert fetched["unit_amount_decimal"] == rate
+
+
+def test_crud_price_tiered(client: BillKit) -> None:
+    """[crud.price_tiered] a tiered metered price round-trips every band."""
+    product = client.products.create(name=f"Tiered {idem_key()}")
+    price = client.prices.create(
+        product_id=product["id"],
+        currency="EUR",
+        interval="month",
+        usage_type="metered",
+        billing_scheme="tiered",
+        # Never defaulted: the same table under the two modes is a different
+        # bill, not a rounding difference.
+        tiers_mode="graduated",
+        tiers=[
+            {"up_to": 1000, "unit_amount_decimal": "0.05"},
+            {"up_to": "inf", "unit_amount_decimal": "0.0125"},
+        ],
+    )
+    assert price["billing_scheme"] == "tiered"
+    assert price["tiers_mode"] == "graduated"
+    assert len(price["tiers"]) == 2
+    assert all(isinstance(tier["unit_amount_decimal"], str) for tier in price["tiers"])
+    assert price["tiers"][0]["unit_amount_decimal"] == "0.05"
+    assert price["tiers"][1]["unit_amount_decimal"] == "0.0125"
+
+
+def test_crud_credit_note_absent_until_refunded(client: BillKit) -> None:
+    """[crud.credit_note_absent_until_refunded] credit notes are issued, never created."""
+    page = client.credit_notes.list(limit=10)
+    assert page["object"] == "list"
+    with pytest.raises(ResourceMissingError):
+        client.credit_notes.retrieve("cn_does_not_exist")
+
+
 # ── filters ──────────────────────────────────────────────────────────
 
 
@@ -487,6 +552,59 @@ def test_money_dispute_opened(client: BillKit, tenant: ITTenant) -> None:
     assert client.disputes.retrieve(match[0]["id"])["id"] == match[0]["id"]
 
 
+def test_money_credit_note_for_refund(client: BillKit, tenant: ITTenant) -> None:
+    """[money.credit_note_for_refund] a settled refund issues a retrievable credit note."""
+    price = make_plan(client, amount_cents=6400)["price"]
+    result = checkout_to_active(client, tenant, price["id"])
+    sub = find_subscription(client, price["id"])
+    payment = find_payment(client, sub["id"])
+
+    invoices = client.invoices.list(limit=100)
+    invoice = next(i for i in invoices["data"] if i["payment_id"] == payment["id"])
+
+    refund = client.refunds.create(payment_id=payment["id"], amount_cents=6400)
+    # Nothing yet: the refund is pending and may still fail, and a gapless
+    # series cannot un-issue a number.
+    assert refund["status"] == "pending"
+    assert client.credit_notes.list(invoice_id=invoice["id"])["data"] == []
+
+    MollieControl.settle_refunds_for(result["provider_payment_id"], "refunded")
+    deliver_mollie_webhook(tenant.mollie_route_id, result["provider_payment_id"])
+
+    notes = client.credit_notes.list(invoice_id=invoice["id"])["data"]
+    assert len(notes) == 1
+    note = notes[0]
+    assert note["invoice_id"] == invoice["id"]
+    # Its own series, deliberately distinct from the invoice's: a tax
+    # authority reads the two as different document classes.
+    assert note["number"].startswith("CN-")
+    assert note["number"] != invoice["number"]
+    # The identity the whole document rests on.
+    assert note["subtotal_cents"] + note["tax_cents"] == note["total_cents"] == 6400
+
+    fetched = client.credit_notes.retrieve(note["id"])
+    assert fetched["id"] == note["id"]
+    assert fetched["object"] == "credit_note"
+
+
+def test_money_void_refused_on_paid_invoice(client: BillKit, tenant: ITTenant) -> None:
+    """[money.void_refused_on_paid_invoice] voiding a paid invoice is a typed conflict."""
+    price = make_plan(client, amount_cents=1900)["price"]
+    checkout_to_active(client, tenant, price["id"])
+    sub = find_subscription(client, price["id"])
+
+    invoices = client.invoices.list(limit=100)
+    invoice = next(i for i in invoices["data"] if i["subscription_id"] == sub["id"])
+    assert invoice["status"] == "paid"
+
+    # Not a limitation — the contract. Voiding claims the sale was never
+    # owed, which is false once the money moved; the reversal there is a
+    # credit note.
+    with pytest.raises(ConflictError) as excinfo:
+        client.invoices.void(invoice["id"])
+    assert excinfo.value.code == "invoice_not_voidable"
+
+
 # ── usage ────────────────────────────────────────────────────────────
 
 
@@ -552,6 +670,44 @@ def test_usage_non_metered_rejected(client: BillKit, tenant: ITTenant) -> None:
 
     with pytest.raises(InvalidRequestError):
         client.subscriptions.create_usage_record(sub["id"], quantity=1)
+
+
+def test_usage_dedupe_identifier(client: BillKit, tenant: ITTenant) -> None:
+    """[usage.dedupe_identifier] the same identifier under a different key dedupes."""
+    price = make_plan(client, amount_cents=7, usage_type="metered")["price"]
+    sub = active_subscription(client, tenant, price["id"])
+
+    identifier = f"job-{idem_key()}"
+    first = client.subscriptions.create_usage_record(
+        sub["id"], quantity=9, identifier=identifier, idempotency_key=idem_key()
+    )
+    # A DIFFERENT idempotency key, so the transport-level replay guard cannot
+    # be what dedupes this. Only the natural key can.
+    second = client.subscriptions.create_usage_record(
+        sub["id"], quantity=9, identifier=identifier, idempotency_key=idem_key()
+    )
+    assert second["id"] == first["id"]
+
+    pending = client.subscriptions.list_usage_records(sub["id"], invoice_id="pending", limit=100)
+    assert [r["id"] for r in pending["data"]].count(first["id"]) == 1
+
+
+def test_usage_summary_forecast(client: BillKit, tenant: ITTenant) -> None:
+    """[usage.summary_forecast] usage_summary says what the next close will bill."""
+    price = make_plan(client, amount_cents=11, usage_type="metered")["price"]
+    sub = active_subscription(client, tenant, price["id"])
+    for quantity in (100, 250):
+        client.subscriptions.create_usage_record(sub["id"], quantity=quantity)
+
+    summary = client.subscriptions.retrieve_usage_summary(sub["id"])
+    assert summary["subscription_id"] == sub["id"]
+    assert summary["pending_quantity"] == 350
+    assert summary["pending_record_count"] == 2
+    # 350 units at 11 cents. The forecast and the close share one predicate
+    # server-side, so this is the invoice, not an estimate.
+    assert summary["net_cents"] == 3850
+    assert summary["net_cents"] + summary["tax_cents"] == summary["gross_cents"]
+    assert summary["will_charge"] is True
 
 
 # ── webhooks ─────────────────────────────────────────────────────────

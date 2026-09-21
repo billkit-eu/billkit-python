@@ -123,6 +123,26 @@ class MollieControl:
         )
         resp.raise_for_status()
 
+    @staticmethod
+    def settle_refunds_for(provider_payment_id: str, status: str = "refunded") -> None:
+        """Settle every refund the fake holds against one payment.
+
+        Takes the **provider** payment id (``tr_…``, what :meth:`settle`
+        takes), not BillKit's own ``pay_…``. The form a suite can actually
+        reach: BillKit deliberately never returns ``provider_refund_id``, so
+        a spec that booked a refund through the real route has no handle on
+        the Mollie row it produced. The API answers 400 rather than
+        succeeding vacuously when the payment has no fake refunds, so a
+        mis-wired call fails loudly instead of reporting a settlement that
+        never happened.
+        """
+        resp = httpx.post(
+            f"{BASE_URL}/v1/console/auth/_test/mollie/refund_status",
+            json={"payment_id": provider_payment_id, "status": status},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+
 
 def deliver_mollie_webhook(route_id: str, provider_payment_id: str) -> None:
     """Post the provider webhook the way Mollie does, form-encoded ``id=tr_...``.

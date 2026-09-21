@@ -10,6 +10,24 @@ so the numbers will diverge after this first release.
 
 Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
+## [0.4.0]
+
+### Added
+- **`credit_notes`** on both clients — `retrieve`, `list` and `iter`. A credit
+  note is the document that reverses an issued invoice; one is created for you
+  when a refund settles, so there is no `create` here. `list` takes
+  `invoice_id` to answer "was this sale credited, and by how much".
+- **`invoices.void(invoice_id)`** — records that an invoice was never owed. It
+  keeps its number and stays readable; it just stops being a receivable.
+
+  A **paid** invoice is refused with a `ConflictError` whose `code` is
+  `"invoice_not_voidable"`. Once the money has moved, "never owed" is not
+  true — refund the payment instead, and a credit note is issued when the
+  refund settles. Voiding twice is a no-op.
+
+  There is no `retrieve_pdf`: this client has no binary response path yet, so
+  invoice PDFs are not fetchable either. Use the URL from the API directly.
+
 ## [0.3.0]
 
 ### Added

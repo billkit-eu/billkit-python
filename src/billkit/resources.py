@@ -1586,6 +1586,86 @@ class AsyncInvoices:
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
         return aiterate(self.list, page_size=page_size)
 
+    async def void(
+        self,
+        invoice_id: str,
+        *,
+        reason: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Void an invoice: state that the sale was never owed.
+
+        The invoice keeps its number and stays readable — a gapless
+        series cannot lose a row — and stops being a receivable. Use it
+        for an invoice that should not have been issued.
+
+        A **paid** invoice is refused with :class:`ConflictError` whose
+        ``code`` is ``invoice_not_voidable``. That is deliberate: once
+        the money has moved, "never owed" is false, and the document that
+        reverses a real sale is a credit note — refund the payment and
+        one is issued when the refund settles.
+
+        Idempotent: voiding an already-void invoice returns it unchanged.
+
+        ``reason`` is recorded on the audit row only, never on the
+        document.
+        """
+        return await self._t.request(
+            "POST",
+            f"/v1/invoices/{invoice_id}/void",
+            json_body=_drop_none({"reason": reason}),
+            idempotency_key=idempotency_key,
+        )
+
+
+class AsyncCreditNotes:
+    """Read-only access to credit notes — the documents that reverse an
+    issued invoice.
+
+    There is no create. A credit note is issued for you when a refund
+    settles, never on request, so a numbered legal record is only minted
+    once the money has actually moved. A refund still pending, a refund
+    that fails, and a refund of a one-off charge that was never invoiced
+    all produce none.
+    """
+
+    def __init__(self, transport: _AsyncRequester) -> None:
+        self._t = transport
+
+    async def retrieve(self, credit_note_id: str) -> dict[str, Any]:
+        return await self._t.request("GET", f"/v1/credit_notes/{credit_note_id}")
+
+    async def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        invoice_id: str | None = None,
+        customer_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One page of credit notes, newest first.
+
+        ``invoice_id`` answers "was this sale credited, and by how much",
+        which is the question when reconciling a single invoice;
+        ``customer_id`` answers it for everything credited to one buyer.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        for key, value in (("invoice_id", invoice_id), ("customer_id", customer_id)):
+            if value is not None:
+                params[key] = value
+        return await self._t.request("GET", "/v1/credit_notes", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        invoice_id: str | None = None,
+        customer_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        return aiterate(
+            self.list, page_size=page_size, invoice_id=invoice_id, customer_id=customer_id
+        )
+
 
 class AsyncAuditLogs:
     """Read-only access to the per-tenant audit log."""
@@ -2809,6 +2889,55 @@ class Invoices:
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
         return paginate(self.list, page_size=page_size)
+
+    def void(
+        self,
+        invoice_id: str,
+        *,
+        reason: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        return self._t.request(
+            "POST",
+            f"/v1/invoices/{invoice_id}/void",
+            json_body=_drop_none({"reason": reason}),
+            idempotency_key=idempotency_key,
+        )
+
+
+class CreditNotes:
+    """Sync flavour of :class:`AsyncCreditNotes`."""
+
+    def __init__(self, transport: _SyncRequester) -> None:
+        self._t = transport
+
+    def retrieve(self, credit_note_id: str) -> dict[str, Any]:
+        return self._t.request("GET", f"/v1/credit_notes/{credit_note_id}")
+
+    def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        invoice_id: str | None = None,
+        customer_id: str | None = None,
+    ) -> dict[str, Any]:
+        params = _list_params(limit=limit, starting_after=starting_after)
+        for key, value in (("invoice_id", invoice_id), ("customer_id", customer_id)):
+            if value is not None:
+                params[key] = value
+        return self._t.request("GET", "/v1/credit_notes", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        invoice_id: str | None = None,
+        customer_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        return paginate(
+            self.list, page_size=page_size, invoice_id=invoice_id, customer_id=customer_id
+        )
 
 
 class AuditLogs:

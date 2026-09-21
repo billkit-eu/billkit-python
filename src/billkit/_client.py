@@ -24,6 +24,7 @@ from billkit.resources import (
     AsyncBillingPortalSessions,
     AsyncCheckoutSessions,
     AsyncCoupons,
+    AsyncCreditNotes,
     AsyncCustomers,
     AsyncDisputes,
     AsyncEvents,
@@ -41,6 +42,7 @@ from billkit.resources import (
     BillingPortalSessions,
     CheckoutSessions,
     Coupons,
+    CreditNotes,
     Customers,
     Disputes,
     Events,
@@ -109,6 +111,7 @@ class AsyncBillKit:
         self.coupons = AsyncCoupons(self._transport)
         self.tax_rates = AsyncTaxRates(self._transport)
         self.invoices = AsyncInvoices(self._transport)
+        self.credit_notes = AsyncCreditNotes(self._transport)
         self.audit_logs = AsyncAuditLogs(self._transport)
         self.payments = AsyncPayments(self._transport)
         self.billing_portal_sessions = AsyncBillingPortalSessions(self._transport)
@@ -168,6 +171,7 @@ class BillKit:
         self.coupons = Coupons(self._transport)
         self.tax_rates = TaxRates(self._transport)
         self.invoices = Invoices(self._transport)
+        self.credit_notes = CreditNotes(self._transport)
         self.audit_logs = AuditLogs(self._transport)
         self.payments = Payments(self._transport)
         self.billing_portal_sessions = BillingPortalSessions(self._transport)
