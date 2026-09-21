@@ -1,6 +1,6 @@
 {
   "$comment": "Machine-readable scenario matrix every SDK integration suite must cover. See SCENARIOS.md for the rationale and for how to add one. Each suite asserts it implements every scenario in ITS OWN family, so adding an entry fails the other SDKs in that family until they catch up. Families: 'server' (node/python/php), 'browser' (js/react), 'framework' (laravel).",
-  "version": 3,
+  "version": 4,
   "families": {
     "server": ["node", "python", "php"],
     "browser": ["js", "react"],
@@ -23,15 +23,18 @@
     { "id": "crud.credit_note_absent_until_refunded", "family": "server", "group": "crud", "summary": "credit_notes lists empty for a fresh tenant and 404s an unknown id — there is no create, because issuance is refund-driven." },
 
     { "id": "filters.subscription_renewal_state", "family": "server", "group": "filters", "summary": "A paused subscription is found by renewal_state=paused while its status stays active; status=paused maps to the invalid-request exception." },
+    { "id": "filters.customer_provisional", "family": "server", "group": "filters", "summary": "customers.list(provisional=false) returns a created customer and provisional=true does not, with both listed when the filter is omitted." },
 
     { "id": "pagination.has_more", "family": "server", "group": "pagination", "summary": "limit < N yields has_more and an exactly-limit-long page." },
     { "id": "pagination.auto_iter", "family": "server", "group": "pagination", "summary": "Auto-paging iterator yields every row exactly once." },
 
     { "id": "idempotency.replay", "family": "server", "group": "idempotency", "summary": "Same key + same body replays the same resource id." },
     { "id": "idempotency.key_reuse_conflict", "family": "server", "group": "idempotency", "summary": "Same key + different body maps to the conflict exception." },
+    { "id": "idempotency.in_progress_converges", "family": "server", "group": "idempotency", "summary": "Concurrent creates sharing one Idempotency-Key all resolve to the SAME resource id and none raises. A loser that arrives while the winner's handler is still running gets 409 idempotency_in_progress, the one 4xx the client retries." },
 
     { "id": "errors.not_found", "family": "server", "group": "errors", "summary": "404 maps to the resource-missing exception with its code." },
     { "id": "errors.invalid_request", "family": "server", "group": "errors", "summary": "A validation failure maps to the invalid-request exception and carries `param`." },
+    { "id": "errors.status_drives_class", "family": "server", "group": "errors", "summary": "A 4xx the API serialises with type 'api_error' (an unmatched route, a method the route does not allow) maps on its STATUS, so it is the resource-missing / invalid-request exception and never the server one. The envelope type is still carried on the error verbatim." },
 
     { "id": "money.checkout_to_active", "family": "server", "group": "money", "summary": "Checkout -> settle -> webhook -> subscription active + paid payment." },
     { "id": "money.partial_refund", "family": "server", "group": "money", "summary": "Partial refund books and leaves the remainder refundable." },

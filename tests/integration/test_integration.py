@@ -23,6 +23,7 @@ import hashlib
 import hmac
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ from billkit import (
     InvalidRequestError,
     PermissionError,
     ResourceMissingError,
+    ServerError,
     WebhookSignature,
     WebhookVerificationError,
 )
@@ -76,12 +78,15 @@ COVERED: set[str] = {
     "crud.price_tiered",
     "crud.credit_note_absent_until_refunded",
     "filters.subscription_renewal_state",
+    "filters.customer_provisional",
     "pagination.has_more",
     "pagination.auto_iter",
     "idempotency.replay",
     "idempotency.key_reuse_conflict",
+    "idempotency.in_progress_converges",
     "errors.not_found",
     "errors.invalid_request",
+    "errors.status_drives_class",
     "money.checkout_to_active",
     "money.partial_refund",
     "money.over_refund_rejected",
@@ -412,6 +417,29 @@ def test_filters_subscription_renewal_state() -> None:
     assert excinfo.value.param == "status"
 
 
+def test_filters_customer_provisional() -> None:
+    """[filters.customer_provisional] buyers and abandoned carts are separable.
+
+    A checkout that captures an email commits its Customer *before* the
+    charge, so a checkout nobody finished leaves a row behind.
+    ``provisional`` is the only thing that tells the two apart, and a
+    fresh tenant is what makes the assertion exact.
+    """
+    t = provision_tenant("provisional")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+    created = c.customers.create(email=f"buyer-{idem_key()}@example.com")
+
+    def ids(**filters: Any) -> list[str]:
+        return [row["id"] for row in c.customers.list(**filters)["data"]]
+
+    assert created["id"] in ids(provisional=False)
+    assert created["id"] not in ids(provisional=True)
+    # Omitted means both kinds, which is why the filter has to be
+    # reachable at all: the default answer is not the one a "list my
+    # customers" screen wants.
+    assert created["id"] in ids()
+
+
 # ── pagination ───────────────────────────────────────────────────────
 
 
@@ -460,6 +488,41 @@ def test_idempotency_key_reuse_conflict(client: BillKit) -> None:
         client.products.create(name="Different Body", idempotency_key=key)
 
 
+def test_idempotency_in_progress_converges() -> None:
+    """[idempotency.in_progress_converges] one key, one resource, no raise.
+
+    The contract a caller depends on: firing the same keyed create from N
+    workers yields ONE resource and no exception.
+
+    A request that arrives while the winner's handler is still running
+    gets ``409 idempotency_in_progress`` — the one 4xx the client retries,
+    because the charge may already have happened and the obvious
+    workaround (retry with a fresh key) is what turns one charge into two.
+    Whether any given attempt lands inside that window depends on the
+    server's timing, so this can pass without entering it; what it can
+    never do is pass while the client treats that 409 as terminal. The
+    deterministic proof is in ``tests/test_retry.py``.
+    """
+    t = provision_tenant("inflight")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+    key = idem_key()
+    name = f"Concurrent {key}"
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: c.products.create(name=name, idempotency_key=key),
+                range(8),
+            )
+        )
+
+    assert len({r["id"] for r in results}) == 1, "every attempt must resolve to the same product"
+
+    # And the server really did create only one row.
+    rows = [row for row in c.products.list(limit=100)["data"] if row["name"] == name]
+    assert len(rows) == 1
+
+
 # ── errors ───────────────────────────────────────────────────────────
 
 
@@ -486,6 +549,31 @@ def test_errors_invalid_request(client: BillKit) -> None:
         )
     assert excinfo.value.param == "currency"
     assert excinfo.value.code == "parameter_invalid"
+
+
+def test_errors_status_drives_class(tenant: ITTenant) -> None:
+    """[errors.status_drives_class] a 4xx labelled ``api_error`` still maps on status.
+
+    Not a contrived body: every request that never reaches a route handler
+    is serialised by the API's framework-level handler as
+    ``{"type": "api_error", "code": "unhandled"}`` with the original 4xx
+    status. Mapping on ``type`` made a plain 404 — a typo'd id, an
+    SDK/API version skew — arrive as ``ServerError``, which is the class
+    retry and alerting policies key on.
+
+    Driven through the transport rather than a resource because that is
+    what a version skew looks like: the SDK asking for a route this API
+    does not have.
+    """
+    c = BillKit(api_key=tenant.api_key, base_url=BASE_URL)
+    with pytest.raises(ResourceMissingError) as excinfo:
+        c._transport.request("GET", "/v1/no_such_resource")
+
+    assert not isinstance(excinfo.value, ServerError)
+    # The envelope value is still carried verbatim; it just does not
+    # choose the class.
+    assert excinfo.value.type == "api_error"
+    assert excinfo.value.status_code == 404
 
 
 # ── money ────────────────────────────────────────────────────────────

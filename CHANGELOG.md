@@ -10,6 +10,44 @@ so the numbers will diverge after this first release.
 
 Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
+## [0.5.0] - 2026-09-22
+
+### Added
+- **`invoices.retrieve_pdf(id)` and `credit_notes.retrieve_pdf(id)`** on both
+  clients, returning the rendered document as `bytes`. Blob-backed deployments
+  stream the bytes inline and S3-backed ones answer `302` to a presigned URL,
+  which the transport follows under the SDK's own timeout and retry policy;
+  `httpx` drops the `Authorization` header on that cross-origin hop, so the
+  API key never reaches the storage host. Node has had this since 0.3.0.
+
+### Fixed
+- **The exception class is now chosen by the HTTP status, not the envelope
+  `type`.** A request that never reaches a route handler is serialised by the
+  API's framework-level handler as `{"type": "api_error"}` *with a 4xx status*,
+  so a plain `404` — a typo'd id, an SDK/API version skew — was raised as
+  `ServerError`. That told callers BillKit had broken when their own request
+  was at fault, and `ServerError` is the class retry and alerting policies key
+  on. `type` is still carried verbatim on the raised error. Node already
+  behaved this way; python and php now match.
+- **`409 idempotency_in_progress` is retried.** It means a request carrying the
+  same `Idempotency-Key` is still in flight, so the charge may already have
+  happened; surfacing it immediately invited the one workaround that turns a
+  single charge into two — retrying with a fresh key. The retry reuses the
+  original key, so it either loses the race again or replays the first call's
+  result. Every other 409 still fails fast.
+- **`BillKit.customers.list()` accepts `provisional`**, the filter its
+  `AsyncBillKit` twin has carried since the parameter shipped. The sync client
+  silently could not ask for abandoned-checkout rows.
+
+### Changed
+- Twenty-eight methods and eleven classes on the sync clients carried a
+  one-line docstring, or none, where their async twins explained the call in
+  full — `prices.create`, `invoices.void`, `subscriptions.create_usage_record`
+  and `retrieve_usage_summary` among them, and eight resource classes that said
+  only "Sync flavour of `AsyncX`" and pointed the reader elsewhere. The sync
+  client is the one most Python callers reach for; the two halves now document
+  themselves identically.
+
 ## [0.4.0]
 
 ### Added

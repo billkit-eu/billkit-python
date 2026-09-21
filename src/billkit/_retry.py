@@ -1,14 +1,15 @@
 """Retry policy for transient failures.
 
 Retries 5xx + network errors with jittered exponential backoff.
-4xx (including 409 Idempotency-Key conflicts) are caller-fault and
-never retried. 429 is retried only when the response advertises
-``Retry-After`` short enough to be reasonable; otherwise we surface
-the exception so the caller can decide.
+4xx are caller-fault and never retried, with one deliberate exception:
+``409 idempotency_in_progress``. See :data:`IN_PROGRESS_CODE`. 429 is
+retried only when the response advertises a ``Retry-After`` short
+enough to be reasonable; otherwise we surface the exception so the
+caller can decide.
 
-The SDK auto-generates an ``Idempotency-Key`` for every mutating
-call, so retrying a 5xx never double-charges: the server
-replays the original response if the original handler completed.
+The SDK auto-generates an ``Idempotency-Key`` for every mutating call
+and reuses it across attempts, so retrying never double-charges: the
+server replays the original response if the original handler completed.
 """
 
 from __future__ import annotations
@@ -46,6 +47,20 @@ class RetryPolicy:
 
 DEFAULT_RETRY_POLICY = RetryPolicy()
 
+#: The one 409 error code that is transient rather than caller-fault.
+#:
+#: The server returns it when a request carrying the *same*
+#: ``Idempotency-Key`` is still in flight ("Retry after a short delay",
+#: ``Retry-After: 1``). It is the only 4xx where doing nothing is the
+#: dangerous option: the call may well have charged the customer, the
+#: caller cannot see the outcome, and the obvious workaround — retry with
+#: a *fresh* key — is precisely what turns one charge into two.
+#:
+#: Retrying is safe because the transport reuses the original
+#: ``Idempotency-Key`` on every attempt, so the retry either loses the
+#: race again or replays the first call's recorded response.
+IN_PROGRESS_CODE = "idempotency_in_progress"
+
 
 def should_retry(
     status_code: int | None,
@@ -53,19 +68,28 @@ def should_retry(
     attempt: int,
     policy: RetryPolicy,
     retry_after_seconds: float | None = None,
+    error_code: str | None = None,
 ) -> bool:
     """Decide whether the next attempt is allowed.
 
-    ``status_code=None`` means a transport-level failure (network
-    error, DNS, TLS, timeout), so always retry within budget. Any 5xx
-    is a server fault, also retry. A 429 is retried only when the
-    server supplies a short, parseable ``Retry-After`` value; this
-    keeps tenant-side workers from sleeping for unbounded periods.
+    ``status_code=None`` means a transport-level failure (network error,
+    DNS, TLS, timeout), so always retry within budget. Any 5xx is a
+    server fault, also retry. A 429 is retried only when the server
+    supplies a short, parseable ``Retry-After`` value; this keeps
+    tenant-side workers from sleeping for unbounded periods.
+
+    ``error_code`` is the envelope's ``error.code``, and is consulted for
+    409s only; every other decision is status-driven.
     """
     if attempt >= policy.max_attempts:
         return False
     if status_code is None:
         return True
+    if status_code == 409:
+        # A 409 from a *different* code (``idempotency_key_in_use``, a
+        # conflicting subscription state) is a genuine caller-fault
+        # conflict that retrying can only repeat, so it still fails fast.
+        return error_code == IN_PROGRESS_CODE
     if status_code == 429:
         return (
             retry_after_seconds is not None

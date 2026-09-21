@@ -7,8 +7,24 @@ typically forward the JSON through to their own data layer
 verbatim. Callers who want strong types can wrap the return value
 in their own Pydantic models or :class:`typing.TypedDict`.
 
-Each class has an ``Async*`` and a sync flavor. They share the
-same method signatures so code reading either side feels the same.
+Every resource appears twice: once as ``Async<Name>`` and once as
+``<Name>``. The two halves are an exact mirror — same methods, same
+signatures, same docstrings, same bodies, differing only in
+``async``/``await``, ``AsyncIterator`` vs ``Iterator``, and ``aiterate``
+vs ``paginate``. A caller who reads one half is reading the other.
+
+**Edit the async classes only.** Everything below the "Sync resources"
+marker is generated from them by ``scripts/mirror_sync.py``; run it to
+propagate a change, and CI runs ``--check`` so the two cannot come
+apart between reviews.
+
+The mirror used to be maintained by hand and drifted both ways that a
+hand-maintained mirror drifts. Silently, in behaviour: the sync
+``Customers.list`` was missing the ``provisional`` filter its async twin
+had carried for a release, so the client most Python callers reach for
+could not ask the question at all. And loudly, in documentation:
+twenty-eight methods and eleven classes explained themselves in full on
+the async side and said one line, or nothing, on the sync side.
 """
 
 from __future__ import annotations
@@ -21,6 +37,8 @@ from billkit._pagination import aiterate, paginate
 
 
 class _AsyncRequester(Protocol):
+    async def request_bytes(self, method: str, path: str) -> bytes: ...
+
     async def request(
         self,
         method: str,
@@ -34,6 +52,8 @@ class _AsyncRequester(Protocol):
 
 
 class _SyncRequester(Protocol):
+    def request_bytes(self, method: str, path: str) -> bytes: ...
+
     def request(
         self,
         method: str,
@@ -1571,6 +1591,27 @@ class AsyncInvoices:
     async def retrieve(self, invoice_id: str) -> dict[str, Any]:
         return await self._t.request("GET", f"/v1/invoices/{invoice_id}")
 
+    async def retrieve_pdf(self, invoice_id: str) -> bytes:
+        """Download the rendered invoice PDF as raw bytes.
+
+        .. code-block:: python
+
+            pdf = client.invoices.retrieve_pdf("inv_123")
+            Path("invoice.pdf").write_bytes(pdf)
+
+        Blob-backed deployments stream the bytes inline; S3-backed ones
+        answer ``302`` to a presigned URL, which the transport follows
+        under the SDK's own timeout and retry policy — so both storage
+        adapters look identical from here.
+
+        Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
+        and answer ``501 rendering_pending``, which surfaces as a
+        :class:`~billkit.ServerError` whose ``code`` is
+        ``"rendering_pending"``; :meth:`retrieve` still returns the
+        structured invoice for tenants who render their own.
+        """
+        return await self._t.request_bytes("GET", f"/v1/invoices/{invoice_id}/pdf")
+
     async def list(
         self,
         *,
@@ -1634,6 +1675,27 @@ class AsyncCreditNotes:
 
     async def retrieve(self, credit_note_id: str) -> dict[str, Any]:
         return await self._t.request("GET", f"/v1/credit_notes/{credit_note_id}")
+
+    async def retrieve_pdf(self, credit_note_id: str) -> bytes:
+        """Download the rendered credit note PDF as raw bytes.
+
+        .. code-block:: python
+
+            pdf = client.credit_notes.retrieve_pdf("cn_123")
+            Path("credit-note.pdf").write_bytes(pdf)
+
+        Blob-backed deployments stream the bytes inline; S3-backed ones
+        answer ``302`` to a presigned URL, which the transport follows
+        under the SDK's own timeout and retry policy — so both storage
+        adapters look identical from here.
+
+        Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
+        and answer ``501 rendering_pending``, which surfaces as a
+        :class:`~billkit.ServerError` whose ``code`` is
+        ``"rendering_pending"``; :meth:`retrieve` still returns the
+        structured credit note for tenants who render their own.
+        """
+        return await self._t.request_bytes("GET", f"/v1/credit_notes/{credit_note_id}/pdf")
 
     async def list(
         self,
@@ -1783,14 +1845,19 @@ class AsyncBillingPortalSessions:
 
 # ─── Sync resources ────────────────────────────────────────────────
 #
-# Sync flavors are mechanical mirrors of the async ones. We keep the
-# definitions side-by-side rather than auto-generating from a single
-# source because the explicit duplication makes the SDK trivially
-# greppable and serves as the documentation of what's supported.
+# GENERATED from the async classes above by `scripts/mirror_sync.py`.
+# Do not edit this region by hand: run the script instead, or your change
+# is reverted the next time anyone does. `--check` runs in CI.
 
 
 class Customers:
-    """Create, update, delete, and page through BillKit customers."""
+    """Create, update, delete, and page through BillKit customers.
+
+    Customers are tenant-scoped buyer records. Use them as the anchor
+    for checkout sessions, subscriptions, invoices, refunds, and audit
+    history. Methods return the API's raw JSON dictionaries so callers
+    can preserve fields added by newer API versions.
+    """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -1824,7 +1891,13 @@ class Customers:
         country_code: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Attach or replace the customer's VAT number; triggers VIES validation."""
+        """Attach or replace the customer's VAT number.
+
+        Triggers server-side VIES validation. The response carries the
+        updated ``vat_number`` plus ``vat_number_validated``; a ``False``
+        flag means VIES is reachable but the number didn't validate, or
+        the validation is still pending.
+        """
         body = _drop_none({"vat_number": vat_number, "country_code": country_code})
         return self._t.request(
             "POST",
@@ -1840,7 +1913,13 @@ class Customers:
         confirmed: bool = True,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Hard-purge a customer's PII for GDPR erasure. Irreversible."""
+        """Hard-purge a customer's PII for GDPR erasure requests.
+
+        Distinct from :meth:`delete` (soft delete): purge nulls email,
+        name, country, VAT, and metadata, sets ``purged_at``, and is
+        irreversible. ``confirmed=False`` no-ops at the API as a
+        fat-finger guard, so the SDK defaults it to ``True``.
+        """
         return self._t.request(
             "POST",
             f"/v1/customers/{customer_id}/purge",
@@ -1895,23 +1974,38 @@ class Customers:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        provisional: bool | None = None,
     ) -> dict[str, Any]:
-        return self._t.request(
-            "GET",
-            "/v1/customers",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List customers, newest first.
+
+        ``provisional`` filters on whether the customer ever completed a
+        payment. A checkout that captures an email commits its Customer
+        before the charge, so a checkout nobody finished leaves a row
+        behind: pass ``False`` for real customers only, ``True`` for the
+        abandoned ones (the cart-recovery worklist), or omit for both.
+        Abandoned rows are swept after the tenant's retention window.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        if provisional is not None:
+            params["provisional"] = "true" if provisional else "false"
+        return self._t.request("GET", "/v1/customers", params=params)
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
-        """Walk every page of ``list()`` and yield each customer."""
+        """Walk every page of ``list()`` and yield each customer.
+
+        Page size defaults to the server's default (10). Pass
+        ``page_size=100`` to reduce round-trips on large tenant data.
+        """
         return paginate(self.list, page_size=page_size)
 
 
 class Products:
     """Manage catalog products.
 
-    A Product is the customer-facing thing being sold. Create one
-    Product, then attach one or more Prices to it.
+    A Product is the customer-facing thing being sold (for example,
+    ``"Pro"`` or ``"Enterprise"``). Create one Product, then attach one
+    or more Prices to it for currencies, billing intervals, trials, or
+    payment-method mixes.
     """
 
     def __init__(self, transport: _SyncRequester) -> None:
@@ -1965,7 +2059,15 @@ class Products:
         allow_promotion_codes: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Patch mutable product fields."""
+        """Patch mutable product fields, or archive the product.
+
+        Pass only the fields you want to change. ``active=False``
+        archives: the product stops being offered, a checkout against
+        any of its prices is refused, and it emits ``product.archived``.
+        It keeps its id and stays readable, because what was sold under
+        it has to be, which is why there is no delete. ``active=True``
+        un-archives.
+        """
         body = _drop_none(
             {
                 "name": name,
@@ -2029,7 +2131,91 @@ class Prices:
         usage_type: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create a price for an existing product. See :class:`AsyncPrices`."""
+        """Create a price for an existing product.
+
+        Prices are append-only billing terms. Create a new Price when
+        changing amount, interval, trial, or supported payment methods;
+        existing subscriptions keep pointing at their original Price.
+
+        ``refund_window_initial_days`` and ``refund_window_renewal_days``
+        override the default refund policy (7d / 30d initial, 3d
+        renewal) on a per-price basis. Leave ``None`` to inherit the
+        default; pass ``0`` to disable refunds for that charge type;
+        pass ``N > 0`` for an ``N``-day window (capped server-side at
+        365). Useful for "Pro Bundle has a 14-day money-back guarantee"
+        or "Lifetime plan has no refunds" product decisions.
+
+        ``tax_behavior`` says whether ``amount_cents`` is quoted gross
+        (``"inclusive"``, VAT is backed out of it) or net
+        (``"exclusive"``, VAT is added on top at charge time). Leave
+        ``None`` to inherit ``"unspecified"``, which defers to the tax
+        rate configured for the buyer's country. Set it explicitly when
+        the amount you advertise has to be the amount charged regardless
+        of what tax rates exist now or later.
+
+        ``refund_on_cancel`` decides what a cancellation refunds without
+        being asked: ``"none"`` (the default) nothing, ``"full"`` the whole
+        last charge, ``"prorated"`` the unused part of the current period.
+        Both non-none modes also end access immediately, and both are still
+        bounded by the refund window. Metered prices must leave this at
+        ``"none"`` — see below.
+
+        ``usage_type`` selects the billing model. ``"licensed"`` (the
+        default when ``None``) bills ``amount_cents`` per period
+        regardless of consumption. ``"metered"`` bills **per reported
+        unit**: post consumption with
+        :meth:`Subscriptions.create_usage_record`, and at each period
+        close BillKit invoices the period's total and charges the stored
+        mandate. Metered prices must be ``interval="month"``, cannot have
+        ``trial_days``, and cannot set ``refund_on_cancel`` (ending access
+        mid-period would strand usage that has not been billed yet).
+
+        **Three ways to price a metered unit**, and exactly one of them per
+        price:
+
+        ``amount_cents``
+            Whole minor units per unit. ``amount_cents=5`` is €0.05 each.
+
+        ``unit_amount_decimal``
+            A rate finer than one minor unit, in minor units, to 12 decimal
+            places. ``"0.02"`` is 0.02 cents, i.e. €0.0002 per unit — the
+            canonical per-API-call price, and not expressible as an integer.
+            Pass a ``str``, an ``int`` or a ``Decimal``; a ``float`` raises
+            ``TypeError``, because a float cannot hold 0.0002 exactly and
+            would corrupt the rate before it was ever multiplied. The period's
+            whole quantity is multiplied by the rate and rounded **once**, at
+            the invoice.
+
+        ``billing_scheme="tiered"`` with ``tiers`` and ``tiers_mode``
+            Price by bands. ``tiers_mode="graduated"`` prices the units
+            inside each band; ``"volume"`` lets the period total pick one
+            band which then prices every unit. The same table under the two
+            modes is a different bill, so the mode is required rather than
+            defaulted. Each band is a dict: ``up_to`` (a positive int, or
+            ``"inf"`` on the last band, which is mandatory because a bounded
+            top band cannot price the usage above it), plus ``unit_amount``
+            (whole minor units), ``unit_amount_decimal`` (same float rule as
+            above) and/or ``flat_amount`` charged once for reaching the band.
+            Write a free band as ``unit_amount=0``. A tiered price sends no
+            ``amount_cents``::
+
+                client.prices.create(
+                    product_id="prod_api",
+                    currency="EUR",
+                    interval="month",
+                    usage_type="metered",
+                    billing_scheme="tiered",
+                    tiers_mode="graduated",
+                    tiers=[
+                        {"up_to": 1000, "unit_amount": 1},
+                        {"up_to": "inf", "unit_amount_decimal": "0.5"},
+                    ],
+                )
+
+        ``amount_cents`` is keyword-optional for that reason, not because it
+        is optional in general: a price with none of the three is refused
+        server-side with ``parameter_missing``.
+        """
         body = _drop_none(
             {
                 "product_id": product_id,
@@ -2065,7 +2251,25 @@ class Prices:
     def update(
         self, price_id: str, *, active: bool, idempotency_key: str | None = None
     ) -> dict[str, Any]:
-        """Archive a price, or put it back on sale. See :class:`AsyncPrices`."""
+        """Archive a price so it stops selling, or put it back on sale.
+
+        Pass ``active=False`` to archive. The price keeps its id and is
+        still returned by :meth:`retrieve` and :meth:`list`, because
+        subscriptions renew against it by id and what they are charged
+        has to stay readable. Subscriptions already on the price go on
+        renewing against it; what stops is new business, so a checkout
+        against it is refused and it is no longer offered as a plan
+        change.
+
+        Pass ``active=True`` to undo that. ``amount_cents``, ``currency``
+        and ``interval`` are fixed at creation and none of them move here,
+        so neither direction can change what a past charge was made under.
+        To charge something different, create a new price.
+
+        Sending the value a price already has returns it unchanged and
+        emits no second event, which makes a retry safe. Archiving emits
+        ``price.archived``; putting one back emits ``price.updated``.
+        """
         return self._t.request(
             "POST",
             f"/v1/prices/{price_id}",
@@ -2122,7 +2326,47 @@ class CheckoutSessions:
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create a hosted checkout session. See :class:`AsyncCheckoutSessions`."""
+        """Create a hosted checkout session.
+
+        Pass **exactly one of** ``customer_id`` (existing Customer) or
+        ``customer_email`` (Stripe-compat shortcut: BillKit creates a
+        fresh Customer in the same transaction, and never dedupes by
+        email). ``customer_name`` is only valid with ``customer_email``
+        and is carried onto the auto-created Customer row; rename an
+        existing customer via ``customers.update`` instead.
+
+        ``method`` pins the Mollie payment method (``"creditcard"``,
+        ``"directdebit"``, ``"ideal"`` or ``"applepay"``); ``None`` lets
+        Mollie pick. ``coupon_code`` is
+        atomically claimed at session creation. ``trial_days_override``
+        replaces the price's trial for this session only and is server
+        capped at ``2 * max(price.trial_days, 14)`` (``0`` disables a
+        trial that the price would otherwise grant).
+
+        ``metadata`` is an opaque key/value bag BillKit stores verbatim
+        and echoes back on the session and on the
+        ``checkout.session.completed`` webhook. Use it to carry your own
+        record id through checkout. BillKit never dedupes customers by
+        email, so ``customer_id`` alone is ambiguous once the same buyer
+        checks out twice (resubscribe, plan change).
+
+        ``ui_mode`` selects the payment surface:
+
+        * ``None`` / ``"hosted"`` (default): the response's ``url``
+          points at **Mollie's hosted checkout page**
+          (``https://www.mollie.com/checkout/...``). Redirect the buyer
+          there; Mollie collects card details under the merchant's
+          Mollie profile branding, then redirects back to ``success_url``
+          (or ``cancel_url``).
+        * ``"embedded"``: no charge is created yet. The response carries
+          a short-lived ``client_secret`` (``url`` stays ``None``) for
+          ``<CheckoutElement/>`` from ``@billkit-eu/js`` / ``@billkit-eu/react``
+          to mount against, so the card form renders in your own page.
+          ``method`` must be omitted; it is chosen inside the element.
+
+        Either way tenant branding kicks in once the buyer reaches the
+        post-purchase portal via ``billing_portal_sessions.create``.
+        """
         body = _drop_none(
             {
                 "customer_id": customer_id,
@@ -2150,7 +2394,14 @@ class CheckoutSessions:
 
 
 class OneShotPayments:
-    """Sync flavour of :class:`AsyncOneShotPayments`."""
+    """Mandate-less one-shot payments (``/v1/checkout/one_shot``).
+
+    A one-shot is the Stripe PaymentIntent shape mapped onto Mollie: a
+    single ``sequenceType=oneoff`` charge that provisions nothing: no
+    subscription, no mandate, no renewals. Drive terminal state via the
+    ``one_shot_payment.succeeded`` / ``.failed`` webhook events; refund
+    one with ``refunds.create(one_shot_payment_id=...)``.
+    """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -2170,7 +2421,29 @@ class OneShotPayments:
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Create a one-off charge. See :class:`AsyncOneShotPayments`."""
+        """Create a one-off charge.
+
+        ``method`` is required and validated against the tenant's Mollie
+        capability allowlist for ``currency`` (one-off-only methods like
+        ``bancontact`` / ``eps`` are allowed here even though they can't
+        back a subscription). ``refund_window_days`` overrides
+        the one-shot default (30d) for this payment: ``None`` inherits the
+        default, ``0`` disables refunds, ``N > 0`` is an ``N``-day window
+        (values above 365 are rejected server-side).
+
+        ``tax_behavior`` says whether ``amount_cents`` is quoted gross or
+        net. ``"inclusive"`` (the default when omitted) charges it as-is
+        and backs the VAT out; ``"exclusive"`` reads it as a net figure
+        and charges ``amount_cents + tax``, so the response's
+        ``amount_cents`` comes back *larger* than the one you sent; it is
+        always what was actually charged. Reconcile against ``net_cents``
+        / ``tax_cents`` on the response. ``None`` inherits the country
+        default from your configured tax rate.
+
+        The response's ``redirect_url`` points at Mollie's hosted checkout.
+        Redirect the payer there; terminal state arrives via the
+        ``one_shot_payment.*`` webhook events.
+        """
         body = _drop_none(
             {
                 "customer_id": customer_id,
@@ -2209,10 +2482,22 @@ class Subscriptions:
         limit: int | None = None,
         starting_after: str | None = None,
     ) -> dict[str, Any]:
-        """List subscriptions, newest first. See :class:`AsyncSubscriptions`.
+        """List subscriptions, newest first, optionally filtered.
 
-        Paused subscriptions are found with ``renewal_state="paused"``;
-        ``status="paused"`` is not an accepted value.
+        ``status`` and ``renewal_state`` each take a comma-separated
+        list (``status="active,past_due"``). An unrecognised value is a
+        400 naming the ones that work, rather than being ignored.
+
+        The two answer different questions, and confusing them is the
+        usual mistake here. ``status`` is where the subscription stands
+        with its payments: ``incomplete``, ``trialing``, ``active``,
+        ``past_due``, ``canceled``. ``renewal_state`` is what happens at
+        the end of the current period: ``auto_renew``, ``paused``,
+        ``canceling``, ``stopped``. A paused subscription still reads as
+        ``active``, because the customer has paid for the period they
+        are in, so ``renewal_state="paused"`` is how you find paused
+        ones. ``status="paused"`` is not accepted and raises
+        :class:`~billkit.InvalidRequestError`.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(
@@ -2234,7 +2519,12 @@ class Subscriptions:
         renewal_state: str | None = None,
         page_size: int | None = None,
     ) -> Iterator[dict[str, Any]]:
-        """Walk every page of ``list()`` and yield each subscription."""
+        """Walk every page of ``list()`` and yield each subscription.
+
+        The filters are carried onto every page request, so a filtered
+        walk narrows server-side instead of paging the whole history and
+        discarding rows locally.
+        """
 
         def _bound(**kwargs: Any) -> dict[str, Any]:
             return self.list(
@@ -2270,11 +2560,13 @@ class Subscriptions:
     def reactivate(
         self, subscription_id: str, *, idempotency_key: str | None = None
     ) -> dict[str, Any]:
-        """Reactivate a canceled-but-still-in-period subscription.
+        """Reactivate a subscription that's been canceled but is still
+        inside its paid-through period.
 
         Distinct from :meth:`resume` (paused → active): reactivate
         flips ``canceled`` back to ``active`` for the remainder of the
-        current period. Returns 409 if the period has already elapsed.
+        current period, so the customer keeps service without a new
+        checkout. Returns 409 if the period has already elapsed.
         """
         return self._t.request(
             "POST",
@@ -2328,7 +2620,37 @@ class Subscriptions:
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Report consumption against a metered subscription.
-        See :meth:`AsyncSubscriptions.create_usage_record`."""
+
+        Only valid when the subscription's price is
+        ``usage_type="metered"``; a licensed subscription is rejected
+        with ``400 parameter_invalid``. Records accumulate until the next
+        period close rolls them into one invoice line; the record's
+        ``invoice_id`` stays ``None`` until then.
+
+        ``quantity`` is the number of units consumed (1..1_000_000).
+        ``occurred_at`` (epoch seconds) backdates batched reporting;
+        omit it to let the server stamp receipt time.
+
+        **Two dedupe mechanisms, for two different failures**, and they are
+        not interchangeable:
+
+        ``idempotency_key``
+            Covers a retry of *this HTTP request*. The SDK generates one
+            per call and reuses it across its own retries, so a timeout
+            inside :mod:`billkit` can never double-count.
+
+        ``identifier``
+            Covers a retry of *your own call* — a job runner replaying a
+            task, a queue delivering twice, your code re-invoking after its
+            own timeout. Those arrive at the API as a genuinely new request
+            with a new key, so the transport-level key cannot see them.
+            Pass the id of whatever you are metering; it is unique within
+            the subscription, and a second report of the same identifier
+            returns the first record unchanged rather than billing twice.
+
+        If your reporting pipeline is at-least-once, ``identifier`` is the
+        one that matters.
+        """
         body = _drop_none(
             {
                 "quantity": quantity,
@@ -2353,7 +2675,12 @@ class Subscriptions:
         starting_after: str | None = None,
     ) -> dict[str, Any]:
         """List usage records for one subscription.
-        See :meth:`AsyncSubscriptions.list_usage_records`."""
+
+        ``invoice_id`` filters by billing state: ``"pending"`` selects
+        records not yet rolled into an invoice, and a concrete invoice
+        id selects the records that invoice billed. ``None`` lists
+        everything.
+        """
         params = _list_params(limit=limit, starting_after=starting_after)
         if invoice_id is not None:
             params["invoice_id"] = invoice_id
@@ -2376,8 +2703,24 @@ class Subscriptions:
         return paginate(_bound, page_size=page_size)
 
     def retrieve_usage_summary(self, subscription_id: str) -> dict[str, Any]:
-        """Price the pending usage before the close bills it.
-        See :meth:`AsyncSubscriptions.retrieve_usage_summary`."""
+        """Price the usage that is pending, before the close bills it.
+
+        :meth:`list_usage_records` with ``invoice_id="pending"`` tells you
+        the quantity. This tells you the money: ``pending_quantity`` and
+        ``pending_record_count``, then ``net_cents`` / ``tax_cents`` /
+        ``gross_cents`` computed through the same rate or tier table and the
+        same VAT resolution the close itself uses.
+
+        Read ``will_charge`` before you promise a customer an amount. A
+        period whose total is under ``minimum_charge_cents`` (€1.00) is not
+        charged at all, because the payment provider would refuse it. The
+        usage is **not** lost: it stays pending and rolls into the next
+        period, which is then billed for both. Without this field the only
+        record of that decision was a server log line.
+
+        ``open_invoice_id`` names an earlier cycle that is invoiced and
+        still unsettled; while one is open, this period cannot be charged.
+        """
         return self._t.request("GET", f"/v1/subscriptions/{subscription_id}/usage_summary")
 
 
@@ -2502,6 +2845,13 @@ class WebhookEndpoints:
         status: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Patch an endpoint, or stop delivery with ``status="disabled"``.
+
+        Disabling keeps the endpoint, its signing secret and its delivery
+        history, and ``status="enabled"`` resumes. Use :meth:`delete` when
+        the endpoint should not exist at all: disabling is reversible and
+        deleting is not.
+        """
         body = _drop_none(
             {
                 "url": url,
@@ -2518,7 +2868,18 @@ class WebhookEndpoints:
         )
 
     def delete(self, endpoint_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
-        """Delete an endpoint. See :class:`AsyncWebhookEndpoints`."""
+        """Delete an endpoint. Returns ``{"deleted": True}``, not the endpoint.
+
+        A URL registered by mistake should not be a permanent fixture of
+        the account, so this removes it: :meth:`retrieve` 404s afterwards
+        and it is gone from :meth:`list`. Its delivery attempts go with
+        it, because they are readable only through the endpoint that owns
+        them. The events themselves are untouched and still in
+        ``client.events``, so what you were sent stays on record.
+
+        Use :meth:`update` with ``status="disabled"`` if you only want
+        delivery to stop.
+        """
         return self._t.request(
             "DELETE",
             f"/v1/webhook_endpoints/{endpoint_id}",
@@ -2557,7 +2918,12 @@ class WebhookEndpoints:
         limit: int | None = None,
         starting_after: str | None = None,
     ) -> dict[str, Any]:
-        """List per-attempt delivery records for one endpoint."""
+        """List per-attempt delivery records for one endpoint.
+
+        Useful when a tenant's receiver is failing. Surfaces the
+        status code, response body excerpt, error, and next-attempt
+        timestamp for each event x endpoint pair.
+        """
         return self._t.request(
             "GET",
             f"/v1/webhook_endpoints/{endpoint_id}/deliveries",
@@ -2599,7 +2965,8 @@ class WebhookEndpoints:
 
         Idempotent: a row already in ``delivered`` returns unchanged.
         ``pending`` / ``failed`` rows flip to ``pending`` with
-        ``next_attempt_at = now()``. ``attempt_count`` is preserved.
+        ``next_attempt_at = now()`` so the dispatcher picks them up
+        on the next tick. ``attempt_count`` is preserved.
         """
         return self._t.request(
             "POST",
@@ -2638,7 +3005,17 @@ class Events:
 
 
 class Tenant:
-    """Sync flavour of :class:`AsyncTenant`."""
+    """Read + mutate tenant-level configuration.
+
+    Today exposes:
+
+    * :meth:`capabilities`: cached Mollie profile shape.
+    * :meth:`portal_branding` / :meth:`set_portal_branding`: the
+      customer-facing portal chrome (business name, support email,
+      logo URL, theme tokens, capability flags).
+    * :meth:`rotate_provider_credential`: replace the encrypted
+      Mollie API key without re-running ``provision_tenant --force``.
+    """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -2659,6 +3036,12 @@ class Tenant:
         capabilities: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Partial-update the portal branding row.
+
+        Unset fields are left alone; explicit ``None`` is **not**
+        sent (use the raw HTTP path if you need explicit-null clears,
+        coming in v0.2). To clear all fields, send empty values.
+        """
         body = _drop_none(
             {
                 "business_name": business_name,
@@ -2683,7 +3066,13 @@ class Tenant:
         provider: str = "mollie",
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Rotate the encrypted provider credential for this tenant."""
+        """Rotate the encrypted provider credential for this tenant.
+
+        ``api_key`` is encrypted server-side; nothing is logged.
+        ``mode`` defaults to the calling key's mode. Catches
+        prefix-mismatch (``test_...`` under live, ``live_...`` under test)
+        at the API boundary.
+        """
         body = _drop_none({"api_key": api_key, "mode": mode, "provider": provider})
         return self._t.request(
             "POST",
@@ -2694,7 +3083,7 @@ class Tenant:
 
 
 class Coupons:
-    """Sync flavour of :class:`AsyncCoupons`."""
+    """Create, validate, and page through promotional codes."""
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -2744,6 +3133,13 @@ class Coupons:
         min_amount_cents: int | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Patch a coupon's limits, or withdraw it with ``active=False``.
+
+        A withdrawn code is refused at checkout while the coupon stays
+        readable and discounts already applied keep working out, which
+        is why there is no delete: a redeemed coupon is part of what a
+        customer was charged. ``active=True`` brings the campaign back.
+        """
         body = _drop_none(
             {
                 "active": active,
@@ -2769,8 +3165,15 @@ class Coupons:
     ) -> dict[str, Any]:
         """Server-side dry-run of a coupon redemption.
 
+        Returns the discount math without atomically claiming the
+        coupon, which is useful for "preview before checkout" UX.
+
         Only ``code`` is required, matching ``POST /v1/coupons/validate``.
-        See :meth:`AsyncCoupons.validate` for what each optional field adds.
+        Omit both optional fields to check the code on its own (exists,
+        active, not exhausted, not expired). Supply ``price_id`` to also
+        check the coupon's ``applies_to_price_ids`` restriction, and
+        ``amount_cents`` to get the discount math plus the
+        ``min_amount_cents`` check.
         """
         body: dict[str, Any] = {"code": code}
         if price_id is not None:
@@ -2796,7 +3199,7 @@ class Coupons:
 
 
 class TaxRates:
-    """Sync flavour of :class:`AsyncTaxRates`."""
+    """Create, update, and page through per-country VAT rates."""
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -2835,6 +3238,13 @@ class TaxRates:
         active: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Correct a rate, retire it with ``active=False``, or bring one back.
+
+        Retiring is how you stop charging VAT in a country. The rate
+        stays readable, because an invoice records the percentage it
+        charged and you have to be able to point at the rate that
+        produced it, which is why there is no delete.
+        """
         body = _drop_none(
             {
                 "rate_basis_points": rate_basis_points,
@@ -2867,13 +3277,40 @@ class TaxRates:
 
 
 class Invoices:
-    """Sync flavour of :class:`AsyncInvoices`."""
+    """Read-only access to generated invoices.
+
+    Invoices are produced by the billing pipeline; tenants don't
+    create them directly. PDF retrieval issues a 302 redirect to the
+    storage adapter's signed URL. Follow it transparently or expose
+    it to the customer.
+    """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
     def retrieve(self, invoice_id: str) -> dict[str, Any]:
         return self._t.request("GET", f"/v1/invoices/{invoice_id}")
+
+    def retrieve_pdf(self, invoice_id: str) -> bytes:
+        """Download the rendered invoice PDF as raw bytes.
+
+        .. code-block:: python
+
+            pdf = client.invoices.retrieve_pdf("inv_123")
+            Path("invoice.pdf").write_bytes(pdf)
+
+        Blob-backed deployments stream the bytes inline; S3-backed ones
+        answer ``302`` to a presigned URL, which the transport follows
+        under the SDK's own timeout and retry policy — so both storage
+        adapters look identical from here.
+
+        Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
+        and answer ``501 rendering_pending``, which surfaces as a
+        :class:`~billkit.ServerError` whose ``code`` is
+        ``"rendering_pending"``; :meth:`retrieve` still returns the
+        structured invoice for tenants who render their own.
+        """
+        return self._t.request_bytes("GET", f"/v1/invoices/{invoice_id}/pdf")
 
     def list(
         self,
@@ -2897,6 +3334,23 @@ class Invoices:
         reason: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Void an invoice: state that the sale was never owed.
+
+        The invoice keeps its number and stays readable — a gapless
+        series cannot lose a row — and stops being a receivable. Use it
+        for an invoice that should not have been issued.
+
+        A **paid** invoice is refused with :class:`ConflictError` whose
+        ``code`` is ``invoice_not_voidable``. That is deliberate: once
+        the money has moved, "never owed" is false, and the document that
+        reverses a real sale is a credit note — refund the payment and
+        one is issued when the refund settles.
+
+        Idempotent: voiding an already-void invoice returns it unchanged.
+
+        ``reason`` is recorded on the audit row only, never on the
+        document.
+        """
         return self._t.request(
             "POST",
             f"/v1/invoices/{invoice_id}/void",
@@ -2906,13 +3360,42 @@ class Invoices:
 
 
 class CreditNotes:
-    """Sync flavour of :class:`AsyncCreditNotes`."""
+    """Read-only access to credit notes — the documents that reverse an
+    issued invoice.
+
+    There is no create. A credit note is issued for you when a refund
+    settles, never on request, so a numbered legal record is only minted
+    once the money has actually moved. A refund still pending, a refund
+    that fails, and a refund of a one-off charge that was never invoiced
+    all produce none.
+    """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
     def retrieve(self, credit_note_id: str) -> dict[str, Any]:
         return self._t.request("GET", f"/v1/credit_notes/{credit_note_id}")
+
+    def retrieve_pdf(self, credit_note_id: str) -> bytes:
+        """Download the rendered credit note PDF as raw bytes.
+
+        .. code-block:: python
+
+            pdf = client.credit_notes.retrieve_pdf("cn_123")
+            Path("credit-note.pdf").write_bytes(pdf)
+
+        Blob-backed deployments stream the bytes inline; S3-backed ones
+        answer ``302`` to a presigned URL, which the transport follows
+        under the SDK's own timeout and retry policy — so both storage
+        adapters look identical from here.
+
+        Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
+        and answer ``501 rendering_pending``, which surfaces as a
+        :class:`~billkit.ServerError` whose ``code`` is
+        ``"rendering_pending"``; :meth:`retrieve` still returns the
+        structured credit note for tenants who render their own.
+        """
+        return self._t.request_bytes("GET", f"/v1/credit_notes/{credit_note_id}/pdf")
 
     def list(
         self,
@@ -2922,6 +3405,12 @@ class CreditNotes:
         invoice_id: str | None = None,
         customer_id: str | None = None,
     ) -> dict[str, Any]:
+        """One page of credit notes, newest first.
+
+        ``invoice_id`` answers "was this sale credited, and by how much",
+        which is the question when reconciling a single invoice;
+        ``customer_id`` answers it for everything credited to one buyer.
+        """
         params = _list_params(limit=limit, starting_after=starting_after)
         for key, value in (("invoice_id", invoice_id), ("customer_id", customer_id)):
             if value is not None:
@@ -2941,7 +3430,7 @@ class CreditNotes:
 
 
 class AuditLogs:
-    """Sync flavour of :class:`AsyncAuditLogs`."""
+    """Read-only access to the per-tenant audit log."""
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -2976,6 +3465,8 @@ class AuditLogs:
         resource_type: str | None = None,
         actor_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
+        """Walk every page of ``list()``; filters are forwarded
+        unchanged so ``action="customer.created"`` etc. work."""
         return paginate(
             self.list,
             page_size=page_size,
@@ -2986,7 +3477,12 @@ class AuditLogs:
 
 
 class Payments:
-    """Sync flavour of :class:`AsyncPayments`."""
+    """Read-only access to the payment ledger.
+
+    Payments are written by the billing pipeline (checkout, renewal,
+    reauthorize). Use this resource to inspect attempts and their
+    Mollie-side metadata; refunds and disputes are separate flows.
+    """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -3011,7 +3507,13 @@ class Payments:
 
 
 class BillingPortalSessions:
-    """Sync flavour of :class:`AsyncBillingPortalSessions`."""
+    """Mint and revoke customer-facing billing-portal sessions.
+
+    Each session token is scoped to a single subscription with a
+    sliding 30-minute idle window and 2-hour hard cap. The token is
+    returned **once** on mint; the response also includes the URL the
+    tenant embeds in their app.
+    """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
@@ -3031,6 +3533,7 @@ class BillingPortalSessions:
         )
 
     def revoke(self, session_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Kill an in-the-wild portal session. Idempotent."""
         return self._t.request(
             "POST",
             f"/v1/billing_portal/sessions/{session_id}/revoke",

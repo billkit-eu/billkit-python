@@ -127,6 +127,20 @@ summary["will_charge"]       # False
 
 Check `will_charge` before you promise a customer an amount. A period whose total is under `minimum_charge_cents` (EUR 1.00) is **not** charged, because the payment provider would refuse it. The usage is not lost: it stays pending and rolls into the next period, which is then billed for both. `open_invoice_id` names an earlier cycle that is invoiced and still unsettled; while one is open, this period cannot be charged.
 
+## Telling buyers from abandoned carts
+
+A checkout that captures an email commits its Customer **before** the charge,
+so a checkout nobody finished leaves a row behind. `provisional` is what
+separates the two:
+
+```python
+paid = client.customers.list(provisional=False)   # people who bought
+carts = client.customers.list(provisional=True)   # the cart-recovery worklist
+everyone = client.customers.list()                # both kinds, the default
+```
+
+Abandoned rows are swept after the tenant's retention window.
+
 ## Finding paused subscriptions
 
 `status` and `renewal_state` answer different questions, and only one of them knows about pausing. `status` is where the subscription stands with its payments (`incomplete`, `trialing`, `active`, `past_due`, `canceled`). `renewal_state` is what happens when the current period ends (`auto_renew`, `paused`, `canceling`, `stopped`). Pausing sets `renewal_state` and leaves `status` at `active`, because the customer has paid for the period they are in:
@@ -164,6 +178,17 @@ client.webhook_endpoints.update(endpoint["id"], status="disabled")
 client.customers.delete(customer["id"])  # -> {"deleted": True, ...}
 ```
 
+## Invoice and credit-note PDFs
+
+```python
+from pathlib import Path
+
+Path("invoice.pdf").write_bytes(client.invoices.retrieve_pdf("inv_123"))
+Path("credit-note.pdf").write_bytes(client.credit_notes.retrieve_pdf("cn_123"))
+```
+
+Returns the raw bytes. S3-backed deployments answer with a redirect to a presigned URL, which the SDK follows under its own timeout and retry policy, so both storage adapters look the same from here — and the API key is never sent to the storage host, because the presigned URL carries its own credential. A deployment with PDF rendering disabled answers `501`, which surfaces as a `ServerError` with `code == "rendering_pending"`; `retrieve()` still gives you the structured document to render yourself.
+
 ## Async
 
 ```python
@@ -191,6 +216,8 @@ client = BillKit(
 
 The SDK auto-generates an `Idempotency-Key` for every mutating call, so 5xx and short `Retry-After` 429 retries are safe: the server replays the original response when an earlier attempt completed. Pass `idempotency_key=` to coalesce retries across process restarts.
 
+`409 idempotency_in_progress` is retried too. It means an earlier request carrying the same key is still in flight, which is the one 4xx where giving up is the dangerous answer: that request may already have charged the customer, and the obvious workaround — retry with a *fresh* key — is exactly what turns one charge into two. The retry reuses the original key, so it either loses the race again or replays the first call's result. Every other 409 (`idempotency_key_in_use`, a conflicting subscription state) fails immediately, because retrying can only repeat it.
+
 ## Errors
 
 ```python
@@ -208,6 +235,20 @@ except BillKitError as exc:
 ```
 
 All errors inherit from `BillKitError`. Subclasses: `APIConnectionError`, `APIError`, `ServerError`, `AuthenticationError`, `PermissionError`, `ResourceMissingError`, `InvalidRequestError`, `ConflictError`, `RateLimitError`.
+
+The class is chosen by **HTTP status**, not by the envelope's `type`:
+
+| Status | Class |
+|---|---|
+| 401 | `AuthenticationError` |
+| 403 | `PermissionError` |
+| 404 | `ResourceMissingError` |
+| 409 | `ConflictError` |
+| 429 | `RateLimitError` |
+| other 4xx (400, 405, 422, …) | `InvalidRequestError` |
+| 5xx | `ServerError` |
+
+The status is the field the API cannot get wrong. Requests that never reach a route handler — an unmatched path, a method the route does not allow — are serialised by the framework as `{"type": "api_error", "code": "unhandled"}` *with a 4xx status*, so mapping on `type` would turn a plain 404 into a `ServerError` and tell you BillKit had broken when the request was at fault. The envelope's `type`, `code` and `param` are all still on the raised object if you want them.
 
 ## Logging
 

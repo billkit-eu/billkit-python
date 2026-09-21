@@ -3,9 +3,15 @@
 Both :class:`billkit.BillKit` (sync) and :class:`billkit.AsyncBillKit`
 delegate to a transport in this module. The async transport wraps
 ``httpx.AsyncClient``; the sync transport wraps ``httpx.Client``.
-They share :func:`_build_request_kwargs`, :func:`_handle_response`,
+They share :func:`_build_request_kwargs`, :func:`_raise_for_status`,
 and the retry decision in :mod:`billkit._retry` so behaviour is
 identical across both surfaces.
+
+Each transport exposes one retry loop, ``_send``, returning the raw 2xx
+response. ``request`` decodes it as JSON and ``request_bytes`` hands back
+the bytes, so the document routes (invoice and credit-note PDFs) inherit
+the same timeout, retry budget and typed errors as every resource call
+rather than carrying a second copy of them.
 """
 
 from __future__ import annotations
@@ -41,6 +47,7 @@ def _build_request_kwargs(
     json_body: dict[str, Any] | None,
     idempotency_key: str | None,
     extra_headers: dict[str, str] | None,
+    follow_redirects: bool = False,
 ) -> dict[str, Any]:
     headers: dict[str, str] = {
         "Authorization": f"Bearer {api_key}",
@@ -62,6 +69,8 @@ def _build_request_kwargs(
         kwargs["params"] = {k: v for k, v in params.items() if v is not None}
     if json_body is not None:
         kwargs["json"] = json_body
+    if follow_redirects:
+        kwargs["follow_redirects"] = True
     return kwargs
 
 
@@ -109,18 +118,29 @@ def _retry_delay(
     return policy.backoff_for(attempt + 1)
 
 
-def _handle_response(response: httpx.Response) -> dict[str, Any]:
+def _raise_for_status(response: httpx.Response) -> None:
+    """Turn a non-2xx into the right typed error, or return quietly.
+
+    Split from decoding because the two response shapes the SDK reads —
+    JSON resources and PDF bytes — fail identically. An error is an error
+    envelope whichever endpoint produced it, so the document routes throw
+    the same typed errors as everything else rather than a shapeless one.
+    """
     if 200 <= response.status_code < 300:
-        decoded = _decode_json(response)
-        # Normalise an empty/204 body to ``{}`` so callers always get a
-        # dict, with no ``| None`` to narrow at every call site.
-        return decoded if decoded is not None else {}
+        return
     raise error_from_response(
         response.status_code,
         _decode_json(response),
         request_id=_request_id(response),
         retry_after=_retry_after(response),
     )
+
+
+def _decode_success(response: httpx.Response) -> dict[str, Any]:
+    # Normalise an empty/204 body to ``{}`` so callers always get a dict,
+    # with no ``| None`` to narrow at every call site.
+    decoded = _decode_json(response)
+    return decoded if decoded is not None else {}
 
 
 # --- logging helpers -------------------------------------------------
@@ -228,6 +248,46 @@ class AsyncTransport(_BaseTransport):
         idempotency_key: str | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """Perform one API call and return its decoded JSON body."""
+        return _decode_success(
+            await self._send(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                idempotency_key=idempotency_key,
+                extra_headers=extra_headers,
+            )
+        )
+
+    async def request_bytes(self, method: str, path: str) -> bytes:
+        """Fetch a document route's raw bytes (the invoice + credit-note PDFs).
+
+        Same retry budget, timeout and typed errors as :meth:`request`;
+        only the success-path decoding differs.
+
+        ``follow_redirects`` is on for this call alone. S3-backed
+        deployments answer ``302`` to a presigned URL while blob-backed
+        ones stream the bytes inline, and following it is what makes the
+        two storage adapters look identical from here. ``httpx`` drops the
+        ``Authorization`` header on a cross-origin redirect, which is
+        exactly right: the presigned URL carries its own credential and
+        must not be handed BillKit's API key.
+        """
+        return (await self._send(method, path, follow_redirects=True)).content
+
+    async def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        follow_redirects: bool = False,
+    ) -> httpx.Response:
+        """The retry loop. Returns the first 2xx response, or raises."""
         url = self._path(path)
         kwargs = _build_request_kwargs(
             api_key=self._api_key,
@@ -237,6 +297,7 @@ class AsyncTransport(_BaseTransport):
             json_body=json_body,
             idempotency_key=auto_idempotency_key(method, idempotency_key),
             extra_headers=extra_headers,
+            follow_redirects=follow_redirects,
         )
         last_exc: BillKitError | None = None
         for attempt in range(1, self._retry_policy.max_attempts + 1):
@@ -260,14 +321,21 @@ class AsyncTransport(_BaseTransport):
                 _request_id(response),
             )
             try:
-                return _handle_response(response)
+                _raise_for_status(response)
+                return response
             except BillKitError as exc:
                 retry_after = _retry_after(response)
+                # ``exc.code`` is what separates a transient
+                # ``409 idempotency_in_progress`` from every other
+                # (permanent) 409; see ``_retry.IN_PROGRESS_CODE``. The key
+                # on the wire is unchanged across attempts, so the retry
+                # replays rather than re-charges.
                 if not should_retry(
                     response.status_code,
                     attempt=attempt,
                     policy=self._retry_policy,
                     retry_after_seconds=retry_after,
+                    error_code=exc.code,
                 ):
                     raise
                 last_exc = exc
@@ -322,6 +390,35 @@ class SyncTransport(_BaseTransport):
         idempotency_key: str | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """Perform one API call and return its decoded JSON body."""
+        return _decode_success(
+            self._send(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                idempotency_key=idempotency_key,
+                extra_headers=extra_headers,
+            )
+        )
+
+    def request_bytes(self, method: str, path: str) -> bytes:
+        """Fetch a document route's raw bytes. See
+        :meth:`AsyncTransport.request_bytes`."""
+        return self._send(method, path, follow_redirects=True).content
+
+    def _send(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        extra_headers: dict[str, str] | None = None,
+        follow_redirects: bool = False,
+    ) -> httpx.Response:
+        """The retry loop. Returns the first 2xx response, or raises."""
         url = self._path(path)
         kwargs = _build_request_kwargs(
             api_key=self._api_key,
@@ -331,6 +428,7 @@ class SyncTransport(_BaseTransport):
             json_body=json_body,
             idempotency_key=auto_idempotency_key(method, idempotency_key),
             extra_headers=extra_headers,
+            follow_redirects=follow_redirects,
         )
         last_exc: BillKitError | None = None
         for attempt in range(1, self._retry_policy.max_attempts + 1):
@@ -354,14 +452,21 @@ class SyncTransport(_BaseTransport):
                 _request_id(response),
             )
             try:
-                return _handle_response(response)
+                _raise_for_status(response)
+                return response
             except BillKitError as exc:
                 retry_after = _retry_after(response)
+                # ``exc.code`` is what separates a transient
+                # ``409 idempotency_in_progress`` from every other
+                # (permanent) 409; see ``_retry.IN_PROGRESS_CODE``. The key
+                # on the wire is unchanged across attempts, so the retry
+                # replays rather than re-charges.
                 if not should_retry(
                     response.status_code,
                     attempt=attempt,
                     policy=self._retry_policy,
                     retry_after_seconds=retry_after,
+                    error_code=exc.code,
                 ):
                     raise
                 last_exc = exc

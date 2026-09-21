@@ -1,6 +1,6 @@
-"""Verify retry policy: 5xx + network failures retry, 4xx do not,
-the SDK-generated Idempotency-Key stays stable across attempts so
-the server can replay."""
+"""Verify retry policy: 5xx + network failures retry, 4xx do not —
+except ``409 idempotency_in_progress`` — and the SDK-generated
+Idempotency-Key stays stable across attempts so the server can replay."""
 
 from __future__ import annotations
 
@@ -8,7 +8,13 @@ import httpx
 import pytest
 import respx
 
-from billkit import AsyncBillKit, AuthenticationError, RateLimitError, ServerError
+from billkit import (
+    AsyncBillKit,
+    AuthenticationError,
+    ConflictError,
+    RateLimitError,
+    ServerError,
+)
 
 
 @pytest.mark.asyncio
@@ -114,3 +120,68 @@ async def test_idempotency_key_stable_across_retries(
     second_key = route.calls[1].request.headers["Idempotency-Key"]
     assert first_key == second_key
     assert first_key.startswith("sdk-")
+
+
+def _conflict(code: str) -> httpx.Response:
+    return httpx.Response(
+        409, json={"error": {"type": "conflict", "code": code, "message": "in flight"}}
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_409_in_progress_is_retried_then_replays(async_client: AsyncBillKit) -> None:
+    """The one 4xx worth retrying.
+
+    ``idempotency_in_progress`` says a request carrying this same key is
+    still running elsewhere, so the charge may already have happened.
+    Surfacing it invites the caller to retry with a *fresh* key, which is
+    what turns one charge into two.
+    """
+    route = respx.post("https://test.billkit.eu/v1/customers").mock(
+        side_effect=[
+            _conflict("idempotency_in_progress"),
+            httpx.Response(200, json={"id": "cus_1"}),
+        ]
+    )
+    customer = await async_client.customers.create(email="a@b.co")
+    assert customer["id"] == "cus_1"
+    assert route.call_count == 2
+    # The whole reason retrying is safe: the second attempt replays rather
+    # than re-charging, and only an unchanged key can do that.
+    keys = {call.request.headers["idempotency-key"] for call in route.calls}
+    assert len(keys) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_409_with_any_other_code_is_not_retried(async_client: AsyncBillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/customers").mock(
+        return_value=_conflict("idempotency_key_in_use")
+    )
+    with pytest.raises(ConflictError):
+        await async_client.customers.create(email="a@b.co")
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_409_without_a_code_is_not_retried(async_client: AsyncBillKit) -> None:
+    """A conflict the envelope does not name is a caller-fault conflict."""
+    route = respx.post("https://test.billkit.eu/v1/customers").mock(
+        return_value=httpx.Response(409, json={"error": {"type": "conflict", "message": "clash"}})
+    )
+    with pytest.raises(ConflictError):
+        await async_client.customers.create(email="a@b.co")
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_409_in_progress_retries_are_bounded(async_client: AsyncBillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/customers").mock(
+        return_value=_conflict("idempotency_in_progress")
+    )
+    with pytest.raises(ConflictError):
+        await async_client.customers.create(email="a@b.co")
+    assert route.call_count == 3  # max_attempts in FAST_RETRY

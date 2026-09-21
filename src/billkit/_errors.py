@@ -4,8 +4,11 @@ The API returns errors in the Stripe-shape::
 
     {"error": {"type": "...", "code": "...", "message": "...", "param": "..."}}
 
-Each ``type`` maps to one exception class so callers can ``except
-RateLimitError`` instead of branching on HTTP status codes.
+The HTTP **status** picks the class, so callers can ``except
+RateLimitError`` instead of branching on status codes themselves. The
+envelope's ``type``/``code``/``param`` ride along on the raised object.
+See :func:`_class_for_status` for why the status, and not ``type``, is
+the authority.
 """
 
 from __future__ import annotations
@@ -89,19 +92,40 @@ class RateLimitError(BillKitError):
         self.retry_after = retry_after
 
 
-_TYPE_TO_EXC: dict[str, type[BillKitError]] = {
-    "api_connection_error": APIConnectionError,
-    # ``api_error`` is the Stripe-convention type for 5xx, so surface it as
-    # ``ServerError`` (a subclass of ``APIError``) so a caller can
-    # ``except ServerError`` without false negatives.
-    "api_error": ServerError,
-    "authentication_error": AuthenticationError,
-    "permission_error": PermissionError,
-    "invalid_request_error": InvalidRequestError,
-    "idempotency_error": ConflictError,
-    "conflict": ConflictError,
-    "rate_limit_error": RateLimitError,
-}
+def _class_for_status(status_code: int) -> type[BillKitError]:
+    """Pick the exception class from the HTTP **status**, not the envelope
+    ``type``.
+
+    The status is the field the API cannot get wrong. ``type`` is accurate
+    for errors BillKit raises itself, but a request that never reaches a
+    route handler — an unmatched path, a method the route does not allow —
+    is serialised by the framework-level handler as
+    ``{"type": "api_error", "code": "unhandled"}`` *with a 4xx status*.
+    Trusting ``type`` there mapped a plain ``404 Not Found`` (a typo in a
+    resource id, or an SDK/API version skew) onto :class:`ServerError`,
+    telling the caller BillKit had broken when their own request was at
+    fault — and ``ServerError`` is the class retry and alerting policies
+    key on.
+
+    The envelope ``type`` is still preserved verbatim on
+    :attr:`BillKitError.type`; only the class is status-driven. The node
+    and php clients decide this the same way.
+    """
+    if status_code >= 500:
+        return ServerError
+    if status_code == 401:
+        return AuthenticationError
+    if status_code == 403:
+        return PermissionError
+    if status_code == 404:
+        return ResourceMissingError
+    if status_code == 409:
+        return ConflictError
+    if status_code == 429:
+        return RateLimitError
+    # Everything else below 500 (400, 405, 422, 451 ...) is a request the
+    # caller has to change.
+    return InvalidRequestError
 
 
 def error_from_response(
@@ -113,29 +137,24 @@ def error_from_response(
 ) -> BillKitError:
     """Map an HTTP error response to the right exception subclass.
 
-    Falls back to :class:`APIError` for 5xx and
-    :class:`InvalidRequestError` for 4xx when the body doesn't follow
-    the Stripe-shape envelope (e.g. a Traefik 502 HTML page).
+    A body that doesn't follow the Stripe-shape envelope (a Traefik 502
+    HTML page, an empty 404) still produces a typed error, because the
+    status alone is enough to choose one.
     """
     error_obj = (body or {}).get("error") if isinstance(body, dict) else None
     if not isinstance(error_obj, dict):
         error_obj = {}
 
     err_type = error_obj.get("type") or _fallback_type(status_code)
-    message = error_obj.get("message") or _fallback_message(status_code)
-    code = error_obj.get("code")
-    param = error_obj.get("param")
+    message = error_obj.get("message") or (
+        f"BillKit API returned HTTP {status_code} with no error body."
+    )
 
-    exc_class = _TYPE_TO_EXC.get(err_type, _fallback_class(status_code))
-    if status_code == 404 and exc_class is InvalidRequestError:
-        exc_class = ResourceMissingError
-    if status_code == 409 and exc_class is InvalidRequestError:
-        exc_class = ConflictError
-
+    exc_class = _class_for_status(status_code)
     kwargs: dict[str, Any] = {
         "type": err_type,
-        "code": code,
-        "param": param,
+        "code": error_obj.get("code"),
+        "param": error_obj.get("param"),
         "status_code": status_code,
         "request_id": request_id,
         "raw_body": body if isinstance(body, dict) else None,
@@ -146,6 +165,8 @@ def error_from_response(
 
 
 def _fallback_type(status_code: int) -> str:
+    """The ``type`` the API would have sent, for a response that carried no
+    envelope. Only fills :attr:`BillKitError.type`; it never picks the class."""
     if status_code == 401:
         return "authentication_error"
     if status_code == 403:
@@ -159,23 +180,3 @@ def _fallback_type(status_code: int) -> str:
     if status_code >= 500:
         return "api_error"
     return "invalid_request_error"
-
-
-def _fallback_message(status_code: int) -> str:
-    return f"BillKit API returned HTTP {status_code} with no error body."
-
-
-def _fallback_class(status_code: int) -> type[BillKitError]:
-    if status_code == 401:
-        return AuthenticationError
-    if status_code == 403:
-        return PermissionError
-    if status_code == 404:
-        return ResourceMissingError
-    if status_code == 409:
-        return ConflictError
-    if status_code == 429:
-        return RateLimitError
-    if status_code >= 500:
-        return ServerError
-    return InvalidRequestError
