@@ -79,6 +79,7 @@ COVERED: set[str] = {
     "crud.credit_note_absent_until_refunded",
     "filters.subscription_renewal_state",
     "filters.customer_provisional",
+    "filters.audit_resource_id",
     "pagination.has_more",
     "pagination.auto_iter",
     "idempotency.replay",
@@ -101,6 +102,9 @@ COVERED: set[str] = {
     "webhooks.verify_roundtrip",
     "webhooks.reject_tampered",
     "webhooks.reject_stale",
+    "methods.recurring_vocabulary",
+    "methods.one_shot_vocabulary",
+    "methods.banktransfer_settles_in_days",
 }
 
 
@@ -438,6 +442,37 @@ def test_filters_customer_provisional() -> None:
     # reachable at all: the default answer is not the one a "list my
     # customers" screen wants.
     assert created["id"] in ids()
+
+
+def test_filters_audit_resource_id() -> None:
+    """[filters.audit_resource_id] resource_id narrows to one row's history.
+
+    The question an audit log mostly exists for: everything that ever
+    happened to *this* customer. It was reachable only from php, which
+    forwards an array, while node and python named three of the API's four
+    filters and omitted this one.
+    """
+    t = provision_tenant("audit-resource")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+
+    subject = c.customers.create(email=f"subject-{idem_key()}@example.com")
+    # A second customer, so "only the subject's rows" is an assertion
+    # rather than a restatement of an empty tenant.
+    other = c.customers.create(email=f"other-{idem_key()}@example.com")
+    c.customers.update(subject["id"], name="Renamed")
+
+    def rows(**filters: Any) -> list[dict[str, Any]]:
+        return list(c.audit_logs.list(limit=100, **filters)["data"])
+
+    scoped = rows(resource_id=subject["id"])
+    assert scoped
+    assert all(row["resource_id"] == subject["id"] for row in scoped)
+    assert other["id"] not in [row["resource_id"] for row in scoped]
+
+    # Combines with resource_type rather than replacing it.
+    narrowed = rows(resource_id=subject["id"], resource_type="customer")
+    assert narrowed
+    assert all(row["resource_id"] == subject["id"] for row in narrowed)
 
 
 # ── pagination ───────────────────────────────────────────────────────
@@ -836,6 +871,139 @@ def test_webhooks_reject_stale() -> None:
         WebhookSignature.verify(
             payload=BODY, signature_header=_sign(SECRET, BODY, stale), secret=SECRET
         )
+
+
+# ── methods ──────────────────────────────────────────────────────────
+#
+# The two request surfaces take different method sets, and this SDK
+# spells both out in docstrings rather than in types, so nothing but a
+# live call can tell you whether a promotion reached it.
+
+#: The vocabulary a *price* may offer. Mirrors the server's ``RecurringMethod``,
+#: which is also what this SDK's checkout ``method`` docstring spells out.
+RECURRING_METHODS = ("creditcard", "directdebit", "ideal", "eps", "applepay", "paypal")
+
+#: The subset that can actually be a checkout's ``method``, i.e. that Mollie
+#: will mint a mandate from at ``sequenceType=first``.
+#:
+#: ``directdebit`` is the one member of ``RECURRING_METHODS`` missing here, and
+#: the distinction is the whole point of the scenario: SEPA belongs in a price's
+#: allowlist because it is what the renewals settle on, but it can never be the
+#: FIRST charge — the mandate has to be minted by a card, iDEAL, EPS, Apple Pay
+#: or PayPal payment before anything can be collected over it.
+MANDATE_CREATING_METHODS = ("creditcard", "ideal", "eps", "applepay", "paypal")
+
+#: Everything a single ``sequenceType=oneoff`` charge may use.
+ONE_SHOT_METHODS = (*RECURRING_METHODS, "bancontact", "banktransfer")
+
+
+def _buyer(c: BillKit) -> dict[str, Any]:
+    return c.customers.create(email=f"method-{idem_key()}@sdk-it.example.com", country_code="AT")
+
+
+def _one_shot(c: BillKit, method: str) -> dict[str, Any]:
+    return c.one_shot_payments.create(
+        customer_id=_buyer(c)["id"],
+        amount_cents=2500,
+        currency="EUR",
+        method=method,
+        success_url="https://merchant.example.com/ok",
+    )
+
+
+def test_methods_recurring_vocabulary() -> None:
+    """[methods.recurring_vocabulary] checkout takes exactly the mandate-minting set.
+
+    Narrower than the one-shot set on purpose: a checkout has to mint the
+    mandate the renewal will charge. It is also narrower than the price
+    allowlist, which is the part that surprises people — ``directdebit``
+    is a perfectly good thing for a price to offer and can never be the
+    payment that starts one.
+    """
+    t = provision_tenant("methods-recurring")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+    product = c.products.create(name=f"Plan {idem_key()}")
+    price = c.prices.create(
+        product_id=product["id"],
+        amount_cents=2500,
+        currency="EUR",
+        interval="month",
+        # The allowlist has to name them too, or the refusals below are the
+        # price's and not the vocabulary's.
+        payment_methods=list(RECURRING_METHODS),
+    )
+
+    def start_checkout(method: str) -> dict[str, Any]:
+        # A customer each: an in-flight initial_checkout is guarded per
+        # customer, so reusing one would fail the second method for a
+        # reason that has nothing to do with its name.
+        return c.checkout_sessions.create(
+            customer_id=_buyer(c)["id"],
+            price_id=price["id"],
+            method=method,
+            success_url="https://merchant.example.com/ok",
+            cancel_url="https://merchant.example.com/cancel",
+        )
+
+    for method in MANDATE_CREATING_METHODS:
+        assert start_checkout(method)["id"], f"{method} should start a checkout"
+
+    # Two different refusals, and they come from two different layers.
+    #
+    # ``directdebit`` passes the request literal — it IS a RecurringMethod,
+    # and the price above offers it — and is refused by the service, because
+    # SEPA is what renewals settle on rather than something a buyer can pay
+    # with first.
+    #
+    # ``bancontact`` and ``banktransfer`` never reach the service: neither is
+    # in ``RecurringMethod`` at all, so the schema rejects them. Mollie
+    # refuses banktransfer outright anyway ("The payment method does not
+    # support sequence type").
+    #
+    # Both surface as the same exception, which is the contract this asserts;
+    # the reasons differ and are worth knowing when one fires.
+    for method in ("directdebit", "bancontact", "banktransfer"):
+        with pytest.raises(InvalidRequestError):
+            start_checkout(method)
+
+
+def test_methods_one_shot_vocabulary() -> None:
+    """[methods.one_shot_vocabulary] a one-off charge takes every method.
+
+    ``banktransfer`` included, and the retired ``giropay`` refused: the
+    scheme shut down at the end of 2024, so its refusal is part of the
+    contract rather than an omission.
+    """
+    t = provision_tenant("methods-oneshot")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+
+    for method in ONE_SHOT_METHODS:
+        charge = _one_shot(c, method)
+        assert charge["id"], f"{method} should take a one-off charge"
+
+    with pytest.raises(InvalidRequestError):
+        _one_shot(c, "giropay")
+
+
+def test_methods_banktransfer_settles_in_days() -> None:
+    """[methods.banktransfer_settles_in_days] a bank transfer is held open for a fortnight.
+
+    The payer is handed bank details and pays on their own schedule, so
+    ``pending`` is not a failure and not something to poll.
+    """
+    t = provision_tenant("methods-banktransfer")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+
+    card = _one_shot(c, "creditcard")
+    transfer = _one_shot(c, "banktransfer")
+
+    # Relative, not absolute: the window is copied from the provider's own
+    # answer rather than invented by BillKit, so pinning an exact number
+    # would assert the fake's arithmetic instead of the behaviour an
+    # integrator has to plan for.
+    assert transfer["expires_at"] > card["expires_at"]
+    days = (transfer["expires_at"] - time.time()) / 86_400
+    assert days > 5, "a bank transfer stays open for days, not minutes"
 
 
 # ── parity gate ──────────────────────────────────────────────────────

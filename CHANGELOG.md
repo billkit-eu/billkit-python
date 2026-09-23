@@ -10,6 +10,49 @@ so the numbers will diverge after this first release.
 
 Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
+## [0.6.0] - 2026-09-23
+
+### Added
+- **`eps` and `paypal` can now start a subscription**, not just take a one-off
+  charge. Both are accepted wherever a payment method is named:
+  `checkout_sessions.create(method=...)`, a price's `payment_methods`
+  allowlist, and `one_shot_payments.create(method=...)`.
+  - **EPS** mints a *SEPA* mandate, exactly as iDEAL does, so the subscription
+    renews on `directdebit`.
+  - EPS is **Austria-only** and carries a **EUR 1.00 minimum** — a hundred
+    times iDEAL's. A fully-discounted first charge on a price offering it is
+    raised to that floor.
+  - **PayPal** mints a `paypal` mandate and renews on itself. No country
+    restriction.
+  - `bancontact` stays one-off only: Mollie's recurring guide and its
+    Bancontact method page disagree about whether it mints a mandate, and that
+    is being settled against a live profile rather than guessed.
+
+- **`banktransfer` is accepted by `one_shot_payments.create(method=...)`.**
+  One-off only, for the same reason `bancontact` is.
+  - It mints no mandate, so it can neither anchor a subscription nor settle a
+    metered cycle. Mollie refuses it at `sequenceType=first` with "The payment
+    method does not support sequence type" — which is why the checkout
+    vocabulary stays narrower than the one-shot one.
+  - **It settles in days, not seconds.** The payer is handed bank details and
+    pays on their own schedule, so Mollie holds the payment `open` for about a
+    fortnight and `expires_at` comes back roughly 13 days out.
+  - A pending bank transfer is **not a failure and not something to poll** —
+    wait for `one_shot_payment.succeeded` / `.failed`.
+  - Nothing expires early: the server's reaper keys on the `expires_at` copied
+    from Mollie's own answer, not on a BillKit-invented window.
+  - Minimum is EUR 0.01, measured against a live profile rather than read off
+    a page.
+
+- **`resource_id` filter on `audit_logs.list()` and `audit_logs.iter()`**, on
+  both the sync and the async client.
+  - It answers "everything that ever happened to this customer", which is the
+    question an audit log mostly exists for.
+  - The API has always accepted it; this SDK named three of its four filters
+    and omitted this one.
+  - Matches exactly, and combines with `resource_type` rather than replacing
+    it.
+
 ## [0.5.0] - 2026-09-22
 
 ### Added
@@ -213,6 +256,12 @@ First public release.
   API keys, request/response bodies and query strings are never logged, and the
   final failure is raised rather than logged so you never get a duplicate entry.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/billkit-eu/billkit-python/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/billkit-eu/billkit-python/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/billkit-eu/billkit-python/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/billkit-eu/billkit-python/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/billkit-eu/billkit-python/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/billkit-eu/billkit-python/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/billkit-eu/billkit-python/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/billkit-eu/billkit-python/releases/tag/v0.1.0

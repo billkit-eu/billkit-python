@@ -1,6 +1,6 @@
 {
   "$comment": "Machine-readable scenario matrix every SDK integration suite must cover. See SCENARIOS.md for the rationale and for how to add one. Each suite asserts it implements every scenario in ITS OWN family, so adding an entry fails the other SDKs in that family until they catch up. Families: 'server' (node/python/php), 'browser' (js/react), 'framework' (laravel).",
-  "version": 4,
+  "version": 5,
   "families": {
     "server": ["node", "python", "php"],
     "browser": ["js", "react"],
@@ -24,6 +24,7 @@
 
     { "id": "filters.subscription_renewal_state", "family": "server", "group": "filters", "summary": "A paused subscription is found by renewal_state=paused while its status stays active; status=paused maps to the invalid-request exception." },
     { "id": "filters.customer_provisional", "family": "server", "group": "filters", "summary": "customers.list(provisional=false) returns a created customer and provisional=true does not, with both listed when the filter is omitted." },
+    { "id": "filters.audit_resource_id", "family": "server", "group": "filters", "summary": "audit_logs.list(resource_id=...) returns only the rows for that one resource, and combines with resource_type. The 'everything that happened to this customer' query." },
 
     { "id": "pagination.has_more", "family": "server", "group": "pagination", "summary": "limit < N yields has_more and an exactly-limit-long page." },
     { "id": "pagination.auto_iter", "family": "server", "group": "pagination", "summary": "Auto-paging iterator yields every row exactly once." },
@@ -52,6 +53,10 @@
     { "id": "webhooks.verify_roundtrip", "family": "server", "group": "webhooks", "summary": "A correctly signed payload verifies." },
     { "id": "webhooks.reject_tampered", "family": "server", "group": "webhooks", "summary": "A mutated body fails verification." },
     { "id": "webhooks.reject_stale", "family": "server", "group": "webhooks", "summary": "A timestamp outside tolerance fails verification." },
+
+    { "id": "methods.recurring_vocabulary", "family": "server", "group": "methods", "summary": "Every mandate-MINTING method is accepted on checkout create, and three are refused: directdebit, which a price may offer but which can never be a first payment, plus bancontact and banktransfer, which are not recurring methods at all. Pins the SDK's checkout union to the server's RecurringMethod and to the narrower set the service will actually start a checkout with." },
+    { "id": "methods.one_shot_vocabulary", "family": "server", "group": "methods", "summary": "Every method a one-off charge may use is accepted on one_shot create, including banktransfer, and the retired giropay is refused. Pins the SDK's wider one-shot union to the server's OneShotMethod." },
+    { "id": "methods.banktransfer_settles_in_days", "family": "server", "group": "methods", "summary": "A banktransfer one-shot comes back with an expires_at a fortnight out, not minutes: the payer is handed bank details and pays on their own schedule, so pending is not a failure and not something to poll." },
 
     { "id": "element.mount", "family": "browser", "group": "element", "summary": "The iframe mounts at the configured origin+path and the client_secret is never in the URL." },
     { "id": "element.handshake", "family": "browser", "group": "element", "summary": "init is posted only after the iframe's ready, targeted at the exact origin, carrying a REAL client_secret and the session id parsed from it." },

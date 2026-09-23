@@ -628,8 +628,8 @@ class AsyncCheckoutSessions:
         existing customer via ``customers.update`` instead.
 
         ``method`` pins the Mollie payment method (``"creditcard"``,
-        ``"directdebit"``, ``"ideal"`` or ``"applepay"``); ``None`` lets
-        Mollie pick. ``coupon_code`` is
+        ``"directdebit"``, ``"ideal"``, ``"eps"``, ``"applepay"`` or
+        ``"paypal"``); ``None`` lets Mollie pick. ``coupon_code`` is
         atomically claimed at session creation. ``trial_days_override``
         replaces the price's trial for this session only and is server
         capped at ``2 * max(price.trial_days, 14)`` (``0`` disables a
@@ -717,8 +717,10 @@ class AsyncOneShotPayments:
 
         ``method`` is required and validated against the tenant's Mollie
         capability allowlist for ``currency`` (one-off-only methods like
-        ``bancontact`` / ``eps`` are allowed here even though they can't
-        back a subscription). ``refund_window_days`` overrides
+        ``bancontact`` / ``banktransfer`` are allowed here even though they
+        can't back a subscription; ``banktransfer`` in particular settles
+        in days rather than seconds, because the payer is handed bank
+        details and Mollie holds the payment open for about a fortnight). ``refund_window_days`` overrides
         the one-shot default (30d) for this payment: ``None`` inherits the
         default, ``0`` disables refunds, ``N > 0`` is an ``N``-day window
         (values above 365 are rejected server-side).
@@ -1745,12 +1747,22 @@ class AsyncAuditLogs:
         starting_after: str | None = None,
         action: str | None = None,
         resource_type: str | None = None,
+        resource_id: str | None = None,
         actor_id: str | None = None,
     ) -> dict[str, Any]:
+        """List audit-log entries, newest first, optionally filtered.
+
+        All four filters match exactly and combine. ``resource_type``
+        narrows to a kind (``"customer"``, ``"price"``); ``resource_id``
+        narrows to one row, which is the "everything that ever happened
+        to this customer" question an audit log mostly exists for. Pair
+        them or pass ``resource_id`` alone — ids are already unique.
+        """
         params = _list_params(limit=limit, starting_after=starting_after)
         for key, value in (
             ("action", action),
             ("resource_type", resource_type),
+            ("resource_id", resource_id),
             ("actor_id", actor_id),
         ):
             if value is not None:
@@ -1763,6 +1775,7 @@ class AsyncAuditLogs:
         page_size: int | None = None,
         action: str | None = None,
         resource_type: str | None = None,
+        resource_id: str | None = None,
         actor_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Walk every page of ``list()``; filters are forwarded
@@ -1772,6 +1785,7 @@ class AsyncAuditLogs:
             page_size=page_size,
             action=action,
             resource_type=resource_type,
+            resource_id=resource_id,
             actor_id=actor_id,
         )
 
@@ -2336,8 +2350,8 @@ class CheckoutSessions:
         existing customer via ``customers.update`` instead.
 
         ``method`` pins the Mollie payment method (``"creditcard"``,
-        ``"directdebit"``, ``"ideal"`` or ``"applepay"``); ``None`` lets
-        Mollie pick. ``coupon_code`` is
+        ``"directdebit"``, ``"ideal"``, ``"eps"``, ``"applepay"`` or
+        ``"paypal"``); ``None`` lets Mollie pick. ``coupon_code`` is
         atomically claimed at session creation. ``trial_days_override``
         replaces the price's trial for this session only and is server
         capped at ``2 * max(price.trial_days, 14)`` (``0`` disables a
@@ -2425,8 +2439,10 @@ class OneShotPayments:
 
         ``method`` is required and validated against the tenant's Mollie
         capability allowlist for ``currency`` (one-off-only methods like
-        ``bancontact`` / ``eps`` are allowed here even though they can't
-        back a subscription). ``refund_window_days`` overrides
+        ``bancontact`` / ``banktransfer`` are allowed here even though they
+        can't back a subscription; ``banktransfer`` in particular settles
+        in days rather than seconds, because the payer is handed bank
+        details and Mollie holds the payment open for about a fortnight). ``refund_window_days`` overrides
         the one-shot default (30d) for this payment: ``None`` inherits the
         default, ``0`` disables refunds, ``N > 0`` is an ``N``-day window
         (values above 365 are rejected server-side).
@@ -3445,12 +3461,22 @@ class AuditLogs:
         starting_after: str | None = None,
         action: str | None = None,
         resource_type: str | None = None,
+        resource_id: str | None = None,
         actor_id: str | None = None,
     ) -> dict[str, Any]:
+        """List audit-log entries, newest first, optionally filtered.
+
+        All four filters match exactly and combine. ``resource_type``
+        narrows to a kind (``"customer"``, ``"price"``); ``resource_id``
+        narrows to one row, which is the "everything that ever happened
+        to this customer" question an audit log mostly exists for. Pair
+        them or pass ``resource_id`` alone — ids are already unique.
+        """
         params = _list_params(limit=limit, starting_after=starting_after)
         for key, value in (
             ("action", action),
             ("resource_type", resource_type),
+            ("resource_id", resource_id),
             ("actor_id", actor_id),
         ):
             if value is not None:
@@ -3463,6 +3489,7 @@ class AuditLogs:
         page_size: int | None = None,
         action: str | None = None,
         resource_type: str | None = None,
+        resource_id: str | None = None,
         actor_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Walk every page of ``list()``; filters are forwarded
@@ -3472,6 +3499,7 @@ class AuditLogs:
             page_size=page_size,
             action=action,
             resource_type=resource_type,
+            resource_id=resource_id,
             actor_id=actor_id,
         )
 
