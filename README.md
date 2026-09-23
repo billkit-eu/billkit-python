@@ -290,7 +290,7 @@ So when you opt this SDK in, it raises the `httpx` and `httpcore` loggers to `WA
 - If you have configured `httpx` logging, you made a decision and a billing SDK does not get to overrule it. Silence the request line yourself, or accept the query strings.
 - If you passed your own `httpx_client=`, you own its logging as much as its connection pooling.
 
-The check happens when the client is constructed, so configure your logging before you build a `BillKit` / `AsyncBillKit` (the usual startup order).
+The check runs when the client is constructed and again on its first request, so either startup order works: configure your logging before you build the client, or after.
 
 The logger object is exported if you'd rather wire it up directly:
 

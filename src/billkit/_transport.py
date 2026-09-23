@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 
 from billkit._errors import APIConnectionError, BillKitError, error_from_response
-from billkit._logging import logger, quiet_leaky_request_logs
+from billkit._logging import logger, quiet_leaky_request_logs, sdk_logging_configured
 from billkit._retry import DEFAULT_RETRY_POLICY, RetryPolicy, should_retry
 from billkit._version import __version__
 
@@ -208,11 +208,36 @@ class _BaseTransport:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._retry_policy = retry_policy
+        # Set properly by each subclass once it knows whether it created
+        # the httpx client; declared here so `_quiet_httpx_once` can read
+        # both flags off the base.
+        self._owned = False
+        self._httpx_quieted = False
 
     def _path(self, path: str) -> str:
         if not path.startswith("/"):
             path = "/" + path
         return self._base_url + path
+
+    def _quiet_httpx_once(self) -> None:
+        """Re-check httpx's request-line logging on the way into a send.
+
+        The constructor already calls :func:`quiet_leaky_request_logs`,
+        which covers the usual startup order. It does not cover the
+        opposite one: an app that builds the client first and configures
+        the ``billkit`` logger afterwards had nothing quieted, so the
+        first request logged a full URL with its query string, the exact
+        leak that function exists to prevent.
+
+        Cheap enough to sit in the hot path: one attribute test until the
+        app opts in, then one more call, then it latches.
+        """
+        if self._httpx_quieted or not self._owned:
+            return
+        if not sdk_logging_configured():
+            return
+        quiet_leaky_request_logs()
+        self._httpx_quieted = True
 
 
 class AsyncTransport(_BaseTransport):
@@ -236,7 +261,9 @@ class AsyncTransport(_BaseTransport):
         if self._owned:
             # Only for a client we created. A caller who injected their own
             # ``httpx.AsyncClient`` owns its logging as much as its pooling.
-            quiet_leaky_request_logs()
+            # ``_quiet_httpx_once`` on the send path covers an app that
+            # configures its logging after building the client.
+            self._httpx_quieted = bool(quiet_leaky_request_logs())
 
     async def request(
         self,
@@ -288,6 +315,7 @@ class AsyncTransport(_BaseTransport):
         follow_redirects: bool = False,
     ) -> httpx.Response:
         """The retry loop. Returns the first 2xx response, or raises."""
+        self._quiet_httpx_once()
         url = self._path(path)
         kwargs = _build_request_kwargs(
             api_key=self._api_key,
@@ -378,7 +406,7 @@ class SyncTransport(_BaseTransport):
         self._client = httpx_client or httpx.Client(timeout=self._timeout)
         if self._owned:
             # See AsyncTransport.__init__.
-            quiet_leaky_request_logs()
+            self._httpx_quieted = bool(quiet_leaky_request_logs())
 
     def request(
         self,
@@ -419,6 +447,7 @@ class SyncTransport(_BaseTransport):
         follow_redirects: bool = False,
     ) -> httpx.Response:
         """The retry loop. Returns the first 2xx response, or raises."""
+        self._quiet_httpx_once()
         url = self._path(path)
         kwargs = _build_request_kwargs(
             api_key=self._api_key,

@@ -257,3 +257,69 @@ def test_an_injected_httpx_client_keeps_its_owner_s_logging(
     )
 
     assert logging.getLogger("httpx").level == logging.NOTSET
+
+
+@respx.mock
+def test_opting_in_after_the_client_exists_still_quiets_httpx(
+    clean_httpx_loggers: object,
+) -> None:
+    """The constructor check is not the only one, because it cannot be.
+
+    An app that builds its client first and configures the ``billkit``
+    logger afterwards had nothing quieted, so its very first request
+    logged a full URL with its query string, the exact leak the
+    mitigation exists to prevent. The first ``_send`` re-checks.
+    """
+    logger.setLevel(logging.NOTSET)
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
+
+    client = BillKit(api_key="bk_test_unit", base_url="https://test.billkit.eu")
+    assert logging.getLogger("httpx").level == logging.NOTSET
+
+    # The app opts in only now, after the client already exists.
+    logger.setLevel(logging.DEBUG)
+    respx.get("https://test.billkit.eu/v1/customers").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    client.customers.list(limit=1)
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_the_late_check_also_runs_on_the_async_transport(
+    clean_httpx_loggers: object,
+) -> None:
+    logger.setLevel(logging.NOTSET)
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
+
+    async with AsyncBillKit(api_key="bk_test_unit", base_url="https://test.billkit.eu") as client:
+        logger.setLevel(logging.DEBUG)
+        respx.get("https://test.billkit.eu/v1/customers").mock(
+            return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+        )
+        await client.customers.list(limit=1)
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+
+
+@respx.mock
+def test_the_late_check_still_leaves_an_injected_client_alone(
+    clean_httpx_loggers: object,
+) -> None:
+    logger.setLevel(logging.NOTSET)
+    logging.getLogger("httpx").setLevel(logging.NOTSET)
+
+    client = BillKit(
+        api_key="bk_test_unit",
+        base_url="https://test.billkit.eu",
+        httpx_client=httpx.Client(),
+    )
+    logger.setLevel(logging.DEBUG)
+    respx.get("https://test.billkit.eu/v1/customers").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    client.customers.list(limit=1)
+
+    assert logging.getLogger("httpx").level == logging.NOTSET

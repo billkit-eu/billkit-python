@@ -31,7 +31,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from decimal import Decimal
-from typing import Any, Protocol
+from enum import Enum
+from typing import Any, Final, Protocol
+from urllib.parse import quote
 
 from billkit._pagination import aiterate, paginate
 
@@ -68,6 +70,27 @@ class _SyncRequester(Protocol):
 
 def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _p(value: str) -> str:
+    """Percent-encode a caller-supplied id for use as a path segment.
+
+    Ids reach the SDK from the caller's own storage, and one carrying
+    ``/``, ``?`` or ``#`` would otherwise rewrite the request: ``#``
+    truncates the path, ``?`` turns the tail into a query string, and
+    ``/`` walks to a different route entirely. Encoding keeps the call on
+    the route the method names, so a bad id is a clean 404 rather than a
+    request somewhere else. ``safe=""`` because nothing in an id is a
+    path delimiter here.
+    """
+    return quote(value, safe="")
+
+
+def _expand_params(expand: list[str] | None) -> dict[str, Any] | None:
+    """Render ``?expand=a,b``, or nothing at all when none was asked for."""
+    if not expand:
+        return None
+    return {"expand": ",".join(expand)}
 
 
 def _decimal_field(value: str | int | Decimal, *, field: str) -> str:
@@ -125,6 +148,21 @@ def _normalize_tiers(tiers: list[dict[str, Any]], *, field: str) -> list[dict[st
     return out
 
 
+class _Unset(Enum):
+    """Sentinel for a keyword that was not passed.
+
+    Only needed where the API distinguishes "leave this alone" from "clear
+    it" and spells the second as an explicit JSON ``null``: the tenant
+    billing profile. Everywhere else ``None`` means "omit" and
+    :func:`_drop_none` is enough.
+    """
+
+    TOKEN = 0
+
+
+_UNSET: Final = _Unset.TOKEN
+
+
 def _list_params(*, limit: int | None, starting_after: str | None) -> dict[str, Any]:
     """Build the query for a list call.
 
@@ -177,21 +215,29 @@ class AsyncCustomers:
         self,
         customer_id: str,
         *,
-        vat_number: str,
+        vat_number: str | None,
         country_code: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Attach or replace the customer's VAT number.
+        """Attach, replace, or clear the customer's VAT number.
 
         Triggers server-side VIES validation. The response carries the
         updated ``vat_number`` plus ``vat_number_validated``; a ``False``
         flag means VIES is reachable but the number didn't validate, or
         the validation is still pending.
+
+        ``vat_number=None`` **clears** the registration, and is sent as an
+        explicit JSON null rather than dropped. This is the one body in the
+        SDK where ``None`` is a value rather than an omission. VIES
+        needs a country, so pass ``country_code`` when the customer does
+        not have one yet; that one is omitted when ``None``.
         """
-        body = _drop_none({"vat_number": vat_number, "country_code": country_code})
+        body: dict[str, Any] = {"vat_number": vat_number}
+        if country_code is not None:
+            body["country_code"] = country_code
         return await self._t.request(
             "POST",
-            f"/v1/customers/{customer_id}/vat_number",
+            f"/v1/customers/{_p(customer_id)}/vat_number",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -212,13 +258,13 @@ class AsyncCustomers:
         """
         return await self._t.request(
             "POST",
-            f"/v1/customers/{customer_id}/purge",
+            f"/v1/customers/{_p(customer_id)}/purge",
             json_body={"confirmed": confirmed},
             idempotency_key=idempotency_key,
         )
 
     async def retrieve(self, customer_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/customers/{customer_id}")
+        return await self._t.request("GET", f"/v1/customers/{_p(customer_id)}")
 
     async def update(
         self,
@@ -227,7 +273,7 @@ class AsyncCustomers:
         email: str | None = None,
         name: str | None = None,
         country_code: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         body = _drop_none(
@@ -240,7 +286,7 @@ class AsyncCustomers:
         )
         return await self._t.request(
             "POST",
-            f"/v1/customers/{customer_id}",
+            f"/v1/customers/{_p(customer_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -258,7 +304,7 @@ class AsyncCustomers:
         still charge them.
         """
         return await self._t.request(
-            "DELETE", f"/v1/customers/{customer_id}", idempotency_key=idempotency_key
+            "DELETE", f"/v1/customers/{_p(customer_id)}", idempotency_key=idempotency_key
         )
 
     async def list(
@@ -267,6 +313,7 @@ class AsyncCustomers:
         limit: int | None = None,
         starting_after: str | None = None,
         provisional: bool | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
         """List customers, newest first.
 
@@ -276,10 +323,14 @@ class AsyncCustomers:
         behind: pass ``False`` for real customers only, ``True`` for the
         abandoned ones (the cart-recovery worklist), or omit for both.
         Abandoned rows are swept after the tenant's retention window.
+
+        ``expand`` opts into nested relations, sent as ``expand=a,b``.
+        Expandable here: ``stats``. ``customers.retrieve`` accepts none.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         if provisional is not None:
             params["provisional"] = "true" if provisional else "false"
+        params.update(_expand_params(expand) or {})
         return await self._t.request("GET", "/v1/customers", params=params)
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
@@ -335,9 +386,15 @@ class AsyncProducts:
             "POST", "/v1/products", json_body=body, idempotency_key=idempotency_key
         )
 
-    async def retrieve(self, product_id: str) -> dict[str, Any]:
-        """Fetch one product by id."""
-        return await self._t.request("GET", f"/v1/products/{product_id}")
+    async def retrieve(self, product_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+        """Fetch one product by id.
+
+        Expandable: ``prices`` (every price on the product, archived ones
+        included, active-first) and ``stats``.
+        """
+        return await self._t.request(
+            "GET", f"/v1/products/{_p(product_id)}", params=_expand_params(expand)
+        )
 
     async def update(
         self,
@@ -372,7 +429,7 @@ class AsyncProducts:
         )
         return await self._t.request(
             "POST",
-            f"/v1/products/{product_id}",
+            f"/v1/products/{_p(product_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -382,13 +439,15 @@ class AsyncProducts:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
-        """List products in reverse creation order."""
-        return await self._t.request(
-            "GET",
-            "/v1/products",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List products in reverse creation order.
+
+        Expandable: ``prices``, ``stats``.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_expand_params(expand) or {})
+        return await self._t.request("GET", "/v1/products", params=params)
 
     def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
         """Walk every page of ``list()`` and yield each product."""
@@ -538,34 +597,64 @@ class AsyncPrices:
         )
 
     async def retrieve(self, price_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/prices/{price_id}")
+        return await self._t.request("GET", f"/v1/prices/{_p(price_id)}")
 
     async def update(
-        self, price_id: str, *, active: bool, idempotency_key: str | None = None
+        self,
+        price_id: str,
+        *,
+        active: bool | None = None,
+        metadata: dict[str, str] | None = None,
+        tax_behavior: str | None = None,
+        payment_methods: list[str] | None = None,
+        refund_on_cancel: str | None = None,
+        refund_window_initial_days: int | None = None,
+        refund_window_renewal_days: int | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Archive a price so it stops selling, or put it back on sale.
+        """Change what a price does next. Omitted fields are left alone.
 
-        Pass ``active=False`` to archive. The price keeps its id and is
-        still returned by :meth:`retrieve` and :meth:`list`, because
-        subscriptions renew against it by id and what they are charged
-        has to stay readable. Subscriptions already on the price go on
-        renewing against it; what stops is new business, so a checkout
-        against it is refused and it is no longer offered as a plan
-        change.
+        The dividing line is what a field decides. ``amount_cents``,
+        ``currency``, ``interval`` and ``usage_type`` decide **what a past
+        charge was**, so they are fixed at creation and absent here:
+        subscriptions renew against a price by id, and editing one would
+        re-price live customers and make an issued invoice unreadable. To
+        charge something different, create a new price.
 
-        Pass ``active=True`` to undo that. ``amount_cents``, ``currency``
-        and ``interval`` are fixed at creation and none of them move here,
-        so neither direction can change what a past charge was made under.
-        To charge something different, create a new price.
+        Everything accepted here decides **what happens next**.
+        ``active=False`` archives the price: it keeps its id and stays
+        readable, subscriptions already on it go on renewing, and what
+        stops is new business; ``active=True`` undoes that.
+        ``payment_methods`` is read when a checkout opens, and the refund
+        fields when a cancellation or refund is evaluated, which is the
+        useful part: setting ``refund_on_cancel`` covers the customers
+        already on the price.
+
+        ``tax_behavior`` is the exception and moves one way. It can be set
+        (``"inclusive"`` or ``"exclusive"``) while the price is still
+        ``"unspecified"`` and never changed again, because flipping it
+        would restate whether tax was inside or on top of an amount
+        somebody has already paid.
 
         Sending the value a price already has returns it unchanged and
         emits no second event, which makes a retry safe. Archiving emits
         ``price.archived``; putting one back emits ``price.updated``.
         """
+        body = _drop_none(
+            {
+                "active": active,
+                "metadata": metadata,
+                "tax_behavior": tax_behavior,
+                "payment_methods": payment_methods,
+                "refund_on_cancel": refund_on_cancel,
+                "refund_window_initial_days": refund_window_initial_days,
+                "refund_window_renewal_days": refund_window_renewal_days,
+            }
+        )
         return await self._t.request(
             "POST",
-            f"/v1/prices/{price_id}",
-            json_body={"active": active},
+            f"/v1/prices/{_p(price_id)}",
+            json_body=body,
             idempotency_key=idempotency_key,
         )
 
@@ -612,6 +701,7 @@ class AsyncCheckoutSessions:
         success_url: str,
         cancel_url: str,
         method: str | None = None,
+        country: str | None = None,
         coupon_code: str | None = None,
         trial_days_override: int | None = None,
         ui_mode: str | None = None,
@@ -626,6 +716,13 @@ class AsyncCheckoutSessions:
         email). ``customer_name`` is only valid with ``customer_email``
         and is carried onto the auto-created Customer row; rename an
         existing customer via ``customers.update`` instead.
+
+        ``country`` is the buyer's ISO-3166-1 alpha-2 country, when you
+        already know it. It is stored on the customer if they do not have
+        one yet, which is what lets VAT apply to the very first charge. On
+        the hosted flow the buyer only reaches a country-collecting page
+        after the charge exists. It never overwrites a country the
+        customer already has.
 
         ``method`` pins the Mollie payment method (``"creditcard"``,
         ``"directdebit"``, ``"ideal"``, ``"eps"``, ``"applepay"`` or
@@ -668,6 +765,7 @@ class AsyncCheckoutSessions:
                 "success_url": success_url,
                 "cancel_url": cancel_url,
                 "method": method,
+                "country": country,
                 "coupon_code": coupon_code,
                 "trial_days_override": trial_days_override,
                 "ui_mode": ui_mode,
@@ -682,7 +780,7 @@ class AsyncCheckoutSessions:
         )
 
     async def retrieve(self, session_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/checkout/sessions/{session_id}")
+        return await self._t.request("GET", f"/v1/checkout/sessions/{_p(session_id)}")
 
 
 class AsyncOneShotPayments:
@@ -757,15 +855,25 @@ class AsyncOneShotPayments:
         )
 
     async def retrieve(self, one_shot_payment_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/checkout/one_shot/{one_shot_payment_id}")
+        return await self._t.request("GET", f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}")
 
 
 class AsyncSubscriptions:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, subscription_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/subscriptions/{subscription_id}")
+    async def retrieve(
+        self, subscription_id: str, *, expand: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Fetch one subscription.
+
+        Expandable: ``customer``, ``price``, ``refund_eligibility``.
+        """
+        return await self._t.request(
+            "GET",
+            f"/v1/subscriptions/{_p(subscription_id)}",
+            params=_expand_params(expand),
+        )
 
     async def list(
         self,
@@ -775,6 +883,7 @@ class AsyncSubscriptions:
         renewal_state: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
         """List subscriptions, newest first, optionally filtered.
 
@@ -792,6 +901,8 @@ class AsyncSubscriptions:
         are in, so ``renewal_state="paused"`` is how you find paused
         ones. ``status="paused"`` is not accepted and raises
         :class:`~billkit.InvalidRequestError`.
+
+        Expandable: ``customer``, ``price``, ``refund_eligibility``.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(
@@ -803,6 +914,7 @@ class AsyncSubscriptions:
                 }
             )
         )
+        params.update(_expand_params(expand) or {})
         return await self._t.request("GET", "/v1/subscriptions", params=params)
 
     def iter(
@@ -835,7 +947,7 @@ class AsyncSubscriptions:
     ) -> dict[str, Any]:
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/cancel",
+            f"/v1/subscriptions/{_p(subscription_id)}/cancel",
             idempotency_key=idempotency_key,
         )
 
@@ -844,7 +956,7 @@ class AsyncSubscriptions:
     ) -> dict[str, Any]:
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/pause",
+            f"/v1/subscriptions/{_p(subscription_id)}/pause",
             idempotency_key=idempotency_key,
         )
 
@@ -853,7 +965,7 @@ class AsyncSubscriptions:
     ) -> dict[str, Any]:
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/resume",
+            f"/v1/subscriptions/{_p(subscription_id)}/resume",
             idempotency_key=idempotency_key,
         )
 
@@ -870,14 +982,14 @@ class AsyncSubscriptions:
         """
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/reactivate",
+            f"/v1/subscriptions/{_p(subscription_id)}/reactivate",
             idempotency_key=idempotency_key,
         )
 
     async def preview_update(self, subscription_id: str, *, target_price_id: str) -> dict[str, Any]:
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/preview_update",
+            f"/v1/subscriptions/{_p(subscription_id)}/preview_update",
             json_body={"target_price_id": target_price_id},
         )
 
@@ -890,7 +1002,7 @@ class AsyncSubscriptions:
     ) -> dict[str, Any]:
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/update",
+            f"/v1/subscriptions/{_p(subscription_id)}/update",
             json_body={"target_price_id": target_price_id},
             idempotency_key=idempotency_key,
         )
@@ -904,7 +1016,7 @@ class AsyncSubscriptions:
     ) -> dict[str, Any]:
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/reauthorize_payment_method",
+            f"/v1/subscriptions/{_p(subscription_id)}/reauthorize_payment_method",
             json_body={"return_url": return_url},
             idempotency_key=idempotency_key,
         )
@@ -961,7 +1073,7 @@ class AsyncSubscriptions:
         )
         return await self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/usage_records",
+            f"/v1/subscriptions/{_p(subscription_id)}/usage_records",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -985,7 +1097,7 @@ class AsyncSubscriptions:
         if invoice_id is not None:
             params["invoice_id"] = invoice_id
         return await self._t.request(
-            "GET", f"/v1/subscriptions/{subscription_id}/usage_records", params=params
+            "GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_records", params=params
         )
 
     def iter_usage_records(
@@ -1021,7 +1133,9 @@ class AsyncSubscriptions:
         ``open_invoice_id`` names an earlier cycle that is invoiced and
         still unsettled; while one is open, this period cannot be charged.
         """
-        return await self._t.request("GET", f"/v1/subscriptions/{subscription_id}/usage_summary")
+        return await self._t.request(
+            "GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_summary"
+        )
 
 
 class AsyncRefunds:
@@ -1058,7 +1172,7 @@ class AsyncRefunds:
         )
 
     async def retrieve(self, refund_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/refunds/{refund_id}")
+        return await self._t.request("GET", f"/v1/refunds/{_p(refund_id)}")
 
     async def list(
         self,
@@ -1091,28 +1205,54 @@ class AsyncDisputes:
         self._t = transport
 
     async def retrieve(self, dispute_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/disputes/{dispute_id}")
+        return await self._t.request("GET", f"/v1/disputes/{_p(dispute_id)}")
 
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        status: str | None = None,
+        payment_id: str | None = None,
     ) -> dict[str, Any]:
-        return await self._t.request(
-            "GET",
-            "/v1/disputes",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List chargebacks raised against your payments, newest first.
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
-        """Walk every page of ``list()`` and yield each dispute."""
-        return aiterate(self.list, page_size=page_size)
+        ``status`` takes a comma-separated list of ``open`` / ``won``.
+        There is no ``lost``: the provider gives no signal for one, so a
+        dispute you lost stays ``open``. ``payment_id`` matches
+        subscription payments only, not one-off charges.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_drop_none({"status": status, "payment_id": payment_id}))
+        return await self._t.request("GET", "/v1/disputes", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        status: str | None = None,
+        payment_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Walk every page of ``list()`` and yield each dispute.
+
+        Filters are carried onto every page request.
+        """
+        return aiterate(self.list, page_size=page_size, status=status, payment_id=payment_id)
 
 
 class AsyncWebhookEndpoints:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
+
+    async def list_event_types(self) -> dict[str, Any]:
+        """Every event type this deployment can deliver, plus the wildcard.
+
+        ``enabled_events`` rejects anything not on this list, so read it
+        rather than hard-coding a set: a name that is not on it fails at
+        registration and leaves you with an endpoint that never fires.
+        Read-only and the same for every caller.
+        """
+        return await self._t.request("GET", "/v1/webhook_endpoints/event_types")
 
     async def create(
         self,
@@ -1133,7 +1273,7 @@ class AsyncWebhookEndpoints:
         )
 
     async def retrieve(self, endpoint_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/webhook_endpoints/{endpoint_id}")
+        return await self._t.request("GET", f"/v1/webhook_endpoints/{_p(endpoint_id)}")
 
     async def update(
         self,
@@ -1162,7 +1302,7 @@ class AsyncWebhookEndpoints:
         )
         return await self._t.request(
             "POST",
-            f"/v1/webhook_endpoints/{endpoint_id}",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -1184,7 +1324,7 @@ class AsyncWebhookEndpoints:
         """
         return await self._t.request(
             "DELETE",
-            f"/v1/webhook_endpoints/{endpoint_id}",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}",
             idempotency_key=idempotency_key,
         )
 
@@ -1193,7 +1333,7 @@ class AsyncWebhookEndpoints:
     ) -> dict[str, Any]:
         return await self._t.request(
             "POST",
-            f"/v1/webhook_endpoints/{endpoint_id}/rotate_secret",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/rotate_secret",
             idempotency_key=idempotency_key,
         )
 
@@ -1228,7 +1368,7 @@ class AsyncWebhookEndpoints:
         """
         return await self._t.request(
             "GET",
-            f"/v1/webhook_endpoints/{endpoint_id}/deliveries",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries",
             params=_list_params(limit=limit, starting_after=starting_after),
         )
 
@@ -1248,12 +1388,11 @@ class AsyncWebhookEndpoints:
         The single-row counterpart to :meth:`list_deliveries`. Carries
         the full response body excerpt rather than the truncated form on
         the list page, which is what you want when debugging one failing
-        attempt. Mirrors ``getDelivery`` (node) and ``retrieveDelivery``
-        (php).
+        attempt. Spelled ``retrieveDelivery`` in the node and php clients.
         """
         return await self._t.request(
             "GET",
-            f"/v1/webhook_endpoints/{endpoint_id}/deliveries/{delivery_id}",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}",
         )
 
     async def redeliver(
@@ -1272,7 +1411,7 @@ class AsyncWebhookEndpoints:
         """
         return await self._t.request(
             "POST",
-            f"/v1/webhook_endpoints/{endpoint_id}/deliveries/{delivery_id}/redeliver",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}/redeliver",
             idempotency_key=idempotency_key,
         )
 
@@ -1282,7 +1421,7 @@ class AsyncEvents:
         self._t = transport
 
     async def retrieve(self, event_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/events/{event_id}")
+        return await self._t.request("GET", f"/v1/events/{_p(event_id)}")
 
     async def list(
         self,
@@ -1290,10 +1429,16 @@ class AsyncEvents:
         limit: int | None = None,
         starting_after: str | None = None,
         type: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
+        """List events, newest first.
+
+        Expandable: ``customer``. ``events.retrieve`` accepts none.
+        """
         params = _list_params(limit=limit, starting_after=starting_after)
         if type is not None:
             params["type"] = type
+        params.update(_expand_params(expand) or {})
         return await self._t.request("GET", "/v1/events", params=params)
 
     def iter(
@@ -1315,6 +1460,9 @@ class AsyncTenant:
     * :meth:`portal_branding` / :meth:`set_portal_branding`: the
       customer-facing portal chrome (business name, support email,
       logo URL, theme tokens, capability flags).
+    * :meth:`billing_profile` / :meth:`set_billing_profile`: your own
+      registered country, VAT id and invoice address.
+    * :meth:`export`: everything in the account as one JSON document.
     * :meth:`rotate_provider_credential`: replace the encrypted
       Mollie API key without re-running ``provision_tenant --force``.
     """
@@ -1340,9 +1488,9 @@ class AsyncTenant:
     ) -> dict[str, Any]:
         """Partial-update the portal branding row.
 
-        Unset fields are left alone; explicit ``None`` is **not**
-        sent (use the raw HTTP path if you need explicit-null clears,
-        coming in v0.2). To clear all fields, send empty values.
+        Unset fields are left alone: an explicit ``None`` is **not** sent,
+        it is dropped like any other omitted keyword. Clear a field by
+        sending an empty value for it.
         """
         body = _drop_none(
             {
@@ -1359,6 +1507,89 @@ class AsyncTenant:
             json_body=body,
             idempotency_key=idempotency_key,
         )
+
+    async def billing_profile(self) -> dict[str, Any]:
+        """Read your own registered country and VAT number.
+
+        These are what your customers' VAT is decided against, so check
+        them before you take your first live payment. ``country_code`` is
+        what you have stored and can be ``None``;
+        ``effective_country_code`` is what the next charge will really
+        use. The two differ only when you have stored nothing, which is
+        exactly the case worth spotting. ``vat_id`` has no effective
+        counterpart, because nothing can stand in for a registration.
+        """
+        return await self._t.request("GET", "/v1/tenant/billing_profile")
+
+    async def set_billing_profile(
+        self,
+        *,
+        country_code: str,
+        vat_id: str | _Unset | None = _UNSET,
+        address_line1: str | _Unset | None = _UNSET,
+        address_line2: str | _Unset | None = _UNSET,
+        postal_code: str | _Unset | None = _UNSET,
+        city: str | _Unset | None = _UNSET,
+        registration_number: str | _Unset | None = _UNSET,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Set the seller identity: jurisdiction, VAT id, invoice address.
+
+        ``country_code`` is required on every call: there is nothing to
+        leave alone about a jurisdiction, and it decides whether a
+        customer's sale is domestic, cross-border within the EU, or
+        outside it.
+
+        Every other field is partial-update, and this is the one method in
+        the SDK where ``None`` is a value rather than an omission: omit a
+        keyword and the stored value is left alone, pass ``None``
+        explicitly and it is **cleared**. Deregistering for VAT and moving
+        office are both real events, so a field that could be set once and
+        never emptied would force you to keep printing something untrue.
+
+        Changes take effect on your next charge only. Tax is worked out
+        before money moves and written onto the payment and its invoice,
+        so correcting a country here never reprices an issued document.
+        """
+        body: dict[str, Any] = {"country_code": country_code}
+        for key, value in (
+            ("vat_id", vat_id),
+            ("address_line1", address_line1),
+            ("address_line2", address_line2),
+            ("postal_code", postal_code),
+            ("city", city),
+            ("registration_number", registration_number),
+        ):
+            if not isinstance(value, _Unset):
+                body[key] = value
+        return await self._t.request(
+            "POST",
+            "/v1/tenant/billing_profile",
+            json_body=body,
+            idempotency_key=idempotency_key,
+        )
+
+    async def export(self) -> bytes:
+        """Download everything in the account as one JSON document.
+
+        .. code-block:: python
+
+            Path("export.json").write_bytes(client.tenant.export())
+
+        The GDPR Article 20 portability route, and the way to take a
+        backup: catalogue, customers, subscriptions, every payment with
+        its refunds, credit notes, disputes, invoices with line items,
+        usage records and the event log. Each record has the same shape
+        its ``GET`` route returns, and ``billkit_export_version`` names
+        the shape.
+
+        It is ``application/json`` streamed inline, with no redirect, and it
+        can be large, so write it to a file rather than holding it in
+        memory. Test and live data export separately: you get whichever
+        mode the calling key belongs to. Nothing is changed, but the
+        access is recorded in your audit log.
+        """
+        return await self._t.request_bytes("GET", "/v1/tenant/export")
 
     async def rotate_provider_credential(
         self,
@@ -1422,7 +1653,7 @@ class AsyncCoupons:
         )
 
     async def retrieve(self, coupon_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/coupons/{coupon_id}")
+        return await self._t.request("GET", f"/v1/coupons/{_p(coupon_id)}")
 
     async def update(
         self,
@@ -1453,7 +1684,7 @@ class AsyncCoupons:
         )
         return await self._t.request(
             "POST",
-            f"/v1/coupons/{coupon_id}",
+            f"/v1/coupons/{_p(coupon_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -1528,7 +1759,7 @@ class AsyncTaxRates:
         )
 
     async def retrieve(self, tax_rate_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/tax_rates/{tax_rate_id}")
+        return await self._t.request("GET", f"/v1/tax_rates/{_p(tax_rate_id)}")
 
     async def update(
         self,
@@ -1557,7 +1788,7 @@ class AsyncTaxRates:
         )
         return await self._t.request(
             "POST",
-            f"/v1/tax_rates/{tax_rate_id}",
+            f"/v1/tax_rates/{_p(tax_rate_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -1581,17 +1812,24 @@ class AsyncTaxRates:
 class AsyncInvoices:
     """Read-only access to generated invoices.
 
-    Invoices are produced by the billing pipeline; tenants don't
-    create them directly. PDF retrieval issues a 302 redirect to the
-    storage adapter's signed URL. Follow it transparently or expose
-    it to the customer.
+    Invoices are produced by the billing pipeline; tenants don't create
+    them directly. :meth:`retrieve_pdf` hands back the rendered bytes: a
+    blob-backed deployment streams them inline and an S3-backed one
+    answers 302 to a presigned URL, which the transport follows for you,
+    so both look identical from here.
     """
 
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, invoice_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/invoices/{invoice_id}")
+    async def retrieve(self, invoice_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+        """Fetch one invoice, line items included.
+
+        Expandable: ``customer``.
+        """
+        return await self._t.request(
+            "GET", f"/v1/invoices/{_p(invoice_id)}", params=_expand_params(expand)
+        )
 
     async def retrieve_pdf(self, invoice_id: str) -> bytes:
         """Download the rendered invoice PDF as raw bytes.
@@ -1612,22 +1850,83 @@ class AsyncInvoices:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured invoice for tenants who render their own.
         """
-        return await self._t.request_bytes("GET", f"/v1/invoices/{invoice_id}/pdf")
+        return await self._t.request_bytes("GET", f"/v1/invoices/{_p(invoice_id)}/pdf")
+
+    async def send_email(
+        self, invoice_id: str, *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Send the customer their invoice again.
+
+        The same tenant-branded "your invoice is ready" email, with a
+        fresh portal link, because the one in the original may have
+        expired and re-sending a dead link is worse than not re-sending.
+
+        It goes to the address captured **on the invoice**, not the
+        customer's current one: this is a copy of a document that was
+        issued to somebody, and quietly redirecting it would make the
+        resend a different act from the original send. An invoice with no
+        address on file raises :class:`~billkit.InvalidRequestError`
+        rather than reporting a send that did not happen.
+        """
+        return await self._t.request(
+            "POST",
+            f"/v1/invoices/{_p(invoice_id)}/email",
+            idempotency_key=idempotency_key,
+        )
 
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        customer_id: str | None = None,
+        subscription_id: str | None = None,
+        payment_id: str | None = None,
+        status: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
-        return await self._t.request(
-            "GET",
-            "/v1/invoices",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List invoices, newest first. Line items are left out here.
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
-        return aiterate(self.list, page_size=page_size)
+        ``customer_id``, ``subscription_id`` and ``payment_id`` each
+        narrow to one, which is how you ask "show me this customer's
+        invoices" or "which invoice did this charge produce" without
+        paging the whole account. ``status`` takes one of ``draft``,
+        ``open``, ``paid``, ``void``, ``uncollectible``.
+
+        Expandable: ``customer``.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(
+            _drop_none(
+                {
+                    "customer_id": customer_id,
+                    "subscription_id": subscription_id,
+                    "payment_id": payment_id,
+                    "status": status,
+                }
+            )
+        )
+        params.update(_expand_params(expand) or {})
+        return await self._t.request("GET", "/v1/invoices", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        customer_id: str | None = None,
+        subscription_id: str | None = None,
+        payment_id: str | None = None,
+        status: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Walk every page of ``list()``; filters are carried on each."""
+        return aiterate(
+            self.list,
+            page_size=page_size,
+            customer_id=customer_id,
+            subscription_id=subscription_id,
+            payment_id=payment_id,
+            status=status,
+        )
 
     async def void(
         self,
@@ -1655,7 +1954,7 @@ class AsyncInvoices:
         """
         return await self._t.request(
             "POST",
-            f"/v1/invoices/{invoice_id}/void",
+            f"/v1/invoices/{_p(invoice_id)}/void",
             json_body=_drop_none({"reason": reason}),
             idempotency_key=idempotency_key,
         )
@@ -1676,7 +1975,7 @@ class AsyncCreditNotes:
         self._t = transport
 
     async def retrieve(self, credit_note_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/credit_notes/{credit_note_id}")
+        return await self._t.request("GET", f"/v1/credit_notes/{_p(credit_note_id)}")
 
     async def retrieve_pdf(self, credit_note_id: str) -> bytes:
         """Download the rendered credit note PDF as raw bytes.
@@ -1697,7 +1996,7 @@ class AsyncCreditNotes:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured credit note for tenants who render their own.
         """
-        return await self._t.request_bytes("GET", f"/v1/credit_notes/{credit_note_id}/pdf")
+        return await self._t.request_bytes("GET", f"/v1/credit_notes/{_p(credit_note_id)}/pdf")
 
     async def list(
         self,
@@ -1738,7 +2037,7 @@ class AsyncAuditLogs:
         self._t = transport
 
     async def retrieve(self, audit_log_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/audit_logs/{audit_log_id}")
+        return await self._t.request("GET", f"/v1/audit_logs/{_p(audit_log_id)}")
 
     async def list(
         self,
@@ -1801,23 +2100,56 @@ class AsyncPayments:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, payment_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/payments/{payment_id}")
+    async def retrieve(self, payment_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+        """Fetch one subscription payment.
+
+        Expandable: ``customer``, ``subscription``.
+        """
+        return await self._t.request(
+            "GET", f"/v1/payments/{_p(payment_id)}", params=_expand_params(expand)
+        )
+
+    async def retrieve_provider(self, payment_id: str) -> dict[str, Any]:
+        """Fetch the provider's own record of this charge, live.
+
+        Reads Mollie at request time rather than a stored copy, so it
+        carries what BillKit deliberately does not keep: the card BIN, the
+        iDEAL bank, the provider's own status string. Reading live means
+        it can fail: a provider outage, a credential that no longer
+        authorises the profile, or a charge old enough to have aged out
+        all answer ``200`` with ``available: False`` and a short reason,
+        so render the rest of the page regardless.
+        """
+        return await self._t.request("GET", f"/v1/payments/{_p(payment_id)}/provider")
 
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        customer_id: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
-        return await self._t.request(
-            "GET",
-            "/v1/payments",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List subscription payments, newest first.
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
-        return aiterate(self.list, page_size=page_size)
+        ``customer_id`` narrows to one customer. Failed and pending
+        attempts are listed alongside successful ones, so check ``status``
+        before treating a row as revenue. Mandate verifications are never
+        listed, because nothing was sold, and one-off charges live under
+        ``one_shot_payments``.
+
+        Expandable: ``customer``, ``subscription``.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_drop_none({"customer_id": customer_id}))
+        params.update(_expand_params(expand) or {})
+        return await self._t.request("GET", "/v1/payments", params=params)
+
+    def iter(
+        self, *, page_size: int | None = None, customer_id: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Walk every page of ``list()``; ``customer_id`` is carried on each."""
+        return aiterate(self.list, page_size=page_size, customer_id=customer_id)
 
 
 class AsyncBillingPortalSessions:
@@ -1837,12 +2169,27 @@ class AsyncBillingPortalSessions:
         *,
         subscription_id: str,
         return_url: str,
+        deliver_email: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Mint a portal session for one subscription.
+
+        ``deliver_email=True`` also emails the link to the subscription's
+        customer, at the address on their record, as a tenant-branded
+        message. It defaults to off: without it you distribute the
+        returned ``url`` yourself.
+        """
+        body = _drop_none(
+            {
+                "subscription_id": subscription_id,
+                "return_url": return_url,
+                "deliver_email": deliver_email,
+            }
+        )
         return await self._t.request(
             "POST",
             "/v1/billing_portal/sessions",
-            json_body={"subscription_id": subscription_id, "return_url": return_url},
+            json_body=body,
             idempotency_key=idempotency_key,
         )
 
@@ -1852,9 +2199,90 @@ class AsyncBillingPortalSessions:
         """Kill an in-the-wild portal session. Idempotent."""
         return await self._t.request(
             "POST",
-            f"/v1/billing_portal/sessions/{session_id}/revoke",
+            f"/v1/billing_portal/sessions/{_p(session_id)}/revoke",
             idempotency_key=idempotency_key,
         )
+
+
+class AsyncApiKeys:
+    """Issue, inspect and revoke API keys.
+
+    A key is issued in the same mode as the key that created it, so a test
+    key can only mint test keys, and it can never grant scopes it does not
+    hold itself. The secret is returned **once**, on :meth:`create`; every
+    later read carries only the prefix.
+    """
+
+    def __init__(self, transport: _AsyncRequester) -> None:
+        self._t = transport
+
+    async def create(
+        self,
+        *,
+        label: str | None = None,
+        scopes: list[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue a new key.
+
+        The response's ``secret`` is the only time the full key exists
+        outside your own storage, so record it now; it is never retrievable
+        again. ``scopes`` narrows what the key may do, which is the point
+        of minting one per integration rather than sharing a single key;
+        omit it and the new key inherits the calling key's own. An
+        unrecognised scope is rejected at creation rather than failing
+        later on every call.
+        """
+        body = _drop_none({"label": label, "scopes": scopes})
+        return await self._t.request(
+            "POST", "/v1/api_keys", json_body=body, idempotency_key=idempotency_key
+        )
+
+    async def retrieve(self, api_key_id: str) -> dict[str, Any]:
+        """One key's metadata: prefix, label, scopes, ``revoked_at``.
+
+        The key itself is never returned. ``last_used_at`` is the useful
+        field, since it tells you whether a key is still in service before
+        you revoke it.
+        """
+        return await self._t.request("GET", f"/v1/api_keys/{_p(api_key_id)}")
+
+    async def revoke(
+        self, api_key_id: str, *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """Revoke a key so it stops working.
+
+        Immediate and irreversible; issue a new key instead. Revoking an
+        already-revoked key returns it unchanged, so a retry is safe, and
+        a key may revoke itself, which is what you want when the leaked
+        key is the one you are calling with.
+        """
+        return await self._t.request(
+            "POST",
+            f"/v1/api_keys/{_p(api_key_id)}/revoke",
+            idempotency_key=idempotency_key,
+        )
+
+    async def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+    ) -> dict[str, Any]:
+        """List your API keys, newest first.
+
+        Only keys in the calling key's mode are listed. Revoked ones are
+        included, so check ``revoked_at``.
+        """
+        return await self._t.request(
+            "GET",
+            "/v1/api_keys",
+            params=_list_params(limit=limit, starting_after=starting_after),
+        )
+
+    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+        """Walk every page of ``list()`` and yield each key."""
+        return aiterate(self.list, page_size=page_size)
 
 
 # ─── Sync resources ────────────────────────────────────────────────
@@ -1901,21 +2329,29 @@ class Customers:
         self,
         customer_id: str,
         *,
-        vat_number: str,
+        vat_number: str | None,
         country_code: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Attach or replace the customer's VAT number.
+        """Attach, replace, or clear the customer's VAT number.
 
         Triggers server-side VIES validation. The response carries the
         updated ``vat_number`` plus ``vat_number_validated``; a ``False``
         flag means VIES is reachable but the number didn't validate, or
         the validation is still pending.
+
+        ``vat_number=None`` **clears** the registration, and is sent as an
+        explicit JSON null rather than dropped. This is the one body in the
+        SDK where ``None`` is a value rather than an omission. VIES
+        needs a country, so pass ``country_code`` when the customer does
+        not have one yet; that one is omitted when ``None``.
         """
-        body = _drop_none({"vat_number": vat_number, "country_code": country_code})
+        body: dict[str, Any] = {"vat_number": vat_number}
+        if country_code is not None:
+            body["country_code"] = country_code
         return self._t.request(
             "POST",
-            f"/v1/customers/{customer_id}/vat_number",
+            f"/v1/customers/{_p(customer_id)}/vat_number",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -1936,13 +2372,13 @@ class Customers:
         """
         return self._t.request(
             "POST",
-            f"/v1/customers/{customer_id}/purge",
+            f"/v1/customers/{_p(customer_id)}/purge",
             json_body={"confirmed": confirmed},
             idempotency_key=idempotency_key,
         )
 
     def retrieve(self, customer_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/customers/{customer_id}")
+        return self._t.request("GET", f"/v1/customers/{_p(customer_id)}")
 
     def update(
         self,
@@ -1951,7 +2387,7 @@ class Customers:
         email: str | None = None,
         name: str | None = None,
         country_code: str | None = None,
-        metadata: dict[str, Any] | None = None,
+        metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         body = _drop_none(
@@ -1964,7 +2400,7 @@ class Customers:
         )
         return self._t.request(
             "POST",
-            f"/v1/customers/{customer_id}",
+            f"/v1/customers/{_p(customer_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -1980,7 +2416,7 @@ class Customers:
         still charge them.
         """
         return self._t.request(
-            "DELETE", f"/v1/customers/{customer_id}", idempotency_key=idempotency_key
+            "DELETE", f"/v1/customers/{_p(customer_id)}", idempotency_key=idempotency_key
         )
 
     def list(
@@ -1989,6 +2425,7 @@ class Customers:
         limit: int | None = None,
         starting_after: str | None = None,
         provisional: bool | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
         """List customers, newest first.
 
@@ -1998,10 +2435,14 @@ class Customers:
         behind: pass ``False`` for real customers only, ``True`` for the
         abandoned ones (the cart-recovery worklist), or omit for both.
         Abandoned rows are swept after the tenant's retention window.
+
+        ``expand`` opts into nested relations, sent as ``expand=a,b``.
+        Expandable here: ``stats``. ``customers.retrieve`` accepts none.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         if provisional is not None:
             params["provisional"] = "true" if provisional else "false"
+        params.update(_expand_params(expand) or {})
         return self._t.request("GET", "/v1/customers", params=params)
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
@@ -2057,9 +2498,15 @@ class Products:
             "POST", "/v1/products", json_body=body, idempotency_key=idempotency_key
         )
 
-    def retrieve(self, product_id: str) -> dict[str, Any]:
-        """Fetch one product by id."""
-        return self._t.request("GET", f"/v1/products/{product_id}")
+    def retrieve(self, product_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+        """Fetch one product by id.
+
+        Expandable: ``prices`` (every price on the product, archived ones
+        included, active-first) and ``stats``.
+        """
+        return self._t.request(
+            "GET", f"/v1/products/{_p(product_id)}", params=_expand_params(expand)
+        )
 
     def update(
         self,
@@ -2094,7 +2541,7 @@ class Products:
         )
         return self._t.request(
             "POST",
-            f"/v1/products/{product_id}",
+            f"/v1/products/{_p(product_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -2104,13 +2551,15 @@ class Products:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
-        """List products in reverse creation order."""
-        return self._t.request(
-            "GET",
-            "/v1/products",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List products in reverse creation order.
+
+        Expandable: ``prices``, ``stats``.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_expand_params(expand) or {})
+        return self._t.request("GET", "/v1/products", params=params)
 
     def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
         """Walk every page of ``list()`` and yield each product."""
@@ -2260,34 +2709,64 @@ class Prices:
         )
 
     def retrieve(self, price_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/prices/{price_id}")
+        return self._t.request("GET", f"/v1/prices/{_p(price_id)}")
 
     def update(
-        self, price_id: str, *, active: bool, idempotency_key: str | None = None
+        self,
+        price_id: str,
+        *,
+        active: bool | None = None,
+        metadata: dict[str, str] | None = None,
+        tax_behavior: str | None = None,
+        payment_methods: list[str] | None = None,
+        refund_on_cancel: str | None = None,
+        refund_window_initial_days: int | None = None,
+        refund_window_renewal_days: int | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        """Archive a price so it stops selling, or put it back on sale.
+        """Change what a price does next. Omitted fields are left alone.
 
-        Pass ``active=False`` to archive. The price keeps its id and is
-        still returned by :meth:`retrieve` and :meth:`list`, because
-        subscriptions renew against it by id and what they are charged
-        has to stay readable. Subscriptions already on the price go on
-        renewing against it; what stops is new business, so a checkout
-        against it is refused and it is no longer offered as a plan
-        change.
+        The dividing line is what a field decides. ``amount_cents``,
+        ``currency``, ``interval`` and ``usage_type`` decide **what a past
+        charge was**, so they are fixed at creation and absent here:
+        subscriptions renew against a price by id, and editing one would
+        re-price live customers and make an issued invoice unreadable. To
+        charge something different, create a new price.
 
-        Pass ``active=True`` to undo that. ``amount_cents``, ``currency``
-        and ``interval`` are fixed at creation and none of them move here,
-        so neither direction can change what a past charge was made under.
-        To charge something different, create a new price.
+        Everything accepted here decides **what happens next**.
+        ``active=False`` archives the price: it keeps its id and stays
+        readable, subscriptions already on it go on renewing, and what
+        stops is new business; ``active=True`` undoes that.
+        ``payment_methods`` is read when a checkout opens, and the refund
+        fields when a cancellation or refund is evaluated, which is the
+        useful part: setting ``refund_on_cancel`` covers the customers
+        already on the price.
+
+        ``tax_behavior`` is the exception and moves one way. It can be set
+        (``"inclusive"`` or ``"exclusive"``) while the price is still
+        ``"unspecified"`` and never changed again, because flipping it
+        would restate whether tax was inside or on top of an amount
+        somebody has already paid.
 
         Sending the value a price already has returns it unchanged and
         emits no second event, which makes a retry safe. Archiving emits
         ``price.archived``; putting one back emits ``price.updated``.
         """
+        body = _drop_none(
+            {
+                "active": active,
+                "metadata": metadata,
+                "tax_behavior": tax_behavior,
+                "payment_methods": payment_methods,
+                "refund_on_cancel": refund_on_cancel,
+                "refund_window_initial_days": refund_window_initial_days,
+                "refund_window_renewal_days": refund_window_renewal_days,
+            }
+        )
         return self._t.request(
             "POST",
-            f"/v1/prices/{price_id}",
-            json_body={"active": active},
+            f"/v1/prices/{_p(price_id)}",
+            json_body=body,
             idempotency_key=idempotency_key,
         )
 
@@ -2334,6 +2813,7 @@ class CheckoutSessions:
         success_url: str,
         cancel_url: str,
         method: str | None = None,
+        country: str | None = None,
         coupon_code: str | None = None,
         trial_days_override: int | None = None,
         ui_mode: str | None = None,
@@ -2348,6 +2828,13 @@ class CheckoutSessions:
         email). ``customer_name`` is only valid with ``customer_email``
         and is carried onto the auto-created Customer row; rename an
         existing customer via ``customers.update`` instead.
+
+        ``country`` is the buyer's ISO-3166-1 alpha-2 country, when you
+        already know it. It is stored on the customer if they do not have
+        one yet, which is what lets VAT apply to the very first charge. On
+        the hosted flow the buyer only reaches a country-collecting page
+        after the charge exists. It never overwrites a country the
+        customer already has.
 
         ``method`` pins the Mollie payment method (``"creditcard"``,
         ``"directdebit"``, ``"ideal"``, ``"eps"``, ``"applepay"`` or
@@ -2390,6 +2877,7 @@ class CheckoutSessions:
                 "success_url": success_url,
                 "cancel_url": cancel_url,
                 "method": method,
+                "country": country,
                 "coupon_code": coupon_code,
                 "trial_days_override": trial_days_override,
                 "ui_mode": ui_mode,
@@ -2404,7 +2892,7 @@ class CheckoutSessions:
         )
 
     def retrieve(self, session_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/checkout/sessions/{session_id}")
+        return self._t.request("GET", f"/v1/checkout/sessions/{_p(session_id)}")
 
 
 class OneShotPayments:
@@ -2479,15 +2967,23 @@ class OneShotPayments:
         )
 
     def retrieve(self, one_shot_payment_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/checkout/one_shot/{one_shot_payment_id}")
+        return self._t.request("GET", f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}")
 
 
 class Subscriptions:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, subscription_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/subscriptions/{subscription_id}")
+    def retrieve(self, subscription_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+        """Fetch one subscription.
+
+        Expandable: ``customer``, ``price``, ``refund_eligibility``.
+        """
+        return self._t.request(
+            "GET",
+            f"/v1/subscriptions/{_p(subscription_id)}",
+            params=_expand_params(expand),
+        )
 
     def list(
         self,
@@ -2497,6 +2993,7 @@ class Subscriptions:
         renewal_state: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
         """List subscriptions, newest first, optionally filtered.
 
@@ -2514,6 +3011,8 @@ class Subscriptions:
         are in, so ``renewal_state="paused"`` is how you find paused
         ones. ``status="paused"`` is not accepted and raises
         :class:`~billkit.InvalidRequestError`.
+
+        Expandable: ``customer``, ``price``, ``refund_eligibility``.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(
@@ -2525,6 +3024,7 @@ class Subscriptions:
                 }
             )
         )
+        params.update(_expand_params(expand) or {})
         return self._t.request("GET", "/v1/subscriptions", params=params)
 
     def iter(
@@ -2555,21 +3055,21 @@ class Subscriptions:
     def cancel(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/cancel",
+            f"/v1/subscriptions/{_p(subscription_id)}/cancel",
             idempotency_key=idempotency_key,
         )
 
     def pause(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/pause",
+            f"/v1/subscriptions/{_p(subscription_id)}/pause",
             idempotency_key=idempotency_key,
         )
 
     def resume(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/resume",
+            f"/v1/subscriptions/{_p(subscription_id)}/resume",
             idempotency_key=idempotency_key,
         )
 
@@ -2586,14 +3086,14 @@ class Subscriptions:
         """
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/reactivate",
+            f"/v1/subscriptions/{_p(subscription_id)}/reactivate",
             idempotency_key=idempotency_key,
         )
 
     def preview_update(self, subscription_id: str, *, target_price_id: str) -> dict[str, Any]:
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/preview_update",
+            f"/v1/subscriptions/{_p(subscription_id)}/preview_update",
             json_body={"target_price_id": target_price_id},
         )
 
@@ -2606,7 +3106,7 @@ class Subscriptions:
     ) -> dict[str, Any]:
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/update",
+            f"/v1/subscriptions/{_p(subscription_id)}/update",
             json_body={"target_price_id": target_price_id},
             idempotency_key=idempotency_key,
         )
@@ -2620,7 +3120,7 @@ class Subscriptions:
     ) -> dict[str, Any]:
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/reauthorize_payment_method",
+            f"/v1/subscriptions/{_p(subscription_id)}/reauthorize_payment_method",
             json_body={"return_url": return_url},
             idempotency_key=idempotency_key,
         )
@@ -2677,7 +3177,7 @@ class Subscriptions:
         )
         return self._t.request(
             "POST",
-            f"/v1/subscriptions/{subscription_id}/usage_records",
+            f"/v1/subscriptions/{_p(subscription_id)}/usage_records",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -2701,7 +3201,7 @@ class Subscriptions:
         if invoice_id is not None:
             params["invoice_id"] = invoice_id
         return self._t.request(
-            "GET", f"/v1/subscriptions/{subscription_id}/usage_records", params=params
+            "GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_records", params=params
         )
 
     def iter_usage_records(
@@ -2737,7 +3237,7 @@ class Subscriptions:
         ``open_invoice_id`` names an earlier cycle that is invoiced and
         still unsettled; while one is open, this period cannot be charged.
         """
-        return self._t.request("GET", f"/v1/subscriptions/{subscription_id}/usage_summary")
+        return self._t.request("GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_summary")
 
 
 class Refunds:
@@ -2774,7 +3274,7 @@ class Refunds:
         )
 
     def retrieve(self, refund_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/refunds/{refund_id}")
+        return self._t.request("GET", f"/v1/refunds/{_p(refund_id)}")
 
     def list(
         self,
@@ -2807,28 +3307,54 @@ class Disputes:
         self._t = transport
 
     def retrieve(self, dispute_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/disputes/{dispute_id}")
+        return self._t.request("GET", f"/v1/disputes/{_p(dispute_id)}")
 
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        status: str | None = None,
+        payment_id: str | None = None,
     ) -> dict[str, Any]:
-        return self._t.request(
-            "GET",
-            "/v1/disputes",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List chargebacks raised against your payments, newest first.
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
-        """Walk every page of ``list()`` and yield each dispute."""
-        return paginate(self.list, page_size=page_size)
+        ``status`` takes a comma-separated list of ``open`` / ``won``.
+        There is no ``lost``: the provider gives no signal for one, so a
+        dispute you lost stays ``open``. ``payment_id`` matches
+        subscription payments only, not one-off charges.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_drop_none({"status": status, "payment_id": payment_id}))
+        return self._t.request("GET", "/v1/disputes", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        status: str | None = None,
+        payment_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Walk every page of ``list()`` and yield each dispute.
+
+        Filters are carried onto every page request.
+        """
+        return paginate(self.list, page_size=page_size, status=status, payment_id=payment_id)
 
 
 class WebhookEndpoints:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
+
+    def list_event_types(self) -> dict[str, Any]:
+        """Every event type this deployment can deliver, plus the wildcard.
+
+        ``enabled_events`` rejects anything not on this list, so read it
+        rather than hard-coding a set: a name that is not on it fails at
+        registration and leaves you with an endpoint that never fires.
+        Read-only and the same for every caller.
+        """
+        return self._t.request("GET", "/v1/webhook_endpoints/event_types")
 
     def create(
         self,
@@ -2849,7 +3375,7 @@ class WebhookEndpoints:
         )
 
     def retrieve(self, endpoint_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/webhook_endpoints/{endpoint_id}")
+        return self._t.request("GET", f"/v1/webhook_endpoints/{_p(endpoint_id)}")
 
     def update(
         self,
@@ -2878,7 +3404,7 @@ class WebhookEndpoints:
         )
         return self._t.request(
             "POST",
-            f"/v1/webhook_endpoints/{endpoint_id}",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -2898,7 +3424,7 @@ class WebhookEndpoints:
         """
         return self._t.request(
             "DELETE",
-            f"/v1/webhook_endpoints/{endpoint_id}",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}",
             idempotency_key=idempotency_key,
         )
 
@@ -2907,7 +3433,7 @@ class WebhookEndpoints:
     ) -> dict[str, Any]:
         return self._t.request(
             "POST",
-            f"/v1/webhook_endpoints/{endpoint_id}/rotate_secret",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/rotate_secret",
             idempotency_key=idempotency_key,
         )
 
@@ -2942,7 +3468,7 @@ class WebhookEndpoints:
         """
         return self._t.request(
             "GET",
-            f"/v1/webhook_endpoints/{endpoint_id}/deliveries",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries",
             params=_list_params(limit=limit, starting_after=starting_after),
         )
 
@@ -2962,12 +3488,11 @@ class WebhookEndpoints:
         The single-row counterpart to :meth:`list_deliveries`. Carries
         the full response body excerpt rather than the truncated form on
         the list page, which is what you want when debugging one failing
-        attempt. Mirrors ``getDelivery`` (node) and ``retrieveDelivery``
-        (php).
+        attempt. Spelled ``retrieveDelivery`` in the node and php clients.
         """
         return self._t.request(
             "GET",
-            f"/v1/webhook_endpoints/{endpoint_id}/deliveries/{delivery_id}",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}",
         )
 
     def redeliver(
@@ -2986,7 +3511,7 @@ class WebhookEndpoints:
         """
         return self._t.request(
             "POST",
-            f"/v1/webhook_endpoints/{endpoint_id}/deliveries/{delivery_id}/redeliver",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}/redeliver",
             idempotency_key=idempotency_key,
         )
 
@@ -2996,7 +3521,7 @@ class Events:
         self._t = transport
 
     def retrieve(self, event_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/events/{event_id}")
+        return self._t.request("GET", f"/v1/events/{_p(event_id)}")
 
     def list(
         self,
@@ -3004,10 +3529,16 @@ class Events:
         limit: int | None = None,
         starting_after: str | None = None,
         type: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
+        """List events, newest first.
+
+        Expandable: ``customer``. ``events.retrieve`` accepts none.
+        """
         params = _list_params(limit=limit, starting_after=starting_after)
         if type is not None:
             params["type"] = type
+        params.update(_expand_params(expand) or {})
         return self._t.request("GET", "/v1/events", params=params)
 
     def iter(
@@ -3029,6 +3560,9 @@ class Tenant:
     * :meth:`portal_branding` / :meth:`set_portal_branding`: the
       customer-facing portal chrome (business name, support email,
       logo URL, theme tokens, capability flags).
+    * :meth:`billing_profile` / :meth:`set_billing_profile`: your own
+      registered country, VAT id and invoice address.
+    * :meth:`export`: everything in the account as one JSON document.
     * :meth:`rotate_provider_credential`: replace the encrypted
       Mollie API key without re-running ``provision_tenant --force``.
     """
@@ -3054,9 +3588,9 @@ class Tenant:
     ) -> dict[str, Any]:
         """Partial-update the portal branding row.
 
-        Unset fields are left alone; explicit ``None`` is **not**
-        sent (use the raw HTTP path if you need explicit-null clears,
-        coming in v0.2). To clear all fields, send empty values.
+        Unset fields are left alone: an explicit ``None`` is **not** sent,
+        it is dropped like any other omitted keyword. Clear a field by
+        sending an empty value for it.
         """
         body = _drop_none(
             {
@@ -3073,6 +3607,89 @@ class Tenant:
             json_body=body,
             idempotency_key=idempotency_key,
         )
+
+    def billing_profile(self) -> dict[str, Any]:
+        """Read your own registered country and VAT number.
+
+        These are what your customers' VAT is decided against, so check
+        them before you take your first live payment. ``country_code`` is
+        what you have stored and can be ``None``;
+        ``effective_country_code`` is what the next charge will really
+        use. The two differ only when you have stored nothing, which is
+        exactly the case worth spotting. ``vat_id`` has no effective
+        counterpart, because nothing can stand in for a registration.
+        """
+        return self._t.request("GET", "/v1/tenant/billing_profile")
+
+    def set_billing_profile(
+        self,
+        *,
+        country_code: str,
+        vat_id: str | _Unset | None = _UNSET,
+        address_line1: str | _Unset | None = _UNSET,
+        address_line2: str | _Unset | None = _UNSET,
+        postal_code: str | _Unset | None = _UNSET,
+        city: str | _Unset | None = _UNSET,
+        registration_number: str | _Unset | None = _UNSET,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Set the seller identity: jurisdiction, VAT id, invoice address.
+
+        ``country_code`` is required on every call: there is nothing to
+        leave alone about a jurisdiction, and it decides whether a
+        customer's sale is domestic, cross-border within the EU, or
+        outside it.
+
+        Every other field is partial-update, and this is the one method in
+        the SDK where ``None`` is a value rather than an omission: omit a
+        keyword and the stored value is left alone, pass ``None``
+        explicitly and it is **cleared**. Deregistering for VAT and moving
+        office are both real events, so a field that could be set once and
+        never emptied would force you to keep printing something untrue.
+
+        Changes take effect on your next charge only. Tax is worked out
+        before money moves and written onto the payment and its invoice,
+        so correcting a country here never reprices an issued document.
+        """
+        body: dict[str, Any] = {"country_code": country_code}
+        for key, value in (
+            ("vat_id", vat_id),
+            ("address_line1", address_line1),
+            ("address_line2", address_line2),
+            ("postal_code", postal_code),
+            ("city", city),
+            ("registration_number", registration_number),
+        ):
+            if not isinstance(value, _Unset):
+                body[key] = value
+        return self._t.request(
+            "POST",
+            "/v1/tenant/billing_profile",
+            json_body=body,
+            idempotency_key=idempotency_key,
+        )
+
+    def export(self) -> bytes:
+        """Download everything in the account as one JSON document.
+
+        .. code-block:: python
+
+            Path("export.json").write_bytes(client.tenant.export())
+
+        The GDPR Article 20 portability route, and the way to take a
+        backup: catalogue, customers, subscriptions, every payment with
+        its refunds, credit notes, disputes, invoices with line items,
+        usage records and the event log. Each record has the same shape
+        its ``GET`` route returns, and ``billkit_export_version`` names
+        the shape.
+
+        It is ``application/json`` streamed inline, with no redirect, and it
+        can be large, so write it to a file rather than holding it in
+        memory. Test and live data export separately: you get whichever
+        mode the calling key belongs to. Nothing is changed, but the
+        access is recorded in your audit log.
+        """
+        return self._t.request_bytes("GET", "/v1/tenant/export")
 
     def rotate_provider_credential(
         self,
@@ -3136,7 +3753,7 @@ class Coupons:
         )
 
     def retrieve(self, coupon_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/coupons/{coupon_id}")
+        return self._t.request("GET", f"/v1/coupons/{_p(coupon_id)}")
 
     def update(
         self,
@@ -3167,7 +3784,7 @@ class Coupons:
         )
         return self._t.request(
             "POST",
-            f"/v1/coupons/{coupon_id}",
+            f"/v1/coupons/{_p(coupon_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -3242,7 +3859,7 @@ class TaxRates:
         )
 
     def retrieve(self, tax_rate_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/tax_rates/{tax_rate_id}")
+        return self._t.request("GET", f"/v1/tax_rates/{_p(tax_rate_id)}")
 
     def update(
         self,
@@ -3271,7 +3888,7 @@ class TaxRates:
         )
         return self._t.request(
             "POST",
-            f"/v1/tax_rates/{tax_rate_id}",
+            f"/v1/tax_rates/{_p(tax_rate_id)}",
             json_body=body,
             idempotency_key=idempotency_key,
         )
@@ -3295,17 +3912,24 @@ class TaxRates:
 class Invoices:
     """Read-only access to generated invoices.
 
-    Invoices are produced by the billing pipeline; tenants don't
-    create them directly. PDF retrieval issues a 302 redirect to the
-    storage adapter's signed URL. Follow it transparently or expose
-    it to the customer.
+    Invoices are produced by the billing pipeline; tenants don't create
+    them directly. :meth:`retrieve_pdf` hands back the rendered bytes: a
+    blob-backed deployment streams them inline and an S3-backed one
+    answers 302 to a presigned URL, which the transport follows for you,
+    so both look identical from here.
     """
 
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, invoice_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/invoices/{invoice_id}")
+    def retrieve(self, invoice_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+        """Fetch one invoice, line items included.
+
+        Expandable: ``customer``.
+        """
+        return self._t.request(
+            "GET", f"/v1/invoices/{_p(invoice_id)}", params=_expand_params(expand)
+        )
 
     def retrieve_pdf(self, invoice_id: str) -> bytes:
         """Download the rendered invoice PDF as raw bytes.
@@ -3326,22 +3950,81 @@ class Invoices:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured invoice for tenants who render their own.
         """
-        return self._t.request_bytes("GET", f"/v1/invoices/{invoice_id}/pdf")
+        return self._t.request_bytes("GET", f"/v1/invoices/{_p(invoice_id)}/pdf")
+
+    def send_email(self, invoice_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Send the customer their invoice again.
+
+        The same tenant-branded "your invoice is ready" email, with a
+        fresh portal link, because the one in the original may have
+        expired and re-sending a dead link is worse than not re-sending.
+
+        It goes to the address captured **on the invoice**, not the
+        customer's current one: this is a copy of a document that was
+        issued to somebody, and quietly redirecting it would make the
+        resend a different act from the original send. An invoice with no
+        address on file raises :class:`~billkit.InvalidRequestError`
+        rather than reporting a send that did not happen.
+        """
+        return self._t.request(
+            "POST",
+            f"/v1/invoices/{_p(invoice_id)}/email",
+            idempotency_key=idempotency_key,
+        )
 
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        customer_id: str | None = None,
+        subscription_id: str | None = None,
+        payment_id: str | None = None,
+        status: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
-        return self._t.request(
-            "GET",
-            "/v1/invoices",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List invoices, newest first. Line items are left out here.
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
-        return paginate(self.list, page_size=page_size)
+        ``customer_id``, ``subscription_id`` and ``payment_id`` each
+        narrow to one, which is how you ask "show me this customer's
+        invoices" or "which invoice did this charge produce" without
+        paging the whole account. ``status`` takes one of ``draft``,
+        ``open``, ``paid``, ``void``, ``uncollectible``.
+
+        Expandable: ``customer``.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(
+            _drop_none(
+                {
+                    "customer_id": customer_id,
+                    "subscription_id": subscription_id,
+                    "payment_id": payment_id,
+                    "status": status,
+                }
+            )
+        )
+        params.update(_expand_params(expand) or {})
+        return self._t.request("GET", "/v1/invoices", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        customer_id: str | None = None,
+        subscription_id: str | None = None,
+        payment_id: str | None = None,
+        status: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Walk every page of ``list()``; filters are carried on each."""
+        return paginate(
+            self.list,
+            page_size=page_size,
+            customer_id=customer_id,
+            subscription_id=subscription_id,
+            payment_id=payment_id,
+            status=status,
+        )
 
     def void(
         self,
@@ -3369,7 +4052,7 @@ class Invoices:
         """
         return self._t.request(
             "POST",
-            f"/v1/invoices/{invoice_id}/void",
+            f"/v1/invoices/{_p(invoice_id)}/void",
             json_body=_drop_none({"reason": reason}),
             idempotency_key=idempotency_key,
         )
@@ -3390,7 +4073,7 @@ class CreditNotes:
         self._t = transport
 
     def retrieve(self, credit_note_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/credit_notes/{credit_note_id}")
+        return self._t.request("GET", f"/v1/credit_notes/{_p(credit_note_id)}")
 
     def retrieve_pdf(self, credit_note_id: str) -> bytes:
         """Download the rendered credit note PDF as raw bytes.
@@ -3411,7 +4094,7 @@ class CreditNotes:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured credit note for tenants who render their own.
         """
-        return self._t.request_bytes("GET", f"/v1/credit_notes/{credit_note_id}/pdf")
+        return self._t.request_bytes("GET", f"/v1/credit_notes/{_p(credit_note_id)}/pdf")
 
     def list(
         self,
@@ -3452,7 +4135,7 @@ class AuditLogs:
         self._t = transport
 
     def retrieve(self, audit_log_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/audit_logs/{audit_log_id}")
+        return self._t.request("GET", f"/v1/audit_logs/{_p(audit_log_id)}")
 
     def list(
         self,
@@ -3515,23 +4198,56 @@ class Payments:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, payment_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/payments/{payment_id}")
+    def retrieve(self, payment_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+        """Fetch one subscription payment.
+
+        Expandable: ``customer``, ``subscription``.
+        """
+        return self._t.request(
+            "GET", f"/v1/payments/{_p(payment_id)}", params=_expand_params(expand)
+        )
+
+    def retrieve_provider(self, payment_id: str) -> dict[str, Any]:
+        """Fetch the provider's own record of this charge, live.
+
+        Reads Mollie at request time rather than a stored copy, so it
+        carries what BillKit deliberately does not keep: the card BIN, the
+        iDEAL bank, the provider's own status string. Reading live means
+        it can fail: a provider outage, a credential that no longer
+        authorises the profile, or a charge old enough to have aged out
+        all answer ``200`` with ``available: False`` and a short reason,
+        so render the rest of the page regardless.
+        """
+        return self._t.request("GET", f"/v1/payments/{_p(payment_id)}/provider")
 
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
+        customer_id: str | None = None,
+        expand: list[str] | None = None,
     ) -> dict[str, Any]:
-        return self._t.request(
-            "GET",
-            "/v1/payments",
-            params=_list_params(limit=limit, starting_after=starting_after),
-        )
+        """List subscription payments, newest first.
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
-        return paginate(self.list, page_size=page_size)
+        ``customer_id`` narrows to one customer. Failed and pending
+        attempts are listed alongside successful ones, so check ``status``
+        before treating a row as revenue. Mandate verifications are never
+        listed, because nothing was sold, and one-off charges live under
+        ``one_shot_payments``.
+
+        Expandable: ``customer``, ``subscription``.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_drop_none({"customer_id": customer_id}))
+        params.update(_expand_params(expand) or {})
+        return self._t.request("GET", "/v1/payments", params=params)
+
+    def iter(
+        self, *, page_size: int | None = None, customer_id: str | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """Walk every page of ``list()``; ``customer_id`` is carried on each."""
+        return paginate(self.list, page_size=page_size, customer_id=customer_id)
 
 
 class BillingPortalSessions:
@@ -3551,12 +4267,27 @@ class BillingPortalSessions:
         *,
         subscription_id: str,
         return_url: str,
+        deliver_email: bool | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Mint a portal session for one subscription.
+
+        ``deliver_email=True`` also emails the link to the subscription's
+        customer, at the address on their record, as a tenant-branded
+        message. It defaults to off: without it you distribute the
+        returned ``url`` yourself.
+        """
+        body = _drop_none(
+            {
+                "subscription_id": subscription_id,
+                "return_url": return_url,
+                "deliver_email": deliver_email,
+            }
+        )
         return self._t.request(
             "POST",
             "/v1/billing_portal/sessions",
-            json_body={"subscription_id": subscription_id, "return_url": return_url},
+            json_body=body,
             idempotency_key=idempotency_key,
         )
 
@@ -3564,6 +4295,85 @@ class BillingPortalSessions:
         """Kill an in-the-wild portal session. Idempotent."""
         return self._t.request(
             "POST",
-            f"/v1/billing_portal/sessions/{session_id}/revoke",
+            f"/v1/billing_portal/sessions/{_p(session_id)}/revoke",
             idempotency_key=idempotency_key,
         )
+
+
+class ApiKeys:
+    """Issue, inspect and revoke API keys.
+
+    A key is issued in the same mode as the key that created it, so a test
+    key can only mint test keys, and it can never grant scopes it does not
+    hold itself. The secret is returned **once**, on :meth:`create`; every
+    later read carries only the prefix.
+    """
+
+    def __init__(self, transport: _SyncRequester) -> None:
+        self._t = transport
+
+    def create(
+        self,
+        *,
+        label: str | None = None,
+        scopes: list[str] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Issue a new key.
+
+        The response's ``secret`` is the only time the full key exists
+        outside your own storage, so record it now; it is never retrievable
+        again. ``scopes`` narrows what the key may do, which is the point
+        of minting one per integration rather than sharing a single key;
+        omit it and the new key inherits the calling key's own. An
+        unrecognised scope is rejected at creation rather than failing
+        later on every call.
+        """
+        body = _drop_none({"label": label, "scopes": scopes})
+        return self._t.request(
+            "POST", "/v1/api_keys", json_body=body, idempotency_key=idempotency_key
+        )
+
+    def retrieve(self, api_key_id: str) -> dict[str, Any]:
+        """One key's metadata: prefix, label, scopes, ``revoked_at``.
+
+        The key itself is never returned. ``last_used_at`` is the useful
+        field, since it tells you whether a key is still in service before
+        you revoke it.
+        """
+        return self._t.request("GET", f"/v1/api_keys/{_p(api_key_id)}")
+
+    def revoke(self, api_key_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        """Revoke a key so it stops working.
+
+        Immediate and irreversible; issue a new key instead. Revoking an
+        already-revoked key returns it unchanged, so a retry is safe, and
+        a key may revoke itself, which is what you want when the leaked
+        key is the one you are calling with.
+        """
+        return self._t.request(
+            "POST",
+            f"/v1/api_keys/{_p(api_key_id)}/revoke",
+            idempotency_key=idempotency_key,
+        )
+
+    def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+    ) -> dict[str, Any]:
+        """List your API keys, newest first.
+
+        Only keys in the calling key's mode are listed. Revoked ones are
+        included, so check ``revoked_at``.
+        """
+        return self._t.request(
+            "GET",
+            "/v1/api_keys",
+            params=_list_params(limit=limit, starting_after=starting_after),
+        )
+
+    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+        """Walk every page of ``list()`` and yield each key."""
+        return paginate(self.list, page_size=page_size)

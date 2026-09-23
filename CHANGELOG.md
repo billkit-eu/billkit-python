@@ -10,6 +10,31 @@ so the numbers will diverge after this first release.
 
 Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
+## [0.7.0] - 2026-09-23
+
+### Fixed
+- Every path id is percent-encoded, so an id containing `/`, `?` or `#` can no longer rewrite the request onto a different route.
+- `customers.update(metadata=...)` is typed `dict[str, str] | None`, matching `create`.
+- The httpx request-line mitigation is re-checked on the first request, so configuring the `billkit` logger *after* building the client still quiets httpx's full-URL line.
+
+### Added
+- `api_keys` resource: `create`, `retrieve`, `revoke`, `list`, `iter`.
+- `invoices.send_email(id)` for `POST /v1/invoices/{id}/email`.
+- `payments.retrieve_provider(id)` for `GET /v1/payments/{id}/provider`.
+- `tenant.billing_profile()` / `tenant.set_billing_profile(...)` for the seller's country, VAT id and invoice address; an explicit `None` clears a field, an omitted keyword leaves it alone.
+- `tenant.export()` returns the account's full JSON export as raw bytes.
+- `webhook_endpoints.list_event_types()` for the deliverable-event catalogue.
+- `expand=[...]` on `customers.list`, `products.list`, `subscriptions.list`, `payments.list`, `invoices.list` and `events.list`, and as a keyword on `products.retrieve`, `subscriptions.retrieve`, `payments.retrieve` and `invoices.retrieve`.
+- `payments.list(customer_id=...)`; `invoices.list(customer_id=, subscription_id=, payment_id=, status=)`; `disputes.list(status=, payment_id=)`. All are carried onto every page by `iter()`.
+- `checkout_sessions.create(country=...)`, so VAT applies to the first charge on the hosted flow.
+- `billing_portal_sessions.create(deliver_email=True)`, which also emails the portal link to the customer.
+
+### Changed
+- `prices.update` accepts every field `PriceUpdate` does (`active`, `metadata`, `tax_behavior`, `payment_methods`, `refund_on_cancel`, `refund_window_initial_days`, `refund_window_renewal_days`), all optional, where `active` was previously required and alone.
+- `customers.set_vat_number(vat_number=None)` clears the registration: it is sent as an explicit JSON null rather than dropped.
+- `coupons.create` documents the two `discount_type` values the API accepts, `"percent"` and `"fixed_cents"`.
+- `tenant.set_portal_branding`, `webhook_endpoints.retrieve_delivery` and the `Invoices` class docstrings were corrected; they named a version that never shipped, the node method's old name, and a redirect the transport already follows.
+
 ## [0.6.0] - 2026-09-23
 
 ### Added

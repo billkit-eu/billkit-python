@@ -20,6 +20,8 @@ from billkit._transport import (
     SyncTransport,
 )
 from billkit.resources import (
+    ApiKeys,
+    AsyncApiKeys,
     AsyncAuditLogs,
     AsyncBillingPortalSessions,
     AsyncCheckoutSessions,
@@ -97,6 +99,7 @@ class AsyncBillKit:
             retry_policy=retry_policy,
             httpx_client=httpx_client,
         )
+        self.api_keys = AsyncApiKeys(self._transport)
         self.customers = AsyncCustomers(self._transport)
         self.products = AsyncProducts(self._transport)
         self.prices = AsyncPrices(self._transport)
@@ -157,6 +160,7 @@ class BillKit:
             retry_policy=retry_policy,
             httpx_client=httpx_client,
         )
+        self.api_keys = ApiKeys(self._transport)
         self.customers = Customers(self._transport)
         self.products = Products(self._transport)
         self.prices = Prices(self._transport)

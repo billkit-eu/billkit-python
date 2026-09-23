@@ -1096,3 +1096,254 @@ async def test_price_create_metered_decimal_async(async_client: AsyncBillKit) ->
         unit_amount_decimal="0.02",
     )
     assert last_request_body(route)["unit_amount_decimal"] == "0.02"
+
+
+# ─── 0.7.0: encoding, expand, filters, new routes ─────────────────
+
+
+@respx.mock
+def test_path_ids_are_percent_encoded(sync_client: BillKit) -> None:
+    # Unencoded, `?` would start a query string, `#` would truncate the
+    # path, and `/` would walk to a different route entirely.
+    route = respx.get(
+        "https://test.billkit.eu/v1/customers/cus_a%2Fb%3Fc%23d",
+    ).mock(return_value=httpx.Response(200, json={"id": "cus_1"}))
+    sync_client.customers.retrieve("cus_a/b?c#d")
+    assert route.called
+    assert route.calls.last.request.url.raw_path == b"/v1/customers/cus_a%2Fb%3Fc%23d"
+
+
+@respx.mock
+def test_both_segments_of_a_two_id_path_are_encoded(sync_client: BillKit) -> None:
+    route = respx.get(
+        "https://test.billkit.eu/v1/webhook_endpoints/we_1%2Fx/deliveries/whd_2%3Fy",
+    ).mock(return_value=httpx.Response(200, json={"id": "whd_2"}))
+    sync_client.webhook_endpoints.retrieve_delivery("we_1/x", "whd_2?y")
+    assert route.called
+
+
+@respx.mock
+def test_expand_is_comma_joined(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/subscriptions").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    sync_client.subscriptions.list(expand=["customer", "price"])
+    assert route.calls.last.request.url.params["expand"] == "customer,price"
+
+
+@respx.mock
+def test_expand_on_a_retrieve_and_absent_when_omitted(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/payments/pay_1").mock(
+        return_value=httpx.Response(200, json={"id": "pay_1"})
+    )
+    sync_client.payments.retrieve("pay_1", expand=["customer"])
+    assert route.calls[0].request.url.params["expand"] == "customer"
+    sync_client.payments.retrieve("pay_1")
+    assert "expand" not in route.calls[1].request.url.params
+
+
+@respx.mock
+def test_list_filters(sync_client: BillKit) -> None:
+    payments = respx.get("https://test.billkit.eu/v1/payments").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    invoices = respx.get("https://test.billkit.eu/v1/invoices").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    disputes = respx.get("https://test.billkit.eu/v1/disputes").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    sync_client.payments.list(customer_id="cus_1")
+    assert payments.calls.last.request.url.params["customer_id"] == "cus_1"
+
+    sync_client.invoices.list(
+        customer_id="cus_1", subscription_id="sub_1", payment_id="pay_1", status="paid"
+    )
+    params = invoices.calls.last.request.url.params
+    assert params["customer_id"] == "cus_1"
+    assert params["subscription_id"] == "sub_1"
+    assert params["payment_id"] == "pay_1"
+    assert params["status"] == "paid"
+
+    sync_client.disputes.list(status="open", payment_id="pay_1")
+    params = disputes.calls.last.request.url.params
+    assert params["status"] == "open"
+    assert params["payment_id"] == "pay_1"
+
+
+@respx.mock
+def test_disputes_iter_carries_filters_onto_every_page(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/disputes").mock(
+        side_effect=[
+            httpx.Response(
+                200, json={"object": "list", "data": [{"id": "dp_1"}], "has_more": True}
+            ),
+            httpx.Response(
+                200, json={"object": "list", "data": [{"id": "dp_2"}], "has_more": False}
+            ),
+        ]
+    )
+    assert [d["id"] for d in sync_client.disputes.iter(status="open")] == ["dp_1", "dp_2"]
+    assert [c.request.url.params["status"] for c in route.calls] == ["open", "open"]
+    assert route.calls[1].request.url.params["starting_after"] == "dp_1"
+
+
+@respx.mock
+def test_invoice_send_email(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/invoices/in_1/email").mock(
+        return_value=httpx.Response(200, json={"invoice_id": "in_1", "recipient": "a@b.test"})
+    )
+    assert sync_client.invoices.send_email("in_1")["recipient"] == "a@b.test"
+    assert_idempotency_header(route.calls.last.request)
+
+
+@respx.mock
+def test_payment_provider_payload(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/payments/pay_1/provider").mock(
+        return_value=httpx.Response(200, json={"available": False, "reason": "provider_error"})
+    )
+    # A provider read that fails is still a 200: the payment is not in
+    # doubt, only our ability to look it up right now.
+    assert sync_client.payments.retrieve_provider("pay_1")["available"] is False
+    assert route.called
+
+
+@respx.mock
+def test_tenant_billing_profile_round_trip(sync_client: BillKit) -> None:
+    read = respx.get("https://test.billkit.eu/v1/tenant/billing_profile").mock(
+        return_value=httpx.Response(
+            200, json={"country_code": None, "effective_country_code": "NL"}
+        )
+    )
+    write = respx.post("https://test.billkit.eu/v1/tenant/billing_profile").mock(
+        return_value=httpx.Response(200, json={"country_code": "NL"})
+    )
+    assert sync_client.tenant.billing_profile()["effective_country_code"] == "NL"
+    assert read.called
+    sync_client.tenant.set_billing_profile(country_code="NL", vat_id=None, city="Amsterdam")
+    # An explicit None clears; an omitted keyword is left alone entirely.
+    assert last_request_body(write) == {
+        "country_code": "NL",
+        "vat_id": None,
+        "city": "Amsterdam",
+    }
+
+
+@respx.mock
+def test_tenant_export_returns_bytes(sync_client: BillKit) -> None:
+    respx.get("https://test.billkit.eu/v1/tenant/export").mock(
+        return_value=httpx.Response(
+            200,
+            content=b'{"billkit_export_version": 2}',
+            headers={"content-type": "application/json"},
+        )
+    )
+    raw = sync_client.tenant.export()
+    assert json.loads(raw)["billkit_export_version"] == 2
+
+
+@respx.mock
+def test_webhook_event_types(sync_client: BillKit) -> None:
+    respx.get("https://test.billkit.eu/v1/webhook_endpoints/event_types").mock(
+        return_value=httpx.Response(200, json={"data": ["customer.created"], "wildcard": "*"})
+    )
+    assert sync_client.webhook_endpoints.list_event_types()["wildcard"] == "*"
+
+
+@respx.mock
+def test_api_keys_surface(sync_client: BillKit) -> None:
+    create = respx.post("https://test.billkit.eu/v1/api_keys").mock(
+        return_value=httpx.Response(200, json={"id": "ak_1", "secret": "bk_test_x"})
+    )
+    respx.get("https://test.billkit.eu/v1/api_keys/ak_1").mock(
+        return_value=httpx.Response(200, json={"id": "ak_1"})
+    )
+    revoke = respx.post("https://test.billkit.eu/v1/api_keys/ak_1/revoke").mock(
+        return_value=httpx.Response(200, json={"id": "ak_1", "revoked_at": 1})
+    )
+    respx.get("https://test.billkit.eu/v1/api_keys").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    assert sync_client.api_keys.create(label="ci", scopes=["customers.read"])["secret"]
+    assert last_request_body(create) == {"label": "ci", "scopes": ["customers.read"]}
+    assert sync_client.api_keys.retrieve("ak_1")["id"] == "ak_1"
+    assert sync_client.api_keys.revoke("ak_1")["revoked_at"] == 1
+    assert_idempotency_header(revoke.calls.last.request)
+    assert sync_client.api_keys.list(limit=5)["data"] == []
+
+
+@respx.mock
+def test_set_vat_number_sends_an_explicit_null_to_clear(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/customers/cus_1/vat_number").mock(
+        return_value=httpx.Response(200, json={"id": "cus_1", "vat_number": None})
+    )
+    sync_client.customers.set_vat_number("cus_1", vat_number=None)
+    # `None` clears server-side, so it is a value here rather than an
+    # omission; `country_code` is still dropped when unset.
+    assert last_request_body(route) == {"vat_number": None}
+
+
+@respx.mock
+def test_price_update_sends_every_forward_looking_field(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(200, json={"id": "price_1"})
+    )
+    sync_client.prices.update(
+        "price_1",
+        active=False,
+        tax_behavior="exclusive",
+        payment_methods=["creditcard", "ideal"],
+        refund_on_cancel="prorated",
+        refund_window_initial_days=14,
+        refund_window_renewal_days=0,
+        metadata={"tier": "pro"},
+    )
+    assert last_request_body(route) == {
+        "active": False,
+        "tax_behavior": "exclusive",
+        "payment_methods": ["creditcard", "ideal"],
+        "refund_on_cancel": "prorated",
+        "refund_window_initial_days": 14,
+        "refund_window_renewal_days": 0,
+        "metadata": {"tier": "pro"},
+    }
+
+
+@respx.mock
+def test_checkout_session_carries_country(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/checkout/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "cs_1"})
+    )
+    sync_client.checkout_sessions.create(
+        customer_id="cus_1",
+        price_id="price_1",
+        success_url="https://ok.test",
+        cancel_url="https://no.test",
+        country="NL",
+    )
+    assert last_request_body(route)["country"] == "NL"
+
+
+@respx.mock
+def test_portal_session_only_sends_deliver_email_when_set(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/billing_portal/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "bps_1"})
+    )
+    sync_client.billing_portal_sessions.create(
+        subscription_id="sub_1", return_url="https://app.test"
+    )
+    assert "deliver_email" not in last_request_body(route)
+    sync_client.billing_portal_sessions.create(
+        subscription_id="sub_1", return_url="https://app.test", deliver_email=True
+    )
+    assert last_request_body(route)["deliver_email"] is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_api_keys_async(async_client: AsyncBillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/api_keys").mock(
+        return_value=httpx.Response(200, json={"id": "ak_1", "secret": "bk_test_x"})
+    )
+    assert (await async_client.api_keys.create())["id"] == "ak_1"
+    assert route.called
