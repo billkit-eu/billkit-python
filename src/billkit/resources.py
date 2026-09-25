@@ -1540,12 +1540,18 @@ class AsyncTenant:
         customer's sale is domestic, cross-border within the EU, or
         outside it.
 
-        Every other field is partial-update, and this is the one method in
-        the SDK where ``None`` is a value rather than an omission: omit a
-        keyword and the stored value is left alone, pass ``None``
-        explicitly and it is **cleared**. Deregistering for VAT and moving
-        office are both real events, so a field that could be set once and
-        never emptied would force you to keep printing something untrue.
+        The address fields and ``registration_number`` are partial-update,
+        and this is the one method in the SDK where ``None`` is a value
+        rather than an omission: omit a keyword and the stored value is left
+        alone, pass ``None`` explicitly and it is **cleared**. Moving office
+        is a real event, so an address that could be set once and never
+        emptied would force you to keep printing something untrue.
+
+        ``vat_id`` can be set once. After that, a different value or
+        ``None`` raises :class:`InvalidRequestError` (``param="vat_id"``,
+        reason ``vat_id_locked``) and the call writes nothing; re-sending
+        the stored number is accepted. BillKit invoices you reverse-charged
+        against it, so support changes it.
 
         Changes take effect on your next charge only. Tax is worked out
         before money moves and written onto the payment and its invoice,
@@ -3640,12 +3646,18 @@ class Tenant:
         customer's sale is domestic, cross-border within the EU, or
         outside it.
 
-        Every other field is partial-update, and this is the one method in
-        the SDK where ``None`` is a value rather than an omission: omit a
-        keyword and the stored value is left alone, pass ``None``
-        explicitly and it is **cleared**. Deregistering for VAT and moving
-        office are both real events, so a field that could be set once and
-        never emptied would force you to keep printing something untrue.
+        The address fields and ``registration_number`` are partial-update,
+        and this is the one method in the SDK where ``None`` is a value
+        rather than an omission: omit a keyword and the stored value is left
+        alone, pass ``None`` explicitly and it is **cleared**. Moving office
+        is a real event, so an address that could be set once and never
+        emptied would force you to keep printing something untrue.
+
+        ``vat_id`` can be set once. After that, a different value or
+        ``None`` raises :class:`InvalidRequestError` (``param="vat_id"``,
+        reason ``vat_id_locked``) and the call writes nothing; re-sending
+        the stored number is accepted. BillKit invoices you reverse-charged
+        against it, so support changes it.
 
         Changes take effect on your next charge only. Tax is worked out
         before money moves and written onto the payment and its invoice,

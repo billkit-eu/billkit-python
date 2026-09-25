@@ -1,6 +1,6 @@
 {
   "$comment": "Machine-readable scenario matrix every SDK integration suite must cover. See SCENARIOS.md for the rationale and for how to add one. Each suite asserts it implements every scenario in ITS OWN family, so adding an entry fails the other SDKs in that family until they catch up. Families: 'server' (node/python/php), 'browser' (js/react), 'framework' (laravel).",
-  "version": 5,
+  "version": 6,
   "families": {
     "server": ["node", "python", "php"],
     "browser": ["js", "react"],
@@ -20,11 +20,21 @@
     { "id": "crud.webhook_endpoint", "family": "server", "group": "crud", "summary": "Webhook endpoint create/retrieve/update/rotate-secret; disabled with status:disabled and still listed, then really deleted with DELETE, which answers {deleted:true} and drops it from the list." },
     { "id": "crud.price_decimal_rate", "family": "server", "group": "crud", "summary": "A metered price declared with a 12-dp unit_amount_decimal round-trips byte-identical as a STRING. The one case where a client-side float silently corrupts money." },
     { "id": "crud.price_tiered", "family": "server", "group": "crud", "summary": "A tiered metered price round-trips billing_scheme, tiers_mode and every tier, with each tier's unit_amount_decimal still a string." },
+    { "id": "crud.price_update_fields", "family": "server", "group": "crud", "summary": "POST /v1/prices/{id} accepts every forward-looking PriceUpdate field, not just active: metadata and refund_on_cancel are set WITHOUT sending active, and the price stays on sale." },
+    { "id": "crud.coupon_discount_type_literals", "family": "server", "group": "crud", "summary": "discount_type round-trips for both API literals, 'percent' and 'fixed_cents', and the English-sounding 'percentage' is refused with the invalid-request exception." },
     { "id": "crud.credit_note_absent_until_refunded", "family": "server", "group": "crud", "summary": "credit_notes lists empty for a fresh tenant and 404s an unknown id — there is no create, because issuance is refund-driven." },
 
     { "id": "filters.subscription_renewal_state", "family": "server", "group": "filters", "summary": "A paused subscription is found by renewal_state=paused while its status stays active; status=paused maps to the invalid-request exception." },
     { "id": "filters.customer_provisional", "family": "server", "group": "filters", "summary": "customers.list(provisional=false) returns a created customer and provisional=true does not, with both listed when the filter is omitted." },
     { "id": "filters.audit_resource_id", "family": "server", "group": "filters", "summary": "audit_logs.list(resource_id=...) returns only the rows for that one resource, and combines with resource_type. The 'everything that happened to this customer' query." },
+
+    { "id": "filters.expand", "family": "server", "group": "filters", "summary": "?expand= attaches the named relation on a list AND on a retrieve, resolved per page rather than per row, and an unknown relation is the invalid-request exception rather than a silent no-op." },
+
+    { "id": "customers.vat_number_clear", "family": "server", "group": "customers", "summary": "customers.set_vat_number stores a registration, and passing vat_number as an explicit null CLEARS it. The one body where null is a value: stripping it would send an empty body the API reads as 'leave it alone'." },
+
+    { "id": "routes.api_keys", "family": "server", "group": "routes", "summary": "api_keys create -> retrieve -> list -> revoke. The secret is returned only on create, every later read carries the prefix alone, and a revoked key is still listed carrying revoked_at." },
+    { "id": "routes.event_types", "family": "server", "group": "routes", "summary": "webhook_endpoints.list_event_types returns the deliverable-event catalogue plus the wildcard, and a type it names is accepted as enabled_events." },
+    { "id": "routes.tenant_billing_profile", "family": "server", "group": "routes", "summary": "tenant billing profile: set country_code + vat_id + city, read it back, then changing or clearing the stored vat_id is refused (400 parameter_invalid on vat_id, reason vat_id_locked) and writes nothing, while omitting vat_id still lets city change." },
 
     { "id": "pagination.has_more", "family": "server", "group": "pagination", "summary": "limit < N yields has_more and an exactly-limit-long page." },
     { "id": "pagination.auto_iter", "family": "server", "group": "pagination", "summary": "Auto-paging iterator yields every row exactly once." },

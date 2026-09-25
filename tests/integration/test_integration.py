@@ -76,10 +76,17 @@ COVERED: set[str] = {
     "crud.webhook_endpoint",
     "crud.price_decimal_rate",
     "crud.price_tiered",
+    "crud.price_update_fields",
+    "crud.coupon_discount_type_literals",
     "crud.credit_note_absent_until_refunded",
     "filters.subscription_renewal_state",
     "filters.customer_provisional",
     "filters.audit_resource_id",
+    "filters.expand",
+    "customers.vat_number_clear",
+    "routes.api_keys",
+    "routes.event_types",
+    "routes.tenant_billing_profile",
     "pagination.has_more",
     "pagination.auto_iter",
     "idempotency.replay",
@@ -247,6 +254,59 @@ def test_crud_price_archive(client: BillKit) -> None:
     back = client.prices.update(price["id"], active=True)
     assert back["active"] is True
     assert back["amount_cents"] == 777
+
+
+def test_crud_price_update_fields(client: BillKit) -> None:
+    """[crud.price_update_fields] a price takes every forward-looking field."""
+    price = make_plan(client, amount_cents=1500)["price"]
+
+    # No ``active`` in the call. Every field is optional and an omitted one
+    # is left alone, so a refund policy can be set on a live price without
+    # restating whether it is on sale.
+    updated = client.prices.update(
+        price["id"],
+        metadata={"tier": "pro"},
+        refund_on_cancel="prorated",
+        # 0 disables refunds for that charge type, so it has to survive the
+        # SDK's own None-pruning.
+        refund_window_renewal_days=0,
+    )
+    assert updated["metadata"] == {"tier": "pro"}
+    assert updated["refund_on_cancel"] == "prorated"
+    assert updated["refund_window_renewal_days"] == 0
+    assert updated["active"] is True
+
+    fetched = client.prices.retrieve(price["id"])
+    assert fetched["active"] is True
+    assert fetched["amount_cents"] == 1500
+
+
+def test_crud_coupon_discount_type_literals(client: BillKit) -> None:
+    """[crud.coupon_discount_type_literals] percent and fixed_cents, nothing else."""
+    percent = client.coupons.create(
+        code=f"PCT{idem_key()[-10:]}",
+        discount_type="percent",
+        discount_value=10,
+        duration="once",
+    )
+    assert percent["discount_type"] == "percent"
+
+    fixed = client.coupons.create(
+        code=f"FIX{idem_key()[-10:]}",
+        discount_type="fixed_cents",
+        discount_value=500,
+        duration="once",
+    )
+    assert fixed["discount_type"] == "fixed_cents"
+
+    # The value these SDKs used to document. It is not a synonym.
+    with pytest.raises(InvalidRequestError):
+        client.coupons.create(
+            code=f"BAD{idem_key()[-10:]}",
+            discount_type="percentage",
+            discount_value=10,
+            duration="once",
+        )
 
 
 def test_crud_customer(client: BillKit) -> None:
@@ -444,6 +504,30 @@ def test_filters_customer_provisional() -> None:
     assert created["id"] in ids()
 
 
+def test_filters_expand(client: BillKit) -> None:
+    """[filters.expand] expand attaches the relation on a list and a retrieve."""
+    plan = make_plan(client, amount_cents=4200)
+    product, price = plan["product"], plan["price"]
+
+    # On a list. Resolved once for the whole page, which is the point: the
+    # alternative a caller reaches for is one request per row.
+    page = client.products.list(expand=["prices"], limit=100)
+    row = next(p for p in page["data"] if p["id"] == product["id"])
+    assert price["id"] in [x["id"] for x in row["prices"]]
+
+    # And on a retrieve, as a keyword.
+    one = client.products.retrieve(product["id"], expand=["prices"])
+    assert price["id"] in [x["id"] for x in one["prices"]]
+
+    # Without it, nothing changes for a caller that never asked.
+    assert client.products.retrieve(product["id"]).get("prices") is None
+
+    # An unknown relation is a 400 naming the ones that work, not a
+    # response that quietly lacks the key.
+    with pytest.raises(InvalidRequestError):
+        client.products.retrieve(product["id"], expand=["nonsense"])
+
+
 def test_filters_audit_resource_id() -> None:
     """[filters.audit_resource_id] resource_id narrows to one row's history.
 
@@ -473,6 +557,109 @@ def test_filters_audit_resource_id() -> None:
     narrowed = rows(resource_id=subject["id"], resource_type="customer")
     assert narrowed
     assert all(row["resource_id"] == subject["id"] for row in narrowed)
+
+
+# ── customers ────────────────────────────────────────────────────────
+
+
+def test_customers_vat_number_clear(client: BillKit) -> None:
+    """[customers.vat_number_clear] an explicit None clears the registration."""
+    # No country on the customer: VIES needs one, so the API stores the
+    # number as unverifiable without opening a socket. That keeps the
+    # scenario about the SDK's body rather than about the EU's uptime.
+    customer = client.customers.create(email=f"vat-{idem_key()}@sdk-it.example.com")
+
+    stored = client.customers.set_vat_number(customer["id"], vat_number="NL123456789B01")
+    assert stored["vat_number"] == "NL123456789B01"
+
+    # The one body where None is a value. Dropped, it would be an empty
+    # object, which the API reads as "change nothing".
+    cleared = client.customers.set_vat_number(customer["id"], vat_number=None)
+    assert cleared["vat_number"] is None
+    assert client.customers.retrieve(customer["id"])["vat_number"] is None
+
+
+# ── routes ───────────────────────────────────────────────────────────
+
+
+def test_routes_api_keys() -> None:
+    """[routes.api_keys] a key can be minted, read, listed and revoked."""
+    c = BillKit(api_key=provision_tenant("api-keys").api_key, base_url=BASE_URL)
+
+    created = c.api_keys.create(label="integration", scopes=["products:read"])
+    assert created["secret"]
+    assert created["scopes"] == ["products:read"]
+
+    # The secret exists once. Every later read carries the prefix alone.
+    fetched = c.api_keys.retrieve(created["id"])
+    assert fetched["id"] == created["id"]
+    assert fetched.get("secret") is None
+    assert fetched["prefix"]
+
+    assert created["id"] in [k["id"] for k in c.api_keys.list(limit=100)["data"]]
+
+    revoked = c.api_keys.revoke(created["id"])
+    assert revoked["revoked_at"]
+
+    # A revoked key stays listed: "this key was in service until Tuesday"
+    # is the question a leak investigation asks.
+    after = {k["id"]: k for k in c.api_keys.list(limit=100)["data"]}
+    assert after[created["id"]]["revoked_at"]
+
+
+def test_routes_event_types(client: BillKit) -> None:
+    """[routes.event_types] the deliverable-event catalogue is readable."""
+    catalogue = client.webhook_endpoints.list_event_types()
+    assert catalogue["object"] == "event_type_list"
+    assert catalogue["data"]
+    assert catalogue["wildcard"]
+
+    # enabled_events is validated against exactly this list, so a name it
+    # returns has to register.
+    endpoint = client.webhook_endpoints.create(
+        url="https://merchant.example.com/hooks",
+        enabled_events=[catalogue["data"][0]],
+    )
+    assert endpoint["id"]
+    client.webhook_endpoints.delete(endpoint["id"])
+
+
+def test_routes_tenant_billing_profile() -> None:
+    """[routes.tenant_billing_profile] set, read back, then the VAT id is locked."""
+    c = BillKit(api_key=provision_tenant("billing-profile").api_key, base_url=BASE_URL)
+
+    stored = c.tenant.set_billing_profile(
+        country_code="NL", vat_id="NL123456789B01", city="Amsterdam"
+    )
+    assert stored["country_code"] == "NL"
+    assert stored["vat_id"] == "NL123456789B01"
+
+    read = c.tenant.billing_profile()
+    assert read["vat_id"] == "NL123456789B01"
+    # Stored and effective agree once something is stored; they differ only
+    # when nothing ever was.
+    assert read["effective_country_code"] == "NL"
+
+    # A stored VAT id is locked: changing it and clearing it with an explicit
+    # None are both refused, and the refusal names the field.
+    for vat_id in ("NL000099998B57", None):
+        with pytest.raises(InvalidRequestError) as excinfo:
+            c.tenant.set_billing_profile(country_code="NL", vat_id=vat_id, city="Rotterdam")
+        assert excinfo.value.param == "vat_id"
+        assert excinfo.value.code == "parameter_invalid"
+        assert "cannot be changed once it is set" in excinfo.value.message
+        assert excinfo.value.raw_body is not None
+        assert excinfo.value.raw_body["error"]["reason"] == "vat_id_locked"
+
+    # The refused call wrote nothing, including the city it carried.
+    after = c.tenant.billing_profile()
+    assert after["vat_id"] == "NL123456789B01"
+    assert after["city"] == "Amsterdam"
+
+    # Everything else stays editable: omit vat_id and it is left alone.
+    moved = c.tenant.set_billing_profile(country_code="NL", city="Utrecht")
+    assert moved["city"] == "Utrecht"
+    assert moved["vat_id"] == "NL123456789B01"
 
 
 # ── pagination ───────────────────────────────────────────────────────
