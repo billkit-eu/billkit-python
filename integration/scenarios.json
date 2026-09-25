@@ -1,6 +1,6 @@
 {
   "$comment": "Machine-readable scenario matrix every SDK integration suite must cover. See SCENARIOS.md for the rationale and for how to add one. Each suite asserts it implements every scenario in ITS OWN family, so adding an entry fails the other SDKs in that family until they catch up. Families: 'server' (node/python/php), 'browser' (js/react), 'framework' (laravel).",
-  "version": 6,
+  "version": 7,
   "families": {
     "server": ["node", "python", "php"],
     "browser": ["js", "react"],
@@ -13,7 +13,8 @@
 
     { "id": "crud.product", "family": "server", "group": "crud", "summary": "Product create/retrieve/update/list round-trip, archived with active:false through the update route." },
     { "id": "crud.price", "family": "server", "group": "crud", "summary": "Price create under a product, retrieve, list filtered by product_id." },
-    { "id": "crud.price_archive", "family": "server", "group": "crud", "summary": "POST /v1/prices/{id} with active:false archives a price, leaves it readable, and re-archiving is a no-op returning the same row; active:true puts it back on sale unchanged." },
+    { "id": "crud.price_archive", "family": "server", "group": "crud", "summary": "POST /v1/prices/{id} with active:false archives a price, leaves it readable, and re-archiving is a no-op returning the same row; active:true puts it back on sale unchanged. Archiving a product's default price releases the default rather than being refused." },
+    { "id": "crud.product_default_price", "family": "server", "group": "crud", "summary": "A product's first price becomes its default_price_id; POST /v1/products/{id} moves it to another of its prices (read back, and via expand=default_price), an omitted field leaves it alone, an explicit JSON null clears it, another product's price is refused on default_price_id, and archiving the default price releases it." },
     { "id": "crud.customer", "family": "server", "group": "crud", "summary": "Customer create/retrieve/update/delete; DELETE answers {deleted:true} and the row leaves the list." },
     { "id": "crud.coupon", "family": "server", "group": "crud", "summary": "Coupon create/validate/update; withdrawn with active:false, after which the code stops validating." },
     { "id": "crud.tax_rate", "family": "server", "group": "crud", "summary": "Tax rate create/retrieve/update; retired with active:false and still readable." },

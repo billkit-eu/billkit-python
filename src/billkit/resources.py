@@ -153,8 +153,8 @@ class _Unset(Enum):
 
     Only needed where the API distinguishes "leave this alone" from "clear
     it" and spells the second as an explicit JSON ``null``: the tenant
-    billing profile. Everywhere else ``None`` means "omit" and
-    :func:`_drop_none` is enough.
+    billing profile and a product's ``default_price_id``. Everywhere else
+    ``None`` means "omit" and :func:`_drop_none` is enough.
     """
 
     TOKEN = 0
@@ -390,7 +390,8 @@ class AsyncProducts:
         """Fetch one product by id.
 
         Expandable: ``prices`` (every price on the product, archived ones
-        included, active-first) and ``stats``.
+        included, active-first), ``stats`` and ``default_price`` (the
+        price ``default_price_id`` names).
         """
         return await self._t.request(
             "GET", f"/v1/products/{_p(product_id)}", params=_expand_params(expand)
@@ -406,6 +407,7 @@ class AsyncProducts:
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
         allow_promotion_codes: bool | None = None,
+        default_price_id: str | _Unset | None = _UNSET,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Patch mutable product fields, or archive the product.
@@ -416,6 +418,13 @@ class AsyncProducts:
         It keeps its id and stays readable, because what was sold under
         it has to be, which is why there is no delete. ``active=True``
         un-archives.
+
+        ``default_price_id`` names the price the billing portal offers on
+        that price's interval. It must be an active price of this product;
+        anything else raises :class:`InvalidRequestError` on
+        ``default_price_id``. Unlike the other keywords here, ``None`` is a
+        value: pass ``default_price_id=None`` explicitly to **clear** the
+        default, and omit it to leave the default alone.
         """
         body = _drop_none(
             {
@@ -427,6 +436,8 @@ class AsyncProducts:
                 "allow_promotion_codes": allow_promotion_codes,
             }
         )
+        if not isinstance(default_price_id, _Unset):
+            body["default_price_id"] = default_price_id
         return await self._t.request(
             "POST",
             f"/v1/products/{_p(product_id)}",
@@ -443,7 +454,7 @@ class AsyncProducts:
     ) -> dict[str, Any]:
         """List products in reverse creation order.
 
-        Expandable: ``prices``, ``stats``.
+        Expandable: ``prices``, ``stats``, ``default_price``.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_expand_params(expand) or {})
@@ -1541,11 +1552,12 @@ class AsyncTenant:
         outside it.
 
         The address fields and ``registration_number`` are partial-update,
-        and this is the one method in the SDK where ``None`` is a value
-        rather than an omission: omit a keyword and the stored value is left
-        alone, pass ``None`` explicitly and it is **cleared**. Moving office
-        is a real event, so an address that could be set once and never
-        emptied would force you to keep printing something untrue.
+        and here ``None`` is a value rather than an omission, as it is for
+        ``products.update(default_price_id=...)``: omit a keyword and the
+        stored value is left alone, pass ``None`` explicitly and it is
+        **cleared**. Moving office is a real event, so an address that could
+        be set once and never emptied would force you to keep printing
+        something untrue.
 
         ``vat_id`` can be set once. After that, a different value or
         ``None`` raises :class:`InvalidRequestError` (``param="vat_id"``,
@@ -2508,7 +2520,8 @@ class Products:
         """Fetch one product by id.
 
         Expandable: ``prices`` (every price on the product, archived ones
-        included, active-first) and ``stats``.
+        included, active-first), ``stats`` and ``default_price`` (the
+        price ``default_price_id`` names).
         """
         return self._t.request(
             "GET", f"/v1/products/{_p(product_id)}", params=_expand_params(expand)
@@ -2524,6 +2537,7 @@ class Products:
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
         allow_promotion_codes: bool | None = None,
+        default_price_id: str | _Unset | None = _UNSET,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Patch mutable product fields, or archive the product.
@@ -2534,6 +2548,13 @@ class Products:
         It keeps its id and stays readable, because what was sold under
         it has to be, which is why there is no delete. ``active=True``
         un-archives.
+
+        ``default_price_id`` names the price the billing portal offers on
+        that price's interval. It must be an active price of this product;
+        anything else raises :class:`InvalidRequestError` on
+        ``default_price_id``. Unlike the other keywords here, ``None`` is a
+        value: pass ``default_price_id=None`` explicitly to **clear** the
+        default, and omit it to leave the default alone.
         """
         body = _drop_none(
             {
@@ -2545,6 +2566,8 @@ class Products:
                 "allow_promotion_codes": allow_promotion_codes,
             }
         )
+        if not isinstance(default_price_id, _Unset):
+            body["default_price_id"] = default_price_id
         return self._t.request(
             "POST",
             f"/v1/products/{_p(product_id)}",
@@ -2561,7 +2584,7 @@ class Products:
     ) -> dict[str, Any]:
         """List products in reverse creation order.
 
-        Expandable: ``prices``, ``stats``.
+        Expandable: ``prices``, ``stats``, ``default_price``.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_expand_params(expand) or {})
@@ -3647,11 +3670,12 @@ class Tenant:
         outside it.
 
         The address fields and ``registration_number`` are partial-update,
-        and this is the one method in the SDK where ``None`` is a value
-        rather than an omission: omit a keyword and the stored value is left
-        alone, pass ``None`` explicitly and it is **cleared**. Moving office
-        is a real event, so an address that could be set once and never
-        emptied would force you to keep printing something untrue.
+        and here ``None`` is a value rather than an omission, as it is for
+        ``products.update(default_price_id=...)``: omit a keyword and the
+        stored value is left alone, pass ``None`` explicitly and it is
+        **cleared**. Moving office is a real event, so an address that could
+        be set once and never emptied would force you to keep printing
+        something untrue.
 
         ``vat_id`` can be set once. After that, a different value or
         ``None`` raises :class:`InvalidRequestError` (``param="vat_id"``,

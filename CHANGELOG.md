@@ -10,6 +10,15 @@ so the numbers will diverge after this first release.
 
 Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
+## [0.7.1] - 2026-09-25
+
+### Added
+- `products.update(default_price_id=...)`, sync and async, for the product's default price, the one the billing portal offers on that price's interval. It must be an active price of the same product. Unlike the other keywords on the method, an explicit `default_price_id=None` is sent as a JSON null and clears the default; omitting the keyword leaves it alone.
+- `products.retrieve` and `products.list` document the `default_price` expansion alongside `prices` and `stats`.
+
+### Changed
+- `tenant.set_billing_profile` documents that the tenant `vat_id` is set once: changing it or clearing it with `None` afterwards raises `InvalidRequestError` (`vat_id_locked` on `vat_id`) and writes nothing, and support changes it. The address fields and `registration_number` still clear with `None`.
+
 ## [0.7.0] - 2026-09-23
 
 ### Fixed
@@ -281,7 +290,9 @@ First public release.
   API keys, request/response bodies and query strings are never logged, and the
   final failure is raised rather than logged so you never get a duplicate entry.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/billkit-eu/billkit-python/compare/v0.7.0...v0.7.1
+[0.7.0]: https://github.com/billkit-eu/billkit-python/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/billkit-eu/billkit-python/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/billkit-eu/billkit-python/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/billkit-eu/billkit-python/compare/v0.3.0...v0.4.0

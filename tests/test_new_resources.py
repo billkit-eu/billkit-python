@@ -1229,6 +1229,49 @@ def test_tenant_billing_profile_round_trip(sync_client: BillKit) -> None:
     }
 
 
+# ─── Product default price ────────────────────────────────────────
+
+
+@respx.mock
+def test_product_update_default_price_id_set_clear_omit(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/products/prod_1").mock(
+        return_value=httpx.Response(200, json={"id": "prod_1", "object": "product"})
+    )
+    sync_client.products.update("prod_1", default_price_id="price_2")
+    assert last_request_body(route) == {"default_price_id": "price_2"}
+    # An explicit None is the clear, so it has to reach the wire as null
+    # rather than being dropped like every other None on this method.
+    sync_client.products.update("prod_1", default_price_id=None)
+    assert last_request_body(route) == {"default_price_id": None}
+    # Omitted means "leave the default alone": the key is absent entirely.
+    sync_client.products.update("prod_1", name="Pro", description=None)
+    assert last_request_body(route) == {"name": "Pro"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_product_update_default_price_id_async(async_client: AsyncBillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/products/prod_1").mock(
+        return_value=httpx.Response(200, json={"id": "prod_1", "object": "product"})
+    )
+    await async_client.products.update("prod_1", default_price_id="price_2")
+    assert last_request_body(route) == {"default_price_id": "price_2"}
+    await async_client.products.update("prod_1", default_price_id=None)
+    assert last_request_body(route) == {"default_price_id": None}
+    await async_client.products.update("prod_1", active=False)
+    assert last_request_body(route) == {"active": False}
+
+
+@respx.mock
+def test_product_retrieve_expand_default_price(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/products/prod_1").mock(
+        return_value=httpx.Response(200, json={"id": "prod_1", "default_price": {"id": "price_2"}})
+    )
+    product = sync_client.products.retrieve("prod_1", expand=["default_price"])
+    assert product["default_price"]["id"] == "price_2"
+    assert route.calls.last.request.url.params["expand"] == "default_price"
+
+
 @respx.mock
 def test_tenant_export_returns_bytes(sync_client: BillKit) -> None:
     respx.get("https://test.billkit.eu/v1/tenant/export").mock(

@@ -70,6 +70,7 @@ COVERED: set[str] = {
     "crud.product",
     "crud.price",
     "crud.price_archive",
+    "crud.product_default_price",
     "crud.customer",
     "crud.coupon",
     "crud.tax_rate",
@@ -254,6 +255,43 @@ def test_crud_price_archive(client: BillKit) -> None:
     back = client.prices.update(price["id"], active=True)
     assert back["active"] is True
     assert back["amount_cents"] == 777
+
+
+def test_crud_product_default_price(client: BillKit) -> None:
+    """[crud.product_default_price] the default moves, clears with None, and
+    is released when that price is archived."""
+    plan = make_plan(client, amount_cents=1000)
+    product, first = plan["product"], plan["price"]
+    second = client.prices.create(
+        product_id=product["id"], amount_cents=1200, currency="EUR", interval="month"
+    )
+
+    # The first price claims the default; a later one does not.
+    assert client.products.retrieve(product["id"])["default_price_id"] == first["id"]
+
+    moved = client.products.update(product["id"], default_price_id=second["id"])
+    assert moved["default_price_id"] == second["id"]
+    expanded = client.products.retrieve(product["id"], expand=["default_price"])
+    assert expanded["default_price"]["id"] == second["id"]
+
+    # Omitting the keyword leaves the default alone.
+    renamed = client.products.update(product["id"], name="Renamed")
+    assert renamed["default_price_id"] == second["id"]
+
+    # An explicit None is the clear, so it has to reach the wire as null.
+    cleared = client.products.update(product["id"], default_price_id=None)
+    assert cleared["default_price_id"] is None
+
+    # Another product's price is refused on the field.
+    other = make_plan(client)["price"]
+    with pytest.raises(InvalidRequestError) as exc:
+        client.products.update(product["id"], default_price_id=other["id"])
+    assert exc.value.param == "default_price_id"
+
+    # Archiving the default price releases it rather than being refused.
+    client.products.update(product["id"], default_price_id=second["id"])
+    client.prices.update(second["id"], active=False)
+    assert client.products.retrieve(product["id"])["default_price_id"] is None
 
 
 def test_crud_price_update_fields(client: BillKit) -> None:
