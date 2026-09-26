@@ -12,6 +12,14 @@ Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-26
+
+### Changed
+- An explicit `None` now also clears `coupons.update(applies_to_price_ids=)` (lifts the price restriction), `coupons.update(min_amount_cents=)` (lifts the minimum), `products.update(marketing_features=)` (empties the list) and `prices.update(refund_window_initial_days=, refund_window_renewal_days=)` (drops the price's override), sync and async. The refund windows were already clearable in the API, but `None` was dropped, so the clear could not be sent from Python. On every other update keyword `None` is still dropped, because the API refuses a null there.
+  **Upgrade note:** as in 0.8.0, a null passed through from your own data clears the field: `coupons.update(cid, min_amount_cents=row.min)` with `row.min` sometimes `None` now lifts the coupon's minimum, which widens who can redeem it. Omit the field when you mean "leave it".
+  **Requires the matching API release.** An older API accepts the null on `applies_to_price_ids`, `min_amount_cents` and `marketing_features` and leaves the value in place.
+- Every other update field refuses an explicit null with a `400` naming the field (the API used to ignore it). The SDK never sends one there; omit the field to leave it unchanged.
+
 ## [0.8.0] - 2026-09-26
 
 ### Added
@@ -302,7 +310,8 @@ First public release.
   API keys, request/response bodies and query strings are never logged, and the
   final failure is raised rather than logged so you never get a duplicate entry.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/billkit-eu/billkit-python/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/billkit-eu/billkit-python/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/billkit-eu/billkit-python/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/billkit-eu/billkit-python/compare/v0.6.0...v0.7.0

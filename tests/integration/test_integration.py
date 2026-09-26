@@ -298,7 +298,7 @@ def test_crud_product_default_price(client: BillKit) -> None:
 
 
 def test_crud_nullable_fields_clear() -> None:
-    """[crud.nullable_fields_clear] an explicit None clears six optional fields.
+    """[crud.nullable_fields_clear] an explicit None clears seven optional fields.
 
     Each needs the ``_UNSET`` sentinel: this SDK drops ``None`` keywords
     everywhere else, so without it the clear would never reach the wire.
@@ -332,9 +332,13 @@ def test_crud_nullable_fields_clear() -> None:
     kept = c.coupons.update(coupon["id"], min_amount_cents=100)
     assert kept["max_redemptions"] == 5
     assert kept["redeem_by"] == redeem_by
-    lifted = c.coupons.update(coupon["id"], max_redemptions=None, redeem_by=None)
+    assert kept["min_amount_cents"] == 100
+    lifted = c.coupons.update(
+        coupon["id"], max_redemptions=None, redeem_by=None, min_amount_cents=None
+    )
     assert lifted["max_redemptions"] is None
     assert lifted["redeem_by"] is None
+    assert lifted["min_amount_cents"] is None
 
     rate = c.tax_rates.create(country_code="DE", rate_basis_points=1900, display_name="DE VAT")
     assert c.tax_rates.update(rate["id"], rate_basis_points=1900)["display_name"] == "DE VAT"

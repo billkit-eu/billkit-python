@@ -162,7 +162,7 @@ for sub in client.subscriptions.iter(status="active,past_due", page_size=100):
 
 ## Clearing a field
 
-On an update, an explicit `None` clears a field and omitting the keyword leaves the stored value alone. This applies to `products.update` (`description`, `default_price_id`), `customers.update` (`name`), `webhook_endpoints.update` (`description`), `coupons.update` (`max_redemptions` removes the cap, `redeem_by` removes the expiry) and `tax_rates.update` (`display_name`). Every other keyword still treats `None` as "not given".
+On an update, an explicit `None` clears a field and omitting the keyword leaves the stored value alone. This applies to `products.update` (`description`, `default_price_id`, `marketing_features` empties the list), `prices.update` (`refund_window_initial_days` and `refund_window_renewal_days` drop the price's override), `customers.update` (`name`), `webhook_endpoints.update` (`description`), `coupons.update` (`max_redemptions` removes the cap, `redeem_by` removes the expiry, `applies_to_price_ids` lifts the price restriction, `min_amount_cents` lifts the minimum) and `tax_rates.update` (`display_name`). Every other keyword still treats `None` as "not given" and leaves it out of the request, because the API refuses a null on a field it cannot clear with a 400 naming the field. A `metadata` update replaces the stored object whole, so `metadata={}` is how it is emptied.
 
 ```python
 client.coupons.update(coupon.id, max_redemptions=None)  # remove the cap

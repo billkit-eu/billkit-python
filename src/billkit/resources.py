@@ -153,11 +153,13 @@ class _Unset(Enum):
 
     Only needed where the API distinguishes "leave this alone" from "clear
     it" and spells the second as an explicit JSON ``null``: the tenant
-    billing profile, a product's ``default_price_id`` and ``description``,
-    a customer's ``name``, a webhook endpoint's ``description``, a
-    coupon's ``max_redemptions`` and ``redeem_by``, and a tax rate's
-    ``display_name``. Everywhere else ``None`` means "omit" and
-    :func:`_drop_none` is enough.
+    billing profile, a product's ``default_price_id``, ``description`` and
+    ``marketing_features``, a price's two refund windows, a customer's
+    ``name``, a webhook endpoint's ``description``, a coupon's
+    ``max_redemptions``, ``redeem_by``, ``applies_to_price_ids`` and
+    ``min_amount_cents``, and a tax rate's ``display_name``. Everywhere
+    else ``None`` means "omit" and :func:`_drop_none` is enough; the API
+    refuses a ``null`` there with a 400.
     """
 
     TOKEN = 0
@@ -425,7 +427,7 @@ class AsyncProducts:
         *,
         name: str | None = None,
         description: str | _Unset | None = _UNSET,
-        marketing_features: list[str] | None = None,
+        marketing_features: list[str] | _Unset | None = _UNSET,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
         allow_promotion_codes: bool | None = None,
@@ -445,21 +447,27 @@ class AsyncProducts:
         that price's interval. It must be an active price of this product;
         anything else raises :class:`InvalidRequestError` on
         ``default_price_id``. Unlike the other keywords here, ``None`` is a
-        value for ``default_price_id`` and ``description``: pass
-        ``default_price_id=None`` explicitly to **clear** the default, or
-        ``description=None`` to remove the description, and omit either
-        to leave it alone.
+        value for ``default_price_id``, ``description`` and
+        ``marketing_features``: pass ``default_price_id=None`` explicitly
+        to **clear** the default, ``description=None`` to remove the
+        description, or ``marketing_features=None`` to empty the list, and
+        omit any of them to leave it alone. ``metadata`` replaces the
+        stored object whole, so ``metadata={}`` is how it is emptied.
         """
         body = _drop_none(
             {
                 "name": name,
-                "marketing_features": marketing_features,
                 "metadata": metadata,
                 "active": active,
                 "allow_promotion_codes": allow_promotion_codes,
             }
         )
-        _put_clearable(body, description=description, default_price_id=default_price_id)
+        _put_clearable(
+            body,
+            description=description,
+            marketing_features=marketing_features,
+            default_price_id=default_price_id,
+        )
         return await self._t.request(
             "POST",
             f"/v1/products/{_p(product_id)}",
@@ -641,8 +649,8 @@ class AsyncPrices:
         tax_behavior: str | None = None,
         payment_methods: list[str] | None = None,
         refund_on_cancel: str | None = None,
-        refund_window_initial_days: int | None = None,
-        refund_window_renewal_days: int | None = None,
+        refund_window_initial_days: int | _Unset | None = _UNSET,
+        refund_window_renewal_days: int | _Unset | None = _UNSET,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Change what a price does next. Omitted fields are left alone.
@@ -669,6 +677,12 @@ class AsyncPrices:
         would restate whether tax was inside or on top of an amount
         somebody has already paid.
 
+        ``refund_window_initial_days=None`` and
+        ``refund_window_renewal_days=None`` passed explicitly clear the
+        price's override (each sent as a JSON null), so the window falls
+        back to the default; omit either to leave it alone. On every other
+        keyword ``None`` means "not given".
+
         Sending the value a price already has returns it unchanged and
         emits no second event, which makes a retry safe. Archiving emits
         ``price.archived``; putting one back emits ``price.updated``.
@@ -680,9 +694,12 @@ class AsyncPrices:
                 "tax_behavior": tax_behavior,
                 "payment_methods": payment_methods,
                 "refund_on_cancel": refund_on_cancel,
-                "refund_window_initial_days": refund_window_initial_days,
-                "refund_window_renewal_days": refund_window_renewal_days,
             }
+        )
+        _put_clearable(
+            body,
+            refund_window_initial_days=refund_window_initial_days,
+            refund_window_renewal_days=refund_window_renewal_days,
         )
         return await self._t.request(
             "POST",
@@ -1737,8 +1754,8 @@ class AsyncCoupons:
         active: bool | None = None,
         max_redemptions: int | _Unset | None = _UNSET,
         redeem_by: int | _Unset | None = _UNSET,
-        applies_to_price_ids: list[str] | None = None,
-        min_amount_cents: int | None = None,
+        applies_to_price_ids: list[str] | _Unset | None = _UNSET,
+        min_amount_cents: int | _Unset | None = _UNSET,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Patch a coupon's limits, or withdraw it with ``active=False``.
@@ -1749,17 +1766,19 @@ class AsyncCoupons:
         customer was charged. ``active=True`` brings the campaign back.
 
         ``max_redemptions=None`` passed explicitly removes the redemption
-        cap, and ``redeem_by=None`` removes the expiry (each sent as a
-        JSON null); omit either to leave it alone.
+        cap, ``redeem_by=None`` removes the expiry,
+        ``applies_to_price_ids=None`` lifts the price restriction and
+        ``min_amount_cents=None`` lifts the minimum (each sent as a JSON
+        null); omit any of them to leave it alone.
         """
-        body = _drop_none(
-            {
-                "active": active,
-                "applies_to_price_ids": applies_to_price_ids,
-                "min_amount_cents": min_amount_cents,
-            }
+        body = _drop_none({"active": active})
+        _put_clearable(
+            body,
+            max_redemptions=max_redemptions,
+            redeem_by=redeem_by,
+            applies_to_price_ids=applies_to_price_ids,
+            min_amount_cents=min_amount_cents,
         )
-        _put_clearable(body, max_redemptions=max_redemptions, redeem_by=redeem_by)
         return await self._t.request(
             "POST",
             f"/v1/coupons/{_p(coupon_id)}",
@@ -2613,7 +2632,7 @@ class Products:
         *,
         name: str | None = None,
         description: str | _Unset | None = _UNSET,
-        marketing_features: list[str] | None = None,
+        marketing_features: list[str] | _Unset | None = _UNSET,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
         allow_promotion_codes: bool | None = None,
@@ -2633,21 +2652,27 @@ class Products:
         that price's interval. It must be an active price of this product;
         anything else raises :class:`InvalidRequestError` on
         ``default_price_id``. Unlike the other keywords here, ``None`` is a
-        value for ``default_price_id`` and ``description``: pass
-        ``default_price_id=None`` explicitly to **clear** the default, or
-        ``description=None`` to remove the description, and omit either
-        to leave it alone.
+        value for ``default_price_id``, ``description`` and
+        ``marketing_features``: pass ``default_price_id=None`` explicitly
+        to **clear** the default, ``description=None`` to remove the
+        description, or ``marketing_features=None`` to empty the list, and
+        omit any of them to leave it alone. ``metadata`` replaces the
+        stored object whole, so ``metadata={}`` is how it is emptied.
         """
         body = _drop_none(
             {
                 "name": name,
-                "marketing_features": marketing_features,
                 "metadata": metadata,
                 "active": active,
                 "allow_promotion_codes": allow_promotion_codes,
             }
         )
-        _put_clearable(body, description=description, default_price_id=default_price_id)
+        _put_clearable(
+            body,
+            description=description,
+            marketing_features=marketing_features,
+            default_price_id=default_price_id,
+        )
         return self._t.request(
             "POST",
             f"/v1/products/{_p(product_id)}",
@@ -2829,8 +2854,8 @@ class Prices:
         tax_behavior: str | None = None,
         payment_methods: list[str] | None = None,
         refund_on_cancel: str | None = None,
-        refund_window_initial_days: int | None = None,
-        refund_window_renewal_days: int | None = None,
+        refund_window_initial_days: int | _Unset | None = _UNSET,
+        refund_window_renewal_days: int | _Unset | None = _UNSET,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Change what a price does next. Omitted fields are left alone.
@@ -2857,6 +2882,12 @@ class Prices:
         would restate whether tax was inside or on top of an amount
         somebody has already paid.
 
+        ``refund_window_initial_days=None`` and
+        ``refund_window_renewal_days=None`` passed explicitly clear the
+        price's override (each sent as a JSON null), so the window falls
+        back to the default; omit either to leave it alone. On every other
+        keyword ``None`` means "not given".
+
         Sending the value a price already has returns it unchanged and
         emits no second event, which makes a retry safe. Archiving emits
         ``price.archived``; putting one back emits ``price.updated``.
@@ -2868,9 +2899,12 @@ class Prices:
                 "tax_behavior": tax_behavior,
                 "payment_methods": payment_methods,
                 "refund_on_cancel": refund_on_cancel,
-                "refund_window_initial_days": refund_window_initial_days,
-                "refund_window_renewal_days": refund_window_renewal_days,
             }
+        )
+        _put_clearable(
+            body,
+            refund_window_initial_days=refund_window_initial_days,
+            refund_window_renewal_days=refund_window_renewal_days,
         )
         return self._t.request(
             "POST",
@@ -3913,8 +3947,8 @@ class Coupons:
         active: bool | None = None,
         max_redemptions: int | _Unset | None = _UNSET,
         redeem_by: int | _Unset | None = _UNSET,
-        applies_to_price_ids: list[str] | None = None,
-        min_amount_cents: int | None = None,
+        applies_to_price_ids: list[str] | _Unset | None = _UNSET,
+        min_amount_cents: int | _Unset | None = _UNSET,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Patch a coupon's limits, or withdraw it with ``active=False``.
@@ -3925,17 +3959,19 @@ class Coupons:
         customer was charged. ``active=True`` brings the campaign back.
 
         ``max_redemptions=None`` passed explicitly removes the redemption
-        cap, and ``redeem_by=None`` removes the expiry (each sent as a
-        JSON null); omit either to leave it alone.
+        cap, ``redeem_by=None`` removes the expiry,
+        ``applies_to_price_ids=None`` lifts the price restriction and
+        ``min_amount_cents=None`` lifts the minimum (each sent as a JSON
+        null); omit any of them to leave it alone.
         """
-        body = _drop_none(
-            {
-                "active": active,
-                "applies_to_price_ids": applies_to_price_ids,
-                "min_amount_cents": min_amount_cents,
-            }
+        body = _drop_none({"active": active})
+        _put_clearable(
+            body,
+            max_redemptions=max_redemptions,
+            redeem_by=redeem_by,
+            applies_to_price_ids=applies_to_price_ids,
+            min_amount_cents=min_amount_cents,
         )
-        _put_clearable(body, max_redemptions=max_redemptions, redeem_by=redeem_by)
         return self._t.request(
             "POST",
             f"/v1/coupons/{_p(coupon_id)}",

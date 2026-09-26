@@ -1401,8 +1401,66 @@ _CLEARABLE = [
     ("webhook_endpoints", "/v1/webhook_endpoints/x_1", "description", "prod hook"),
     ("coupons", "/v1/coupons/x_1", "max_redemptions", 5),
     ("coupons", "/v1/coupons/x_1", "redeem_by", 1_900_000_000),
+    ("coupons", "/v1/coupons/x_1", "applies_to_price_ids", ["price_1"]),
+    ("coupons", "/v1/coupons/x_1", "min_amount_cents", 1000),
+    ("products", "/v1/products/x_1", "marketing_features", ["Priority support"]),
+    ("prices", "/v1/prices/x_1", "refund_window_initial_days", 14),
+    ("prices", "/v1/prices/x_1", "refund_window_renewal_days", 7),
     ("tax_rates", "/v1/tax_rates/x_1", "display_name", "BTW"),
 ]
+
+#: Keywords the API cannot clear. It refuses an explicit null on these
+#: with a 400, so ``None`` must keep meaning "not given" and never reach
+#: the wire.
+_NOT_CLEARABLE = [
+    ("products", "/v1/products/x_1", "name"),
+    ("products", "/v1/products/x_1", "metadata"),
+    ("products", "/v1/products/x_1", "active"),
+    ("products", "/v1/products/x_1", "allow_promotion_codes"),
+    ("prices", "/v1/prices/x_1", "active"),
+    ("prices", "/v1/prices/x_1", "metadata"),
+    ("prices", "/v1/prices/x_1", "tax_behavior"),
+    ("prices", "/v1/prices/x_1", "payment_methods"),
+    ("prices", "/v1/prices/x_1", "refund_on_cancel"),
+    ("coupons", "/v1/coupons/x_1", "active"),
+    ("customers", "/v1/customers/x_1", "email"),
+    ("customers", "/v1/customers/x_1", "country_code"),
+    ("customers", "/v1/customers/x_1", "metadata"),
+    ("webhook_endpoints", "/v1/webhook_endpoints/x_1", "url"),
+    ("webhook_endpoints", "/v1/webhook_endpoints/x_1", "enabled_events"),
+    ("webhook_endpoints", "/v1/webhook_endpoints/x_1", "status"),
+    ("tax_rates", "/v1/tax_rates/x_1", "rate_basis_points"),
+    ("tax_rates", "/v1/tax_rates/x_1", "inclusive"),
+    ("tax_rates", "/v1/tax_rates/x_1", "active"),
+]
+"""Every update field the API refuses an explicit null on (``NotClearable`` in
+the API's schemas). ``None`` on these must never reach the wire: it would be
+a 400, not a clear."""
+
+
+@respx.mock
+@pytest.mark.parametrize(("resource", "path", "field"), _NOT_CLEARABLE)
+def test_not_clearable_field_none_is_omitted(
+    sync_client: BillKit, resource: str, path: str, field: str
+) -> None:
+    route = respx.post(f"https://test.billkit.eu{path}").mock(
+        return_value=httpx.Response(200, json={"id": "x_1"})
+    )
+    getattr(sync_client, resource).update("x_1", **{field: None})
+    assert last_request_body(route) == {}
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(("resource", "path", "field"), _NOT_CLEARABLE)
+async def test_not_clearable_field_none_is_omitted_async(
+    async_client: AsyncBillKit, resource: str, path: str, field: str
+) -> None:
+    route = respx.post(f"https://test.billkit.eu{path}").mock(
+        return_value=httpx.Response(200, json={"id": "x_1"})
+    )
+    await getattr(async_client, resource).update("x_1", **{field: None})
+    assert last_request_body(route) == {}
 
 
 @respx.mock
