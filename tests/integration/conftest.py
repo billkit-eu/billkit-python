@@ -52,17 +52,20 @@ class ITTenant:
     session_token: str
 
 
-def provision_tenant(label: str = "py-sdk-it") -> ITTenant:
+def provision_tenant(label: str = "py-sdk-it", *, mode: str = "test") -> ITTenant:
     """Provision a brand-new tenant and return its credentials.
 
     The email is randomised per call precisely so each suite gets its own
     tenant. List assertions ("exactly the 7 products I created") are only
     stable under that isolation.
+
+    ``mode="live"`` returns a live-mode key, which the tenant-level settings
+    (billing profile, portal branding) require: live traffic reads them.
     """
     email = f"{label}-{uuid.uuid4()}@sdk-it.example.com"
     resp = httpx.post(
         f"{BASE_URL}/v1/console/auth/_test/login",
-        json={"email": email, "mode": "test", "tenant_name": f"Py SDK IT {label}"},
+        json={"email": email, "mode": mode, "tenant_name": f"Py SDK IT {label}"},
         timeout=30.0,
     )
     if resp.status_code == 404:

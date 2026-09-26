@@ -10,6 +10,18 @@ so the numbers will diverge after this first release.
 
 Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
+## [Unreleased]
+
+## [0.8.0] - 2026-09-26
+
+### Added
+- `one_shot_payments.list(customer_id=, status=)` and `one_shot_payments.iter(...)`, sync and async, for `GET /v1/checkout/one_shot`. The filters are carried onto every page.
+- `payments.retrieve` documents the `refund_eligibility` expansion: whether a refund of the remaining balance would succeed now, with `window_ends_at` and a `reason` when it would not. Retrieve only; `payments.list` refuses it.
+
+### Changed
+- An explicit `None` now clears `products.update(description=)`, `customers.update(name=)`, `webhook_endpoints.update(description=)`, `coupons.update(max_redemptions=, redeem_by=)` and `tax_rates.update(display_name=)`, sent as a JSON null like `default_price_id`. Omitting the keyword still leaves the field alone. Before, `None` on these keywords was dropped, so the clear never reached the API.
+  **Upgrade note:** a `None` you pass through from your own data now clears the field. `customers.update(cid, name=user.name)` with `user.name` sometimes `None` used to leave the name alone and now erases it; omit the keyword instead when you mean "leave it".
+
 ## [0.7.1] - 2026-09-25
 
 ### Added
@@ -290,7 +302,8 @@ First public release.
   API keys, request/response bodies and query strings are never logged, and the
   final failure is raised rather than logged so you never get a duplicate entry.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/billkit-eu/billkit-python/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/billkit-eu/billkit-python/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/billkit-eu/billkit-python/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/billkit-eu/billkit-python/compare/v0.5.0...v0.6.0

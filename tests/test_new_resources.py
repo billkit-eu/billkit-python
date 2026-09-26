@@ -141,7 +141,7 @@ def test_billing_portal_session_create(sync_client: BillKit) -> None:
                 "id": "bps_1",
                 "object": "billing_portal.session",
                 "token": "bk_portal_test_abc",
-                "url": "https://portal.billkit.eu/bk_portal_test_abc",
+                "url": "https://portal.billkit.eu/#session=bk_portal_test_abc",
                 "expires_at": 0,
             },
         )
@@ -1244,7 +1244,7 @@ def test_product_update_default_price_id_set_clear_omit(sync_client: BillKit) ->
     sync_client.products.update("prod_1", default_price_id=None)
     assert last_request_body(route) == {"default_price_id": None}
     # Omitted means "leave the default alone": the key is absent entirely.
-    sync_client.products.update("prod_1", name="Pro", description=None)
+    sync_client.products.update("prod_1", name="Pro")
     assert last_request_body(route) == {"name": "Pro"}
 
 
@@ -1390,3 +1390,122 @@ async def test_api_keys_async(async_client: AsyncBillKit) -> None:
     )
     assert (await async_client.api_keys.create())["id"] == "ak_1"
     assert route.called
+
+
+# ─── Nullable update fields: explicit None clears ─────────────────
+
+#: (resource attribute, path, keyword, a value that sets it).
+_CLEARABLE = [
+    ("products", "/v1/products/x_1", "description", "A plan"),
+    ("customers", "/v1/customers/x_1", "name", "Ada"),
+    ("webhook_endpoints", "/v1/webhook_endpoints/x_1", "description", "prod hook"),
+    ("coupons", "/v1/coupons/x_1", "max_redemptions", 5),
+    ("coupons", "/v1/coupons/x_1", "redeem_by", 1_900_000_000),
+    ("tax_rates", "/v1/tax_rates/x_1", "display_name", "BTW"),
+]
+
+
+@respx.mock
+@pytest.mark.parametrize(("resource", "path", "field", "value"), _CLEARABLE)
+def test_clearable_field_set_clear_omit_sync(
+    sync_client: BillKit, resource: str, path: str, field: str, value: object
+) -> None:
+    route = respx.post(f"https://test.billkit.eu{path}").mock(
+        return_value=httpx.Response(200, json={"id": "x_1"})
+    )
+    update = getattr(sync_client, resource).update
+    update("x_1", **{field: value})
+    assert last_request_body(route) == {field: value}
+    # The clear: None has to reach the wire as a JSON null.
+    update("x_1", **{field: None})
+    assert last_request_body(route) == {field: None}
+    # Omitted means "leave it alone": the key is absent entirely.
+    update("x_1")
+    assert last_request_body(route) == {}
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(("resource", "path", "field", "value"), _CLEARABLE)
+async def test_clearable_field_set_clear_omit_async(
+    async_client: AsyncBillKit, resource: str, path: str, field: str, value: object
+) -> None:
+    route = respx.post(f"https://test.billkit.eu{path}").mock(
+        return_value=httpx.Response(200, json={"id": "x_1"})
+    )
+    update = getattr(async_client, resource).update
+    await update("x_1", **{field: value})
+    assert last_request_body(route) == {field: value}
+    await update("x_1", **{field: None})
+    assert last_request_body(route) == {field: None}
+    await update("x_1")
+    assert last_request_body(route) == {}
+
+
+# ─── Payment refund eligibility ───────────────────────────────────
+
+
+@respx.mock
+def test_payment_retrieve_expand_refund_eligibility(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/payments/pay_1").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "pay_1",
+                "refund_eligibility": {"object": "refund_eligibility", "eligible": True},
+            },
+        )
+    )
+    payment = sync_client.payments.retrieve("pay_1", expand=["refund_eligibility"])
+    assert payment["refund_eligibility"]["eligible"] is True
+    assert route.calls.last.request.url.params["expand"] == "refund_eligibility"
+
+
+# ─── One-shot list ────────────────────────────────────────────────
+
+
+@respx.mock
+def test_one_shot_list_sends_filters(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/checkout/one_shot").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    sync_client.one_shot_payments.list(limit=5, customer_id="cus_1", status="paid")
+    params = route.calls.last.request.url.params
+    assert params["limit"] == "5"
+    assert params["customer_id"] == "cus_1"
+    assert params["status"] == "paid"
+
+
+@respx.mock
+def test_one_shot_iter_carries_filters_onto_every_page(sync_client: BillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/checkout/one_shot").mock(
+        side_effect=[
+            httpx.Response(
+                200, json={"object": "list", "data": [{"id": "osp_2"}], "has_more": True}
+            ),
+            httpx.Response(
+                200, json={"object": "list", "data": [{"id": "osp_1"}], "has_more": False}
+            ),
+        ]
+    )
+    ids = [o["id"] for o in sync_client.one_shot_payments.iter(customer_id="cus_1", status="open")]
+    assert ids == ["osp_2", "osp_1"]
+    second = route.calls[1].request.url.params
+    assert second["starting_after"] == "osp_2"
+    assert second["customer_id"] == "cus_1"
+    assert second["status"] == "open"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_one_shot_list_and_iter_async(async_client: AsyncBillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/checkout/one_shot").mock(
+        return_value=httpx.Response(
+            200, json={"object": "list", "data": [{"id": "osp_1"}], "has_more": False}
+        )
+    )
+    page = await async_client.one_shot_payments.list(customer_id="cus_1")
+    assert page["data"][0]["id"] == "osp_1"
+    ids = [o["id"] async for o in async_client.one_shot_payments.iter(status="paid")]
+    assert ids == ["osp_1"]
+    assert route.calls.last.request.url.params["status"] == "paid"

@@ -153,14 +153,30 @@ class _Unset(Enum):
 
     Only needed where the API distinguishes "leave this alone" from "clear
     it" and spells the second as an explicit JSON ``null``: the tenant
-    billing profile and a product's ``default_price_id``. Everywhere else
-    ``None`` means "omit" and :func:`_drop_none` is enough.
+    billing profile, a product's ``default_price_id`` and ``description``,
+    a customer's ``name``, a webhook endpoint's ``description``, a
+    coupon's ``max_redemptions`` and ``redeem_by``, and a tax rate's
+    ``display_name``. Everywhere else ``None`` means "omit" and
+    :func:`_drop_none` is enough.
     """
 
     TOKEN = 0
 
 
 _UNSET: Final = _Unset.TOKEN
+
+
+def _put_clearable(body: dict[str, Any], **fields: Any) -> dict[str, Any]:
+    """Add each keyword that was passed, ``None`` included, to ``body``.
+
+    ``None`` is sent as a JSON ``null``, which the API reads as "clear";
+    a keyword left at :data:`_UNSET` is not sent, which it reads as
+    "leave alone".
+    """
+    for key, value in fields.items():
+        if not isinstance(value, _Unset):
+            body[key] = value
+    return body
 
 
 def _list_params(*, limit: int | None, starting_after: str | None) -> dict[str, Any]:
@@ -271,19 +287,25 @@ class AsyncCustomers:
         customer_id: str,
         *,
         email: str | None = None,
-        name: str | None = None,
+        name: str | _Unset | None = _UNSET,
         country_code: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Patch a customer. Only the keywords you pass change.
+
+        ``metadata`` replaces the whole map. ``name=None`` passed
+        explicitly **clears** the name (sent as a JSON null); omit it to
+        leave the name alone.
+        """
         body = _drop_none(
             {
                 "email": email,
-                "name": name,
                 "country_code": country_code,
                 "metadata": metadata,
             }
         )
+        _put_clearable(body, name=name)
         return await self._t.request(
             "POST",
             f"/v1/customers/{_p(customer_id)}",
@@ -402,7 +424,7 @@ class AsyncProducts:
         product_id: str,
         *,
         name: str | None = None,
-        description: str | None = None,
+        description: str | _Unset | None = _UNSET,
         marketing_features: list[str] | None = None,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
@@ -423,21 +445,21 @@ class AsyncProducts:
         that price's interval. It must be an active price of this product;
         anything else raises :class:`InvalidRequestError` on
         ``default_price_id``. Unlike the other keywords here, ``None`` is a
-        value: pass ``default_price_id=None`` explicitly to **clear** the
-        default, and omit it to leave the default alone.
+        value for ``default_price_id`` and ``description``: pass
+        ``default_price_id=None`` explicitly to **clear** the default, or
+        ``description=None`` to remove the description, and omit either
+        to leave it alone.
         """
         body = _drop_none(
             {
                 "name": name,
-                "description": description,
                 "marketing_features": marketing_features,
                 "metadata": metadata,
                 "active": active,
                 "allow_promotion_codes": allow_promotion_codes,
             }
         )
-        if not isinstance(default_price_id, _Unset):
-            body["default_price_id"] = default_price_id
+        _put_clearable(body, description=description, default_price_id=default_price_id)
         return await self._t.request(
             "POST",
             f"/v1/products/{_p(product_id)}",
@@ -868,6 +890,38 @@ class AsyncOneShotPayments:
     async def retrieve(self, one_shot_payment_id: str) -> dict[str, Any]:
         return await self._t.request("GET", f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}")
 
+    async def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        customer_id: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """List one-off payments, newest first.
+
+        The counterpart of ``payments.list``, which lists subscription
+        payments only. ``customer_id`` narrows to one customer; ``status``
+        is one of ``open``, ``pending``, ``authorized``, ``paid``,
+        ``failed``, ``expired``, ``canceled`` or ``refunded``, and an
+        unknown value raises :class:`InvalidRequestError`. Failed, expired
+        and still-open charges are listed too, so check ``status`` before
+        treating a row as revenue.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_drop_none({"customer_id": customer_id, "status": status}))
+        return await self._t.request("GET", "/v1/checkout/one_shot", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        customer_id: str | None = None,
+        status: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Walk every page of ``list()``; the filters are carried on each."""
+        return aiterate(self.list, page_size=page_size, customer_id=customer_id, status=status)
+
 
 class AsyncSubscriptions:
     def __init__(self, transport: _AsyncRequester) -> None:
@@ -1292,7 +1346,7 @@ class AsyncWebhookEndpoints:
         *,
         url: str | None = None,
         enabled_events: list[str] | None = None,
-        description: str | None = None,
+        description: str | _Unset | None = _UNSET,
         status: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -1302,15 +1356,18 @@ class AsyncWebhookEndpoints:
         history, and ``status="enabled"`` resumes. Use :meth:`delete` when
         the endpoint should not exist at all: disabling is reversible and
         deleting is not.
+
+        ``description=None`` passed explicitly **clears** the description
+        (sent as a JSON null); omit it to leave the description alone.
         """
         body = _drop_none(
             {
                 "url": url,
                 "enabled_events": enabled_events,
-                "description": description,
                 "status": status,
             }
         )
+        _put_clearable(body, description=description)
         return await self._t.request(
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}",
@@ -1678,8 +1735,8 @@ class AsyncCoupons:
         coupon_id: str,
         *,
         active: bool | None = None,
-        max_redemptions: int | None = None,
-        redeem_by: int | None = None,
+        max_redemptions: int | _Unset | None = _UNSET,
+        redeem_by: int | _Unset | None = _UNSET,
         applies_to_price_ids: list[str] | None = None,
         min_amount_cents: int | None = None,
         idempotency_key: str | None = None,
@@ -1690,16 +1747,19 @@ class AsyncCoupons:
         readable and discounts already applied keep working out, which
         is why there is no delete: a redeemed coupon is part of what a
         customer was charged. ``active=True`` brings the campaign back.
+
+        ``max_redemptions=None`` passed explicitly removes the redemption
+        cap, and ``redeem_by=None`` removes the expiry (each sent as a
+        JSON null); omit either to leave it alone.
         """
         body = _drop_none(
             {
                 "active": active,
-                "max_redemptions": max_redemptions,
-                "redeem_by": redeem_by,
                 "applies_to_price_ids": applies_to_price_ids,
                 "min_amount_cents": min_amount_cents,
             }
         )
+        _put_clearable(body, max_redemptions=max_redemptions, redeem_by=redeem_by)
         return await self._t.request(
             "POST",
             f"/v1/coupons/{_p(coupon_id)}",
@@ -1784,7 +1844,7 @@ class AsyncTaxRates:
         tax_rate_id: str,
         *,
         rate_basis_points: int | None = None,
-        display_name: str | None = None,
+        display_name: str | _Unset | None = _UNSET,
         inclusive: bool | None = None,
         active: bool | None = None,
         idempotency_key: str | None = None,
@@ -1795,15 +1855,18 @@ class AsyncTaxRates:
         stays readable, because an invoice records the percentage it
         charged and you have to be able to point at the rate that
         produced it, which is why there is no delete.
+
+        ``display_name=None`` passed explicitly **clears** the display
+        name (sent as a JSON null); omit it to leave it alone.
         """
         body = _drop_none(
             {
                 "rate_basis_points": rate_basis_points,
-                "display_name": display_name,
                 "inclusive": inclusive,
                 "active": active,
             }
         )
+        _put_clearable(body, display_name=display_name)
         return await self._t.request(
             "POST",
             f"/v1/tax_rates/{_p(tax_rate_id)}",
@@ -2121,7 +2184,18 @@ class AsyncPayments:
     async def retrieve(self, payment_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
         """Fetch one subscription payment.
 
-        Expandable: ``customer``, ``subscription``.
+        Expandable: ``customer``, ``subscription``, ``refund_eligibility``.
+        ``refund_eligibility`` is retrieve-only (:meth:`list` refuses it)
+        and attaches ``{"object": "refund_eligibility", "eligible",
+        "amount_cents", "currency", "days_remaining", "window_ends_at",
+        "reason"}``: whether a refund of the remaining balance would
+        succeed now, applying the refund window and the price's refund
+        policy, which ``amount_refundable_cents`` does not. When it would
+        not, ``reason`` is ``not_paid``, ``unrefundable_type``,
+        ``window_expired``, ``fully_refunded``, ``disputed``,
+        ``operation_pending`` or ``plan_change_pending`` (a plan change is
+        settling: the full balance cannot be refunded yet, a partial refund
+        still can); treat any other value as "not refundable".
         """
         return await self._t.request(
             "GET", f"/v1/payments/{_p(payment_id)}", params=_expand_params(expand)
@@ -2403,19 +2477,25 @@ class Customers:
         customer_id: str,
         *,
         email: str | None = None,
-        name: str | None = None,
+        name: str | _Unset | None = _UNSET,
         country_code: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
+        """Patch a customer. Only the keywords you pass change.
+
+        ``metadata`` replaces the whole map. ``name=None`` passed
+        explicitly **clears** the name (sent as a JSON null); omit it to
+        leave the name alone.
+        """
         body = _drop_none(
             {
                 "email": email,
-                "name": name,
                 "country_code": country_code,
                 "metadata": metadata,
             }
         )
+        _put_clearable(body, name=name)
         return self._t.request(
             "POST",
             f"/v1/customers/{_p(customer_id)}",
@@ -2532,7 +2612,7 @@ class Products:
         product_id: str,
         *,
         name: str | None = None,
-        description: str | None = None,
+        description: str | _Unset | None = _UNSET,
         marketing_features: list[str] | None = None,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
@@ -2553,21 +2633,21 @@ class Products:
         that price's interval. It must be an active price of this product;
         anything else raises :class:`InvalidRequestError` on
         ``default_price_id``. Unlike the other keywords here, ``None`` is a
-        value: pass ``default_price_id=None`` explicitly to **clear** the
-        default, and omit it to leave the default alone.
+        value for ``default_price_id`` and ``description``: pass
+        ``default_price_id=None`` explicitly to **clear** the default, or
+        ``description=None`` to remove the description, and omit either
+        to leave it alone.
         """
         body = _drop_none(
             {
                 "name": name,
-                "description": description,
                 "marketing_features": marketing_features,
                 "metadata": metadata,
                 "active": active,
                 "allow_promotion_codes": allow_promotion_codes,
             }
         )
-        if not isinstance(default_price_id, _Unset):
-            body["default_price_id"] = default_price_id
+        _put_clearable(body, description=description, default_price_id=default_price_id)
         return self._t.request(
             "POST",
             f"/v1/products/{_p(product_id)}",
@@ -2998,6 +3078,38 @@ class OneShotPayments:
     def retrieve(self, one_shot_payment_id: str) -> dict[str, Any]:
         return self._t.request("GET", f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}")
 
+    def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        customer_id: str | None = None,
+        status: str | None = None,
+    ) -> dict[str, Any]:
+        """List one-off payments, newest first.
+
+        The counterpart of ``payments.list``, which lists subscription
+        payments only. ``customer_id`` narrows to one customer; ``status``
+        is one of ``open``, ``pending``, ``authorized``, ``paid``,
+        ``failed``, ``expired``, ``canceled`` or ``refunded``, and an
+        unknown value raises :class:`InvalidRequestError`. Failed, expired
+        and still-open charges are listed too, so check ``status`` before
+        treating a row as revenue.
+        """
+        params = _list_params(limit=limit, starting_after=starting_after)
+        params.update(_drop_none({"customer_id": customer_id, "status": status}))
+        return self._t.request("GET", "/v1/checkout/one_shot", params=params)
+
+    def iter(
+        self,
+        *,
+        page_size: int | None = None,
+        customer_id: str | None = None,
+        status: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Walk every page of ``list()``; the filters are carried on each."""
+        return paginate(self.list, page_size=page_size, customer_id=customer_id, status=status)
+
 
 class Subscriptions:
     def __init__(self, transport: _SyncRequester) -> None:
@@ -3412,7 +3524,7 @@ class WebhookEndpoints:
         *,
         url: str | None = None,
         enabled_events: list[str] | None = None,
-        description: str | None = None,
+        description: str | _Unset | None = _UNSET,
         status: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
@@ -3422,15 +3534,18 @@ class WebhookEndpoints:
         history, and ``status="enabled"`` resumes. Use :meth:`delete` when
         the endpoint should not exist at all: disabling is reversible and
         deleting is not.
+
+        ``description=None`` passed explicitly **clears** the description
+        (sent as a JSON null); omit it to leave the description alone.
         """
         body = _drop_none(
             {
                 "url": url,
                 "enabled_events": enabled_events,
-                "description": description,
                 "status": status,
             }
         )
+        _put_clearable(body, description=description)
         return self._t.request(
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}",
@@ -3796,8 +3911,8 @@ class Coupons:
         coupon_id: str,
         *,
         active: bool | None = None,
-        max_redemptions: int | None = None,
-        redeem_by: int | None = None,
+        max_redemptions: int | _Unset | None = _UNSET,
+        redeem_by: int | _Unset | None = _UNSET,
         applies_to_price_ids: list[str] | None = None,
         min_amount_cents: int | None = None,
         idempotency_key: str | None = None,
@@ -3808,16 +3923,19 @@ class Coupons:
         readable and discounts already applied keep working out, which
         is why there is no delete: a redeemed coupon is part of what a
         customer was charged. ``active=True`` brings the campaign back.
+
+        ``max_redemptions=None`` passed explicitly removes the redemption
+        cap, and ``redeem_by=None`` removes the expiry (each sent as a
+        JSON null); omit either to leave it alone.
         """
         body = _drop_none(
             {
                 "active": active,
-                "max_redemptions": max_redemptions,
-                "redeem_by": redeem_by,
                 "applies_to_price_ids": applies_to_price_ids,
                 "min_amount_cents": min_amount_cents,
             }
         )
+        _put_clearable(body, max_redemptions=max_redemptions, redeem_by=redeem_by)
         return self._t.request(
             "POST",
             f"/v1/coupons/{_p(coupon_id)}",
@@ -3902,7 +4020,7 @@ class TaxRates:
         tax_rate_id: str,
         *,
         rate_basis_points: int | None = None,
-        display_name: str | None = None,
+        display_name: str | _Unset | None = _UNSET,
         inclusive: bool | None = None,
         active: bool | None = None,
         idempotency_key: str | None = None,
@@ -3913,15 +4031,18 @@ class TaxRates:
         stays readable, because an invoice records the percentage it
         charged and you have to be able to point at the rate that
         produced it, which is why there is no delete.
+
+        ``display_name=None`` passed explicitly **clears** the display
+        name (sent as a JSON null); omit it to leave it alone.
         """
         body = _drop_none(
             {
                 "rate_basis_points": rate_basis_points,
-                "display_name": display_name,
                 "inclusive": inclusive,
                 "active": active,
             }
         )
+        _put_clearable(body, display_name=display_name)
         return self._t.request(
             "POST",
             f"/v1/tax_rates/{_p(tax_rate_id)}",
@@ -4237,7 +4358,18 @@ class Payments:
     def retrieve(self, payment_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
         """Fetch one subscription payment.
 
-        Expandable: ``customer``, ``subscription``.
+        Expandable: ``customer``, ``subscription``, ``refund_eligibility``.
+        ``refund_eligibility`` is retrieve-only (:meth:`list` refuses it)
+        and attaches ``{"object": "refund_eligibility", "eligible",
+        "amount_cents", "currency", "days_remaining", "window_ends_at",
+        "reason"}``: whether a refund of the remaining balance would
+        succeed now, applying the refund window and the price's refund
+        policy, which ``amount_refundable_cents`` does not. When it would
+        not, ``reason`` is ``not_paid``, ``unrefundable_type``,
+        ``window_expired``, ``fully_refunded``, ``disputed``,
+        ``operation_pending`` or ``plan_change_pending`` (a plan change is
+        settling: the full balance cannot be refunded yet, a partial refund
+        still can); treat any other value as "not refundable".
         """
         return self._t.request(
             "GET", f"/v1/payments/{_p(payment_id)}", params=_expand_params(expand)

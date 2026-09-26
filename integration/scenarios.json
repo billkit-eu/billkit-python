@@ -1,6 +1,6 @@
 {
   "$comment": "Machine-readable scenario matrix every SDK integration suite must cover. See SCENARIOS.md for the rationale and for how to add one. Each suite asserts it implements every scenario in ITS OWN family, so adding an entry fails the other SDKs in that family until they catch up. Families: 'server' (node/python/php), 'browser' (js/react), 'framework' (laravel).",
-  "version": 7,
+  "version": 8,
   "families": {
     "server": ["node", "python", "php"],
     "browser": ["js", "react"],
@@ -23,6 +23,7 @@
     { "id": "crud.price_tiered", "family": "server", "group": "crud", "summary": "A tiered metered price round-trips billing_scheme, tiers_mode and every tier, with each tier's unit_amount_decimal still a string." },
     { "id": "crud.price_update_fields", "family": "server", "group": "crud", "summary": "POST /v1/prices/{id} accepts every forward-looking PriceUpdate field, not just active: metadata and refund_on_cancel are set WITHOUT sending active, and the price stays on sale." },
     { "id": "crud.coupon_discount_type_literals", "family": "server", "group": "crud", "summary": "discount_type round-trips for both API literals, 'percent' and 'fixed_cents', and the English-sounding 'percentage' is refused with the invalid-request exception." },
+    { "id": "crud.nullable_fields_clear", "family": "server", "group": "crud", "summary": "An explicit JSON null clears product.description, customer.name, webhook_endpoint.description, coupon.max_redemptions, coupon.redeem_by and tax_rate.display_name; an update that omits the field leaves each one alone." },
     { "id": "crud.credit_note_absent_until_refunded", "family": "server", "group": "crud", "summary": "credit_notes lists empty for a fresh tenant and 404s an unknown id — there is no create, because issuance is refund-driven." },
 
     { "id": "filters.subscription_renewal_state", "family": "server", "group": "filters", "summary": "A paused subscription is found by renewal_state=paused while its status stays active; status=paused maps to the invalid-request exception." },
@@ -34,8 +35,9 @@
     { "id": "customers.vat_number_clear", "family": "server", "group": "customers", "summary": "customers.set_vat_number stores a registration, and passing vat_number as an explicit null CLEARS it. The one body where null is a value: stripping it would send an empty body the API reads as 'leave it alone'." },
 
     { "id": "routes.api_keys", "family": "server", "group": "routes", "summary": "api_keys create -> retrieve -> list -> revoke. The secret is returned only on create, every later read carries the prefix alone, and a revoked key is still listed carrying revoked_at." },
+    { "id": "routes.one_shot_list", "family": "server", "group": "routes", "summary": "one_shot_payments.list(customer_id=...) returns that customer's one-off charges newest first, the status filter narrows them, and an unknown status is the invalid-request exception." },
     { "id": "routes.event_types", "family": "server", "group": "routes", "summary": "webhook_endpoints.list_event_types returns the deliverable-event catalogue plus the wildcard, and a type it names is accepted as enabled_events." },
-    { "id": "routes.tenant_billing_profile", "family": "server", "group": "routes", "summary": "tenant billing profile: set country_code + vat_id + city, read it back, then changing or clearing the stored vat_id is refused (400 parameter_invalid on vat_id, reason vat_id_locked) and writes nothing, while omitting vat_id still lets city change." },
+    { "id": "routes.tenant_billing_profile", "family": "server", "group": "routes", "summary": "tenant billing profile, with a LIVE-mode key (a test-mode key may not write this tenant-level setting): set country_code + vat_id + city, read it back, then changing or clearing the stored vat_id is refused (400 parameter_invalid on vat_id, reason vat_id_locked) and writes nothing, while omitting vat_id still lets city change." },
 
     { "id": "pagination.has_more", "family": "server", "group": "pagination", "summary": "limit < N yields has_more and an exactly-limit-long page." },
     { "id": "pagination.auto_iter", "family": "server", "group": "pagination", "summary": "Auto-paging iterator yields every row exactly once." },
@@ -49,6 +51,7 @@
     { "id": "errors.status_drives_class", "family": "server", "group": "errors", "summary": "A 4xx the API serialises with type 'api_error' (an unmatched route, a method the route does not allow) maps on its STATUS, so it is the resource-missing / invalid-request exception and never the server one. The envelope type is still carried on the error verbatim." },
 
     { "id": "money.checkout_to_active", "family": "server", "group": "money", "summary": "Checkout -> settle -> webhook -> subscription active + paid payment." },
+    { "id": "money.payment_refund_eligibility", "family": "server", "group": "money", "summary": "payments.retrieve(expand=[refund_eligibility]) answers eligible with the full amount and a window_ends_at on a fresh paid charge, the remainder after a partial refund, and the relation is refused on payments.list with the invalid-request exception." },
     { "id": "money.partial_refund", "family": "server", "group": "money", "summary": "Partial refund books and leaves the remainder refundable." },
     { "id": "money.over_refund_rejected", "family": "server", "group": "money", "summary": "Refunding beyond the remaining balance is rejected." },
     { "id": "money.dispute_opened", "family": "server", "group": "money", "summary": "Chargeback + webhook opens a listable, retrievable dispute." },
@@ -66,7 +69,7 @@
     { "id": "webhooks.reject_stale", "family": "server", "group": "webhooks", "summary": "A timestamp outside tolerance fails verification." },
 
     { "id": "methods.recurring_vocabulary", "family": "server", "group": "methods", "summary": "Every mandate-MINTING method is accepted on checkout create, and three are refused: directdebit, which a price may offer but which can never be a first payment, plus bancontact and banktransfer, which are not recurring methods at all. Pins the SDK's checkout union to the server's RecurringMethod and to the narrower set the service will actually start a checkout with." },
-    { "id": "methods.one_shot_vocabulary", "family": "server", "group": "methods", "summary": "Every method a one-off charge may use is accepted on one_shot create, including banktransfer, and the retired giropay is refused. Pins the SDK's wider one-shot union to the server's OneShotMethod." },
+    { "id": "methods.one_shot_vocabulary", "family": "server", "group": "methods", "summary": "Every method a one-off charge may use is accepted on one_shot create, including banktransfer, and two are refused: directdebit, which only collects renewals over a mandate another method minted, and the retired giropay. Pins the SDK's wider one-shot union to the server's OneShotMethod." },
     { "id": "methods.banktransfer_settles_in_days", "family": "server", "group": "methods", "summary": "A banktransfer one-shot comes back with an expires_at a fortnight out, not minutes: the payer is handed bank details and pays on their own schedule, so pending is not a failure and not something to poll." },
 
     { "id": "element.mount", "family": "browser", "group": "element", "summary": "The iframe mounts at the configured origin+path and the client_secret is never in the URL." },

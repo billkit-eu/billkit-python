@@ -80,6 +80,7 @@ COVERED: set[str] = {
     "crud.price_update_fields",
     "crud.coupon_discount_type_literals",
     "crud.credit_note_absent_until_refunded",
+    "crud.nullable_fields_clear",
     "filters.subscription_renewal_state",
     "filters.customer_provisional",
     "filters.audit_resource_id",
@@ -87,6 +88,7 @@ COVERED: set[str] = {
     "customers.vat_number_clear",
     "routes.api_keys",
     "routes.event_types",
+    "routes.one_shot_list",
     "routes.tenant_billing_profile",
     "pagination.has_more",
     "pagination.auto_iter",
@@ -98,6 +100,7 @@ COVERED: set[str] = {
     "errors.status_drives_class",
     "money.checkout_to_active",
     "money.partial_refund",
+    "money.payment_refund_eligibility",
     "money.over_refund_rejected",
     "money.dispute_opened",
     "money.credit_note_for_refund",
@@ -292,6 +295,50 @@ def test_crud_product_default_price(client: BillKit) -> None:
     client.products.update(product["id"], default_price_id=second["id"])
     client.prices.update(second["id"], active=False)
     assert client.products.retrieve(product["id"])["default_price_id"] is None
+
+
+def test_crud_nullable_fields_clear() -> None:
+    """[crud.nullable_fields_clear] an explicit None clears six optional fields.
+
+    Each needs the ``_UNSET`` sentinel: this SDK drops ``None`` keywords
+    everywhere else, so without it the clear would never reach the wire.
+    A fresh tenant so the tax rate cannot collide with another scenario's.
+    """
+    c = BillKit(api_key=provision_tenant("nullable-clears").api_key, base_url=BASE_URL)
+
+    product = c.products.create(name=f"Plan {idem_key()}", description="A plan")
+    assert c.products.update(product["id"], name="Renamed")["description"] == "A plan"
+    assert c.products.update(product["id"], description=None)["description"] is None
+
+    customer = c.customers.create(email=f"clear-{idem_key()}@sdk-it.example.com", name="Ada")
+    assert c.customers.update(customer["id"], metadata={"k": "v"})["name"] == "Ada"
+    assert c.customers.update(customer["id"], name=None)["name"] is None
+
+    endpoint = c.webhook_endpoints.create(
+        url="https://merchant.example.com/hooks/clear", enabled_events=["*"], description="hook"
+    )
+    assert c.webhook_endpoints.update(endpoint["id"], status="disabled")["description"] == "hook"
+    assert c.webhook_endpoints.update(endpoint["id"], description=None)["description"] is None
+
+    redeem_by = int(time.time()) + 30 * 86_400
+    coupon = c.coupons.create(
+        code=f"CLR{str(int(time.time()))[-8:]}",
+        discount_type="percent",
+        discount_value=10,
+        duration="once",
+        max_redemptions=5,
+        redeem_by=redeem_by,
+    )
+    kept = c.coupons.update(coupon["id"], min_amount_cents=100)
+    assert kept["max_redemptions"] == 5
+    assert kept["redeem_by"] == redeem_by
+    lifted = c.coupons.update(coupon["id"], max_redemptions=None, redeem_by=None)
+    assert lifted["max_redemptions"] is None
+    assert lifted["redeem_by"] is None
+
+    rate = c.tax_rates.create(country_code="DE", rate_basis_points=1900, display_name="DE VAT")
+    assert c.tax_rates.update(rate["id"], rate_basis_points=1900)["display_name"] == "DE VAT"
+    assert c.tax_rates.update(rate["id"], display_name=None)["display_name"] is None
 
 
 def test_crud_price_update_fields(client: BillKit) -> None:
@@ -663,8 +710,11 @@ def test_routes_event_types(client: BillKit) -> None:
 
 
 def test_routes_tenant_billing_profile() -> None:
-    """[routes.tenant_billing_profile] set, read back, then the VAT id is locked."""
-    c = BillKit(api_key=provision_tenant("billing-profile").api_key, base_url=BASE_URL)
+    """[routes.tenant_billing_profile] set, read back, then the VAT id is locked.
+
+    With a live-mode key: the billing profile is shared by both modes, so a
+    test-mode key may not write it."""
+    c = BillKit(api_key=provision_tenant("billing-profile", mode="live").api_key, base_url=BASE_URL)
 
     stored = c.tenant.set_billing_profile(
         country_code="NL", vat_id="NL123456789B01", city="Amsterdam"
@@ -867,6 +917,31 @@ def test_money_partial_refund(client: BillKit, tenant: ITTenant) -> None:
     after = client.payments.retrieve(payment["id"])
     assert after["amount_refunded_cents"] == 3000
     assert after["amount_refundable_cents"] == 7000
+
+
+def test_money_payment_refund_eligibility(client: BillKit, tenant: ITTenant) -> None:
+    """[money.payment_refund_eligibility] the server says whether a refund would succeed."""
+    price = make_plan(client, amount_cents=10_000)["price"]
+    checkout_to_active(client, tenant, price["id"])
+    sub = find_subscription(client, price["id"])
+    payment = find_payment(client, sub["id"])
+
+    fresh = client.payments.retrieve(payment["id"], expand=["refund_eligibility"])
+    eligibility = fresh["refund_eligibility"]
+    assert eligibility["object"] == "refund_eligibility"
+    assert eligibility["eligible"] is True
+    assert eligibility["amount_cents"] == 10_000
+    assert isinstance(eligibility["window_ends_at"], int)
+    assert eligibility["reason"] is None
+
+    client.refunds.create(payment_id=payment["id"], amount_cents=3000)
+    after = client.payments.retrieve(payment["id"], expand=["refund_eligibility"])
+    assert after["refund_eligibility"]["eligible"] is True
+    assert after["refund_eligibility"]["amount_cents"] == 7000
+
+    # Retrieve-only: it costs a query per payment, so a list refuses it.
+    with pytest.raises(InvalidRequestError):
+        client.payments.list(expand=["refund_eligibility"])
 
 
 def test_money_over_refund_rejected(client: BillKit, tenant: ITTenant) -> None:
@@ -1118,8 +1193,10 @@ RECURRING_METHODS = ("creditcard", "directdebit", "ideal", "eps", "applepay", "p
 #: or PayPal payment before anything can be collected over it.
 MANDATE_CREATING_METHODS = ("creditcard", "ideal", "eps", "applepay", "paypal")
 
-#: Everything a single ``sequenceType=oneoff`` charge may use.
-ONE_SHOT_METHODS = (*RECURRING_METHODS, "bancontact", "banktransfer")
+#: Everything a single ``sequenceType=oneoff`` charge may use. Not
+#: ``directdebit``: SEPA only collects over a mandate another method minted,
+#: so the API refuses it on a one-off (asserted below with ``giropay``).
+ONE_SHOT_METHODS = (*MANDATE_CREATING_METHODS, "bancontact", "banktransfer")
 
 
 def _buyer(c: BillKit) -> dict[str, Any]:
@@ -1195,9 +1272,10 @@ def test_methods_recurring_vocabulary() -> None:
 def test_methods_one_shot_vocabulary() -> None:
     """[methods.one_shot_vocabulary] a one-off charge takes every method.
 
-    ``banktransfer`` included, and the retired ``giropay`` refused: the
-    scheme shut down at the end of 2024, so its refusal is part of the
-    contract rather than an omission.
+    ``banktransfer`` included. Two are refused: ``directdebit``, which only
+    collects renewals over a mandate another method minted, and the retired
+    ``giropay``: the scheme shut down at the end of 2024, so its refusal is
+    part of the contract rather than an omission.
     """
     t = provision_tenant("methods-oneshot")
     c = BillKit(api_key=t.api_key, base_url=BASE_URL)
@@ -1206,8 +1284,43 @@ def test_methods_one_shot_vocabulary() -> None:
         charge = _one_shot(c, method)
         assert charge["id"], f"{method} should take a one-off charge"
 
+    for method in ("directdebit", "giropay"):
+        with pytest.raises(InvalidRequestError):
+            _one_shot(c, method)
+
+
+def test_routes_one_shot_list() -> None:
+    """[routes.one_shot_list] one-off charges are listable by customer and status."""
+    t = provision_tenant("one-shot-list")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+    buyer = _buyer(c)
+
+    def charge() -> dict[str, Any]:
+        return c.one_shot_payments.create(
+            customer_id=buyer["id"],
+            amount_cents=2500,
+            currency="EUR",
+            method="creditcard",
+            success_url="https://merchant.example.com/ok",
+        )
+
+    first, second = charge(), charge()
+    _one_shot(c, "creditcard")  # another customer's, which the filter must drop
+
+    page = c.one_shot_payments.list(customer_id=buyer["id"])
+    assert [o["id"] for o in page["data"]] == [second["id"], first["id"]]
+
+    status = first["status"]
+    narrowed = c.one_shot_payments.list(customer_id=buyer["id"], status=status)
+    assert {o["id"] for o in narrowed["data"]} == {first["id"], second["id"]}
+    other = "paid" if status != "paid" else "failed"
+    assert c.one_shot_payments.list(customer_id=buyer["id"], status=other)["data"] == []
+
+    walked = [o["id"] for o in c.one_shot_payments.iter(page_size=1, customer_id=buyer["id"])]
+    assert walked == [second["id"], first["id"]]
+
     with pytest.raises(InvalidRequestError):
-        _one_shot(c, "giropay")
+        c.one_shot_payments.list(status="not-a-status")
 
 
 def test_methods_banktransfer_settles_in_days() -> None:

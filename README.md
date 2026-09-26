@@ -67,6 +67,11 @@ print(payment["redirect_url"])  # redirect the payer here
 client.refunds.create(one_shot_payment_id=payment["id"])
 # ...or refund part of it. A charge can carry several partials:
 client.refunds.create(one_shot_payment_id=payment["id"], amount_cents=500)
+
+# List one customer's one-off charges, newest first (payments.list only
+# lists subscription payments):
+for charge in client.one_shot_payments.iter(customer_id=customer["id"], status="paid"):
+    print(charge["id"], charge["amount_cents"])
 ```
 
 ## Metered billing
@@ -154,6 +159,17 @@ for sub in client.subscriptions.iter(status="active,past_due", page_size=100):
 ```
 
 `status="paused"` is not an accepted value and raises `InvalidRequestError`.
+
+## Clearing a field
+
+On an update, an explicit `None` clears a field and omitting the keyword leaves the stored value alone. This applies to `products.update` (`description`, `default_price_id`), `customers.update` (`name`), `webhook_endpoints.update` (`description`), `coupons.update` (`max_redemptions` removes the cap, `redeem_by` removes the expiry) and `tax_rates.update` (`display_name`). Every other keyword still treats `None` as "not given".
+
+```python
+client.coupons.update(coupon.id, max_redemptions=None)  # remove the cap
+client.customers.update(customer.id, email="new@example.com")  # name untouched
+```
+
+A `None` passed straight through from your own data therefore clears the field. When a value may be missing and you mean "leave it", omit the keyword.
 
 ## Retiring something, and deleting something
 
