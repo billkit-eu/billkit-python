@@ -89,6 +89,7 @@ COVERED: set[str] = {
     "routes.api_keys",
     "routes.event_types",
     "routes.one_shot_list",
+    "routes.one_shot_embedded",
     "routes.tenant_billing_profile",
     "pagination.has_more",
     "pagination.auto_iter",
@@ -1325,6 +1326,29 @@ def test_routes_one_shot_list() -> None:
 
     with pytest.raises(InvalidRequestError):
         c.one_shot_payments.list(status="not-a-status")
+
+
+def test_routes_one_shot_embedded() -> None:
+    """[routes.one_shot_embedded] an embedded one-shot returns a client_secret, once."""
+    t = provision_tenant("one-shot-embedded")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+    created = c.one_shot_payments.create(
+        customer_id=_buyer(c)["id"],
+        amount_cents=2500,
+        currency="EUR",
+        ui_mode="embedded",
+        success_url="https://merchant.example.com/ok",
+    )
+    assert created["ui_mode"] == "embedded"
+    assert created["redirect_url"] is None
+    assert created["method"] is None
+    secret = created["client_secret"]
+    assert isinstance(secret, str)
+    assert secret.startswith(f"{created['id']}_secret_")
+
+    read = c.one_shot_payments.retrieve(created["id"])
+    assert read["client_secret"] is None
+    assert read["ui_mode"] == "embedded"
 
 
 def test_methods_banktransfer_settles_in_days() -> None:

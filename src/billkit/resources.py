@@ -852,8 +852,9 @@ class AsyncOneShotPayments:
         customer_id: str,
         amount_cents: int,
         currency: str,
-        method: str,
         success_url: str,
+        method: str | None = None,
+        ui_mode: str | None = None,
         cancel_url: str | None = None,
         description: str | None = None,
         refund_window_days: int | None = None,
@@ -863,7 +864,21 @@ class AsyncOneShotPayments:
     ) -> dict[str, Any]:
         """Create a one-off charge.
 
-        ``method`` is required and validated against the tenant's Mollie
+        ``ui_mode`` picks how the payer pays. ``"hosted"`` (the server
+        default when omitted) needs ``method`` and answers with a
+        ``redirect_url`` on Mollie's hosted page. ``"embedded"`` must be
+        sent WITHOUT ``method``: no provider payment is created yet, and
+        the response carries a short-lived ``client_secret`` (and a null
+        ``redirect_url``) for the browser payment element
+        (``mountOneShotPaymentElement`` in ``@billkit-eu/js``), where the
+        payer picks the method. ``method`` stays null until they confirm,
+        and ``expires_at`` is when the secret and the unconfirmed charge
+        lapse. The secret is returned on create only; a retrieve reads it
+        back as null. Events, refunds and the payment id are the same in
+        both modes. The server is the authority on the method and
+        ``ui_mode`` combination and answers 422 for a wrong one.
+
+        In hosted mode ``method`` is required and validated against the tenant's Mollie
         capability allowlist for ``currency`` (one-off-only methods like
         ``bancontact`` / ``banktransfer`` are allowed here even though they
         can't back a subscription; ``banktransfer`` in particular settles
@@ -892,6 +907,7 @@ class AsyncOneShotPayments:
                 "amount_cents": amount_cents,
                 "currency": currency,
                 "method": method,
+                "ui_mode": ui_mode,
                 "success_url": success_url,
                 "cancel_url": cancel_url,
                 "description": description,
@@ -3057,8 +3073,9 @@ class OneShotPayments:
         customer_id: str,
         amount_cents: int,
         currency: str,
-        method: str,
         success_url: str,
+        method: str | None = None,
+        ui_mode: str | None = None,
         cancel_url: str | None = None,
         description: str | None = None,
         refund_window_days: int | None = None,
@@ -3068,7 +3085,21 @@ class OneShotPayments:
     ) -> dict[str, Any]:
         """Create a one-off charge.
 
-        ``method`` is required and validated against the tenant's Mollie
+        ``ui_mode`` picks how the payer pays. ``"hosted"`` (the server
+        default when omitted) needs ``method`` and answers with a
+        ``redirect_url`` on Mollie's hosted page. ``"embedded"`` must be
+        sent WITHOUT ``method``: no provider payment is created yet, and
+        the response carries a short-lived ``client_secret`` (and a null
+        ``redirect_url``) for the browser payment element
+        (``mountOneShotPaymentElement`` in ``@billkit-eu/js``), where the
+        payer picks the method. ``method`` stays null until they confirm,
+        and ``expires_at`` is when the secret and the unconfirmed charge
+        lapse. The secret is returned on create only; a retrieve reads it
+        back as null. Events, refunds and the payment id are the same in
+        both modes. The server is the authority on the method and
+        ``ui_mode`` combination and answers 422 for a wrong one.
+
+        In hosted mode ``method`` is required and validated against the tenant's Mollie
         capability allowlist for ``currency`` (one-off-only methods like
         ``bancontact`` / ``banktransfer`` are allowed here even though they
         can't back a subscription; ``banktransfer`` in particular settles
@@ -3097,6 +3128,7 @@ class OneShotPayments:
                 "amount_cents": amount_cents,
                 "currency": currency,
                 "method": method,
+                "ui_mode": ui_mode,
                 "success_url": success_url,
                 "cancel_url": cancel_url,
                 "description": description,

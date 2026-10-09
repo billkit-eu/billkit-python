@@ -36,6 +36,7 @@
 
     { "id": "routes.api_keys", "family": "server", "group": "routes", "summary": "api_keys create -> retrieve -> list -> revoke. The secret is returned only on create, every later read carries the prefix alone, and a revoked key is still listed carrying revoked_at." },
     { "id": "routes.one_shot_list", "family": "server", "group": "routes", "summary": "one_shot_payments.list(customer_id=...) returns that customer's one-off charges newest first, the status filter narrows them, and an unknown status is the invalid-request exception." },
+    { "id": "routes.one_shot_embedded", "family": "server", "group": "routes", "summary": "one_shot_payments.create(ui_mode=\"embedded\") with no method returns a client_secret that starts with the one-shot id followed by _secret_, a null redirect_url, a null method and ui_mode embedded; a retrieve of the same one-shot carries client_secret null." },
     { "id": "routes.event_types", "family": "server", "group": "routes", "summary": "webhook_endpoints.list_event_types returns the deliverable-event catalogue plus the wildcard, and a type it names is accepted as enabled_events." },
     { "id": "routes.tenant_billing_profile", "family": "server", "group": "routes", "summary": "tenant billing profile, with a LIVE-mode key (a test-mode key may not write this tenant-level setting): set country_code + vat_id + city, read it back, then changing or clearing the stored vat_id is refused (400 parameter_invalid on vat_id, reason vat_id_locked) and writes nothing, while omitting vat_id still lets city change." },
 
@@ -82,6 +83,7 @@
 
     { "id": "laravel.customer", "family": "framework", "group": "laravel", "summary": "Billable::createOrGetBillKitCustomer creates a real customer and persists its id." },
     { "id": "laravel.checkout", "family": "framework", "group": "laravel", "summary": "Billable::checkout returns a real session carrying a Mollie redirect url." },
+    { "id": "laravel.charge_embedded", "family": "framework", "group": "laravel", "summary": "Billable::chargeEmbedded creates a real embedded one-shot for the billable and returns its client_secret, with no redirect url and no method." },
     { "id": "laravel.subscription_sync", "family": "framework", "group": "laravel", "summary": "checkout -> settle -> webhook -> the Subscription model reports active." },
     { "id": "laravel.subscription_actions", "family": "framework", "group": "laravel", "summary": "cancel and reactivate drive real API state and re-sync the model." },
     { "id": "laravel.paused_state", "family": "framework", "group": "laravel", "summary": "pause() lands in renewal_state: Subscription::paused() is true while status stays active and the row stays valid(); resume() clears it." },

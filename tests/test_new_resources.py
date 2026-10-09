@@ -419,6 +419,63 @@ def test_one_shot_create_sync(sync_client: BillKit) -> None:
     assert body["method"] == "ideal"
     assert body["refund_window_days"] == 0
     assert "cancel_url" not in body
+    # Hosted is the server default, so an omitted ui_mode is not sent at all:
+    # a pre-0.9 request body, byte for byte.
+    assert "ui_mode" not in body
+
+
+@respx.mock
+def test_one_shot_create_embedded_sync(sync_client: BillKit) -> None:
+    """Embedded mode sends ``ui_mode`` and no ``method`` (the payer picks it
+    in the element), and hands back the ``client_secret`` untouched."""
+    route = respx.post("https://test.billkit.eu/v1/checkout/one_shot").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "osp_1",
+                "object": "one_shot_payment",
+                "status": "open",
+                "ui_mode": "embedded",
+                "method": None,
+                "redirect_url": None,
+                "client_secret": "osp_1_secret_abc",
+            },
+        )
+    )
+    payment = sync_client.one_shot_payments.create(
+        customer_id="cus_1",
+        amount_cents=2500,
+        currency="EUR",
+        ui_mode="embedded",
+        success_url="https://shop.example.com/thanks",
+    )
+    assert payment["client_secret"] == "osp_1_secret_abc"
+    assert payment["redirect_url"] is None
+    body = last_request_body(route)
+    assert body["ui_mode"] == "embedded"
+    assert "method" not in body
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_one_shot_create_embedded_async(async_client: AsyncBillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/checkout/one_shot").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": "osp_2", "object": "one_shot_payment", "client_secret": "osp_2_secret_x"},
+        )
+    )
+    payment = await async_client.one_shot_payments.create(
+        customer_id="cus_1",
+        amount_cents=1000,
+        currency="EUR",
+        ui_mode="embedded",
+        success_url="https://shop.example.com/thanks",
+    )
+    assert payment["client_secret"] == "osp_2_secret_x"
+    body = last_request_body(route)
+    assert body["ui_mode"] == "embedded"
+    assert "method" not in body
 
 
 @respx.mock

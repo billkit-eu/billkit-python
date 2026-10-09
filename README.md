@@ -74,6 +74,23 @@ for charge in client.one_shot_payments.iter(customer_id=customer["id"], status="
     print(charge["id"], charge["amount_cents"])
 ```
 
+### Embedded one-shot payments
+
+To take the payment inside your own page instead of redirecting to Mollie, create it with `ui_mode="embedded"` and no `method`. The payer picks the method in the BillKit payment element, which you mount in the browser with the returned `client_secret` (`mountOneShotPaymentElement` in `@billkit-eu/js`, or `<OneShotPaymentElement/>` in `@billkit-eu/react`).
+
+```python
+payment = client.one_shot_payments.create(
+    customer_id=customer["id"],
+    amount_cents=2500,
+    currency="EUR",
+    ui_mode="embedded",
+    success_url="https://shop.example.com/thanks",
+)
+client_secret = payment["client_secret"]  # hand this to the browser, nothing else
+```
+
+The secret is short-lived (`expires_at`) and only on the create response; a retrieve returns it as `null`. `redirect_url` is `null` and `method` stays `null` until the payer confirms. Fulfil from the same `one_shot_payment.succeeded` webhook as a hosted one-shot.
+
 ## Metered billing
 
 A metered price charges for what was consumed. You report usage, and at each period close BillKit invoices the period's total and charges the stored mandate.
