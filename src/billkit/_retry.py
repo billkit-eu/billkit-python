@@ -1,6 +1,6 @@
 """Retry policy for transient failures.
 
-Retries 5xx + network errors with jittered exponential backoff.
+Retries 5xx (except 501) + network errors with jittered exponential backoff.
 4xx are caller-fault and never retried, with one deliberate exception:
 ``409 idempotency_in_progress``. See :data:`IN_PROGRESS_CODE`. 429 is
 retried only when the response advertises a ``Retry-After`` short
@@ -36,6 +36,16 @@ class RetryPolicy:
     max_retry_after_seconds: float = 30.0
     jitter: float = 0.25  # ±25% of the computed wait
 
+    def __post_init__(self) -> None:
+        # ``max_attempts`` counts the first try, so 0 would mean "never send
+        # the request" and every call would fail without touching the
+        # network. ``max_attempts=1`` is the spelling for "no retries".
+        if self.max_attempts < 1:
+            raise ValueError(
+                f"RetryPolicy needs max_attempts of at least 1 (got {self.max_attempts}); "
+                "use max_attempts=1 to disable retries."
+            )
+
     def backoff_for(self, attempt: int) -> float:
         """Backoff before attempt ``attempt`` (1-indexed: attempt 2 is
         the first retry). Caller never asks for attempt=1."""
@@ -61,6 +71,10 @@ DEFAULT_RETRY_POLICY = RetryPolicy()
 #: race again or replays the first call's recorded response.
 IN_PROGRESS_CODE = "idempotency_in_progress"
 
+#: ``501 Not Implemented``: a 5xx, so a :class:`~billkit.ServerError`, but
+#: a permanent answer rather than a fault, and never retried.
+NOT_IMPLEMENTED = 501
+
 
 def should_retry(
     status_code: int | None,
@@ -73,8 +87,8 @@ def should_retry(
     """Decide whether the next attempt is allowed.
 
     ``status_code=None`` means a transport-level failure (network error,
-    DNS, TLS, timeout), so always retry within budget. Any 5xx is a
-    server fault, also retry. A 429 is retried only when the server
+    DNS, TLS, timeout), so always retry within budget. Any 5xx but 501
+    is a server fault, also retry. A 429 is retried only when the server
     supplies a short, parseable ``Retry-After`` value; this keeps
     tenant-side workers from sleeping for unbounded periods.
 
@@ -95,4 +109,7 @@ def should_retry(
             retry_after_seconds is not None
             and 0 <= retry_after_seconds <= policy.max_retry_after_seconds
         )
-    return status_code >= 500
+    # 501 Not Implemented is the one 5xx that is not transient: the server
+    # is saying it does not support the request at all, and every retry
+    # would get the same answer after a backoff.
+    return status_code >= 500 and status_code != NOT_IMPLEMENTED

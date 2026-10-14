@@ -1,5 +1,5 @@
-"""Verify retry policy: 5xx + network failures retry, 4xx do not —
-except ``409 idempotency_in_progress`` — and the SDK-generated
+"""Verify retry policy: 5xx (but not 501) and network failures retry, 4xx
+do not (except ``409 idempotency_in_progress``), and the SDK-generated
 Idempotency-Key stays stable across attempts so the server can replay."""
 
 from __future__ import annotations
@@ -11,10 +11,12 @@ import respx
 from billkit import (
     AsyncBillKit,
     AuthenticationError,
+    BillKit,
     ConflictError,
     RateLimitError,
     ServerError,
 )
+from billkit._retry import RetryPolicy
 
 
 @pytest.mark.asyncio
@@ -185,3 +187,128 @@ async def test_409_in_progress_retries_are_bounded(async_client: AsyncBillKit) -
     with pytest.raises(ConflictError):
         await async_client.customers.create(email="a@b.co")
     assert route.call_count == 3  # max_attempts in FAST_RETRY
+
+
+# ── 501 is a permanent answer ─────────────────────────────────────────
+#
+# Not Implemented means the server will never do this, so a retry only adds
+# the backoff before the same error. The PDF routes answer it on a
+# deployment with rendering disabled.
+
+
+def _not_implemented() -> httpx.Response:
+    return httpx.Response(
+        501,
+        json={"error": {"type": "api_error", "code": "rendering_pending", "message": "no"}},
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_501_is_not_retried_async(async_client: AsyncBillKit) -> None:
+    route = respx.get("https://test.billkit.eu/v1/invoices/in_1/pdf").mock(
+        return_value=_not_implemented()
+    )
+    with pytest.raises(ServerError) as exc_info:
+        await async_client.invoices.retrieve_pdf("in_1")
+    assert exc_info.value.status_code == 501
+    assert exc_info.value.code == "rendering_pending"
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_501_is_not_retried_sync(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/customers").mock(return_value=_not_implemented())
+    with pytest.raises(ServerError):
+        sync_client.customers.create(email="a@b.co")
+    assert route.call_count == 1
+
+
+@respx.mock
+def test_other_5xx_beside_501_still_retried_sync(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/customers").mock(
+        side_effect=[
+            httpx.Response(502, text="bad gateway"),
+            httpx.Response(200, json={"id": "cus_1"}),
+        ]
+    )
+    assert sync_client.customers.create(email="a@b.co")["id"] == "cus_1"
+    assert route.call_count == 2
+
+
+# ── Construction guards ────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("attempts", [0, -1])
+def test_retry_policy_refuses_fewer_than_one_attempt(attempts: int) -> None:
+    """``max_attempts`` counts the first try; 0 would never send anything."""
+    with pytest.raises(ValueError, match="max_attempts of at least 1"):
+        RetryPolicy(max_attempts=attempts)
+
+
+def test_retry_policy_of_one_attempt_is_no_retries() -> None:
+    assert RetryPolicy(max_attempts=1).max_attempts == 1
+
+
+@pytest.mark.parametrize("client_class", [BillKit, AsyncBillKit])
+@pytest.mark.parametrize("key", ["", "   "])
+def test_empty_api_key_is_refused_at_construction(
+    client_class: type[BillKit] | type[AsyncBillKit], key: str
+) -> None:
+    with pytest.raises(ValueError, match="API key is empty"):
+        client_class(api_key=key)
+
+
+def test_empty_api_key_does_not_fall_back_to_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``""`` is a mistake, not "use the environment": falling
+    back would hide the unset variable it usually comes from."""
+    monkeypatch.setenv("BILLKIT_API_KEY", "bk_test_env")
+    with pytest.raises(ValueError, match="API key is empty"):
+        BillKit(api_key="")
+
+
+@respx.mock
+def test_none_api_key_still_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BILLKIT_API_KEY", "bk_test_env")
+    route = respx.get("https://test.billkit.eu/v1/customers/cus_1").mock(
+        return_value=httpx.Response(200, json={"id": "cus_1"})
+    )
+    with BillKit(base_url="https://test.billkit.eu") as client:
+        client.customers.retrieve("cus_1")
+    assert route.calls.last.request.headers["authorization"] == "Bearer bk_test_env"
+
+
+# ── Async backoff is event-loop agnostic ───────────────────────────
+
+
+@respx.mock
+def test_async_retry_backoff_runs_under_trio() -> None:
+    """The async backoff sleeps through anyio, so an ``AsyncBillKit`` under
+    trio waits and retries. ``asyncio.sleep`` there raises on the first
+    retry, before the second request is ever sent."""
+    trio = pytest.importorskip("trio")
+    route = respx.post("https://test.billkit.eu/v1/customers").mock(
+        side_effect=[
+            httpx.Response(503, json={"error": {"type": "api_error", "message": "down"}}),
+            httpx.Response(200, json={"id": "cus_1"}),
+        ]
+    )
+    policy = RetryPolicy(
+        max_attempts=2,
+        initial_backoff_seconds=0.01,
+        backoff_multiplier=1.0,
+        max_backoff_seconds=0.01,
+        jitter=0.0,
+    )
+
+    async def main() -> str | None:
+        async with AsyncBillKit(
+            api_key="bk_test_unit", base_url="https://test.billkit.eu", retry_policy=policy
+        ) as client:
+            customer = await client.customers.create(email="a@b.co")
+            return customer.id
+
+    assert trio.run(main) == "cus_1"
+    assert route.call_count == 2

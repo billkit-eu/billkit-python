@@ -1,84 +1,78 @@
-"""Auto-pagination helpers for list endpoints.
+"""Auto-pagination behind every resource's ``iter()``.
 
-The BillKit API returns Stripe-shape envelopes::
+The API's lists are Stripe-shaped::
 
-    { "object": "list", "data": [...], "has_more": bool }
+    {"object": "list", "data": [...], "has_more": bool}
 
-Cursor pagination is forward-only via the last item's ``id`` as
-``starting_after``. The helpers below walk every page until
-``has_more`` is false and yield each row. Callers iterate::
+Cursor pagination is forward-only, via the last item's ``id`` as
+``starting_after``. Each ``iter()`` hands these helpers a ``fetch``
+callable that requests one page from a cursor, with every filter and
+per-request option the caller gave ``iter()`` already bound, so the
+filters reach every page and not just the first::
 
-    for customer in client.customers.iter():
+    for customer in client.customers.iter(provisional=False, expand=["stats"]):
         ...
-
-The sync flavour returns a generator; the async one returns an
-async iterator. Both forward keyword arguments to ``list()`` so
-filters (e.g. ``status``) flow through unchanged.
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from typing import Any
+from typing import TypeVar
+
+from billkit._models import ListObject
+
+_T = TypeVar("_T")
+
+
+def _next_cursor(page: ListObject[_T]) -> str | None:
+    """The cursor for the page after ``page``, or ``None`` to stop.
+
+    Three terminators, in priority order:
+
+    1. ``has_more`` false: the server's authoritative signal, and the
+       common case.
+    2. An empty page that claims ``has_more``. The contract does not allow
+       it, but a server bug or a misbehaving proxy producing it would
+       otherwise loop forever.
+    3. A last item without an ``id``: there is no cursor to advance with.
+    """
+    if not page.has_more or not page.data:
+        return None
+    last = page.data[-1]
+    cursor = getattr(last, "id", None)
+    if cursor is None and isinstance(last, dict):
+        cursor = last.get("id")
+    return cursor if isinstance(cursor, str) and cursor else None
 
 
 def paginate(
-    list_fn: Callable[..., dict[str, Any]],
+    fetch: Callable[[str | None], ListObject[_T]],
     *,
-    page_size: int | None = None,
-    **filters: Any,
-) -> Iterator[dict[str, Any]]:
-    """Walk every page of ``list_fn`` and yield each row.
-
-    ``page_size`` maps to the API's ``limit`` parameter; leaving it
-    ``None`` lets the server pick its default (10 today). Other
-    ``filters`` are passed through to ``list_fn`` on every page.
-    """
-    cursor: str | None = None
+    starting_after: str | None = None,
+) -> Iterator[_T]:
+    """Walk every page ``fetch`` returns, from ``starting_after``, yielding items."""
+    cursor = starting_after
     while True:
-        page = list_fn(limit=page_size, starting_after=cursor, **filters)
-        items = page.get("data") or []
-        yield from items
-        # Three terminators, in priority order:
-        #   1. ``has_more`` is the server's authoritative signal, and the
-        #      common case.
-        #   2. Empty data with ``has_more=True`` shouldn't happen per
-        #      the API contract, but if a future server bug or proxy
-        #      misbehaviour produced it the iterator would loop
-        #      forever. Belt-and-suspenders: bail.
-        #   3. ``id``-less items have no cursor to advance with, so the
-        #      same defensive reasoning applies. ``items[-1].get("id")``
-        #      will only return ``None`` if a row drops its ``id``,
-        #      which the schema doesn't allow today.
-        if not page.get("has_more"):
+        page = fetch(cursor)
+        yield from page.data
+        next_cursor = _next_cursor(page)
+        if next_cursor is None:
             return
-        if not items:
-            return
-        cursor = items[-1].get("id")
-        if cursor is None:
-            return
+        cursor = next_cursor
 
 
 async def aiterate(
-    list_fn: Callable[..., Awaitable[dict[str, Any]]],
+    fetch: Callable[[str | None], Awaitable[ListObject[_T]]],
     *,
-    page_size: int | None = None,
-    **filters: Any,
-) -> AsyncIterator[dict[str, Any]]:
-    """Async sibling of :func:`paginate`.
-
-    Termination logic is identical; see :func:`paginate` for the three
-    bail-out cases."""
-    cursor: str | None = None
+    starting_after: str | None = None,
+) -> AsyncIterator[_T]:
+    """Async sibling of :func:`paginate`, with the same terminators."""
+    cursor = starting_after
     while True:
-        page = await list_fn(limit=page_size, starting_after=cursor, **filters)
-        items = page.get("data") or []
-        for item in items:
+        page = await fetch(cursor)
+        for item in page.data:
             yield item
-        if not page.get("has_more"):
+        next_cursor = _next_cursor(page)
+        if next_cursor is None:
             return
-        if not items:
-            return
-        cursor = items[-1].get("id")
-        if cursor is None:
-            return
+        cursor = next_cursor

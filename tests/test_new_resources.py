@@ -15,7 +15,8 @@ import httpx
 import pytest
 import respx
 
-from billkit import AsyncBillKit, BillKit
+from billkit import AsyncBillKit, BillKit, PriceTierParam
+from billkit.types import DiscountType, PurgedResource
 from tests.conftest import assert_idempotency_header, last_request_body
 
 # ─── Coupons ──────────────────────────────────────────────────────
@@ -29,14 +30,119 @@ def test_coupon_create_and_validate(sync_client: BillKit) -> None:
     validate = respx.post("https://test.billkit.eu/v1/coupons/validate").mock(
         return_value=httpx.Response(200, json={"valid": True, "discount_cents": 200})
     )
-    coupon = sync_client.coupons.create(
-        code="PROMO", discount_type="percent", discount_value=10, duration="once"
-    )
+    coupon = sync_client.coupons.create(code="PROMO", percent_off=10, duration="once")
     preview = sync_client.coupons.validate(code="PROMO", price_id="price_1", amount_cents=999)
     assert coupon["code"] == "PROMO"
+    assert coupon.code == "PROMO"
     assert preview["valid"] is True
-    assert create.called
+    # The discount travels as the 1.0 field; discount_type is left for the
+    # API to infer, and the 0.x discount_value is never sent.
+    assert last_request_body(create) == {"code": "PROMO", "percent_off": 10, "duration": "once"}
     assert validate.called
+
+
+@pytest.mark.parametrize(
+    ("given", "sent"),
+    [(12.5, 12.5), (Decimal("33.33"), 33.33), (Decimal("20"), 20), (100, 100)],
+)
+@respx.mock
+def test_coupon_create_fractional_percent_off(
+    sync_client: BillKit, given: float | Decimal, sent: float
+) -> None:
+    """``percent_off`` takes up to two decimal places, as a JSON number.
+    A ``Decimal`` would not serialise at all, so it is converted, and a
+    whole one stays an integer on the wire."""
+    route = respx.post("https://test.billkit.eu/v1/coupons").mock(
+        return_value=httpx.Response(200, json={"id": "coup_1", "percent_off": 12.5})
+    )
+    coupon = sync_client.coupons.create(code="HALF", percent_off=given)
+    body = last_request_body(route)
+    assert body["percent_off"] == sent
+    assert type(body["percent_off"]) is type(sent)
+    assert coupon.percent_off == 12.5
+
+
+@pytest.mark.parametrize("bad", [True, "10"])
+def test_coupon_create_refuses_non_number_percent_off(sync_client: BillKit, bad: object) -> None:
+    with pytest.raises(TypeError, match="percent_off"):
+        sync_client.coupons.create(code="BAD", percent_off=bad)  # type: ignore[arg-type]
+
+
+@respx.mock
+def test_coupon_create_fixed_amount_and_explicit_type(sync_client: BillKit) -> None:
+    create = respx.post("https://test.billkit.eu/v1/coupons").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "coup_2",
+                "object": "coupon",
+                "discount_type": "fixed_amount",
+                "percent_off": None,
+                "amount_off_cents": 500,
+            },
+        )
+    )
+    coupon = sync_client.coupons.create(
+        code="FIVER", amount_off_cents=500, discount_type="fixed_amount", currency="EUR"
+    )
+    assert last_request_body(create) == {
+        "code": "FIVER",
+        "amount_off_cents": 500,
+        "discount_type": "fixed_amount",
+        "currency": "EUR",
+    }
+    assert coupon.amount_off_cents == 500
+    assert coupon.percent_off is None
+    assert coupon.discount_type == DiscountType.FIXED_AMOUNT
+
+
+@respx.mock
+def test_coupon_create_and_validate_send_currency(sync_client: BillKit) -> None:
+    create = respx.post("https://test.billkit.eu/v1/coupons").mock(
+        return_value=httpx.Response(200, json={"id": "coup_1", "currency": "SEK"})
+    )
+    validate = respx.post("https://test.billkit.eu/v1/coupons/validate").mock(
+        return_value=httpx.Response(
+            200, json={"valid": False, "reason": "coupon_currency_mismatch", "code": "TENOFF"}
+        )
+    )
+    sync_client.coupons.create(
+        code="TENOFF",
+        amount_off_cents=1000,
+        duration="once",
+        min_amount_cents=5000,
+        currency="SEK",
+    )
+    preview = sync_client.coupons.validate(code="TENOFF", amount_cents=6000, currency="EUR")
+    assert last_request_body(create)["currency"] == "SEK"
+    assert last_request_body(validate) == {
+        "code": "TENOFF",
+        "amount_cents": 6000,
+        "currency": "EUR",
+    }
+    assert preview["reason"] == "coupon_currency_mismatch"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_coupon_create_and_validate_send_currency(
+    async_client: AsyncBillKit,
+) -> None:
+    create = respx.post("https://test.billkit.eu/v1/coupons").mock(
+        return_value=httpx.Response(200, json={"id": "coup_1"})
+    )
+    validate = respx.post("https://test.billkit.eu/v1/coupons/validate").mock(
+        return_value=httpx.Response(200, json={"valid": True})
+    )
+    await async_client.coupons.create(
+        code="TENOFF",
+        amount_off_cents=1000,
+        duration="once",
+        currency="SEK",
+    )
+    await async_client.coupons.validate(code="TENOFF", currency="EUR")
+    assert last_request_body(create)["currency"] == "SEK"
+    assert last_request_body(validate) == {"code": "TENOFF", "currency": "EUR"}
 
 
 @respx.mock
@@ -178,7 +284,7 @@ def test_billing_portal_session_revoke(sync_client: BillKit) -> None:
 @respx.mock
 def test_customers_create_does_not_send_vat_number(sync_client: BillKit) -> None:
     """``vat_number`` lives at a separate endpoint; including it in
-    ``POST /v1/customers`` would 422 against the ``extra=forbid``
+    ``POST /v1/customers`` would 400 against the ``extra=forbid``
     schema. Regression guard for the 0.1 → 0.2 contract fix."""
     route = respx.post("https://test.billkit.eu/v1/customers").mock(
         return_value=httpx.Response(
@@ -212,28 +318,69 @@ def test_customers_set_vat_number(sync_client: BillKit) -> None:
 
 
 @respx.mock
-def test_customers_purge_defaults_confirmed_true(sync_client: BillKit) -> None:
-    """SDK defaults ``confirmed=True`` so the caller doesn't accidentally
-    no-op against the server's fat-finger guard."""
+def test_customers_purge_with_confirm_sends_confirmed(sync_client: BillKit) -> None:
     route = respx.post("https://test.billkit.eu/v1/customers/cus_1/purge").mock(
         return_value=httpx.Response(
             200,
-            json={"id": "cus_1", "object": "customer", "purged_at": 0},
+            json={"id": "cus_1", "object": "customer", "deleted": True, "purged": True},
         )
     )
-    sync_client.customers.purge("cus_1")
-    body = last_request_body(route)
-    assert body == {"confirmed": True}
+    purged = sync_client.customers.purge("cus_1", confirmed=True)
+    assert last_request_body(route) == {"confirmed": True}
+    # The answer is the deletion marker plus ``purged``, never the customer:
+    # its erased placeholder email would read as live data.
+    assert isinstance(purged, PurgedResource)
+    assert (purged.id, purged.object, purged.deleted, purged.purged) == (
+        "cus_1",
+        "customer",
+        True,
+        True,
+    )
+
+
+@pytest.mark.parametrize("confirmed", [False, None, 1, "yes"])
+@respx.mock
+def test_customers_purge_refuses_without_confirm_true(
+    sync_client: BillKit, confirmed: object
+) -> None:
+    """Only the literal ``True`` erases data. Anything else, truthy or not,
+    raises before a request leaves the process."""
+    route = respx.post("https://test.billkit.eu/v1/customers/cus_1/purge").mock(
+        return_value=httpx.Response(200, json={"id": "cus_1"})
+    )
+    with pytest.raises(ValueError, match="confirmed=True"):
+        sync_client.customers.purge("cus_1", confirmed=confirmed)  # type: ignore[arg-type]
+    assert not route.called
+
+
+def test_customers_purge_without_confirm_is_a_type_error(sync_client: BillKit) -> None:
+    with pytest.raises(TypeError, match="confirmed"):
+        sync_client.customers.purge("cus_1")  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_async_customers_purge_refuses_without_confirm(async_client: AsyncBillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/customers/cus_1/purge").mock(
+        return_value=httpx.Response(200, json={"id": "cus_1"})
+    )
+    with pytest.raises(ValueError, match="confirmed=True"):
+        await async_client.customers.purge("cus_1", confirmed=False)
+    assert not route.called
+    await async_client.customers.purge("cus_1", confirmed=True)
+    assert last_request_body(route) == {"confirmed": True}
 
 
 # ─── CheckoutSessions: fixed body shape ───────────────────────────
 
 
 @respx.mock
-def test_checkout_session_create_uses_method_and_coupon_code(sync_client: BillKit) -> None:
-    """0.1 sent ``payment_method``/``coupon`` which the API rejects.
-    0.2 sends ``method``/``coupon_code``/``trial_days_override`` matching
-    ``CheckoutSessionCreate``.
+def test_checkout_session_create_uses_payment_method_and_coupon_code(
+    sync_client: BillKit,
+) -> None:
+    """1.0 sends ``payment_method``/``coupon_code``/``trial_days_override``
+    matching ``CheckoutSessionCreate``; the 0.x ``method`` and the 0.1
+    ``coupon`` are refused by the API.
 
     ``metadata`` is a supported field again (the API gained it), but it must
     still be **absent** from the body when the caller didn't pass one:
@@ -244,7 +391,7 @@ def test_checkout_session_create_uses_method_and_coupon_code(sync_client: BillKi
             200,
             json={
                 "id": "cs_1",
-                "object": "checkout_session",
+                "object": "checkout.session",
                 "url": "https://checkout.mollie.com/cs_1",
             },
         )
@@ -254,16 +401,16 @@ def test_checkout_session_create_uses_method_and_coupon_code(sync_client: BillKi
         price_id="price_1",
         success_url="https://app.example.com/ok",
         cancel_url="https://app.example.com/no",
-        method="creditcard",
+        payment_method="creditcard",
         coupon_code="LAUNCH50",
         trial_days_override=7,
     )
     body = last_request_body(route)
-    assert body["method"] == "creditcard"
+    assert body["payment_method"] == "creditcard"
     assert body["coupon_code"] == "LAUNCH50"
     assert body["trial_days_override"] == 7
-    # Regression: the 0.1 names must not slip back in.
-    assert "payment_method" not in body
+    # Regression: the retired names must not slip back in.
+    assert "method" not in body
     assert "coupon" not in body
     assert "metadata" not in body
 
@@ -280,7 +427,7 @@ def test_checkout_session_create_embedded_sends_ui_mode_and_metadata(
             200,
             json={
                 "id": "cs_1",
-                "object": "checkout_session",
+                "object": "checkout.session",
                 "ui_mode": "embedded",
                 "url": None,
                 "client_secret": "cs_1_secret_abc",
@@ -300,8 +447,8 @@ def test_checkout_session_create_embedded_sends_ui_mode_and_metadata(
     assert body["ui_mode"] == "embedded"
     assert body["metadata"] == {"family_id": "fam_42"}
     # Embedded sessions choose the method inside the element, so the SDK
-    # must not smuggle one in; the API 422s the combination.
-    assert "method" not in body
+    # must not smuggle one in; the API 400s the combination.
+    assert "payment_method" not in body
     assert session["client_secret"] == "cs_1_secret_abc"
     assert session["metadata"] == {"family_id": "fam_42"}
 
@@ -314,7 +461,7 @@ async def test_async_checkout_session_create_embedded(async_client: AsyncBillKit
     route = respx.post("https://test.billkit.eu/v1/checkout/sessions").mock(
         return_value=httpx.Response(
             200,
-            json={"id": "cs_1", "object": "checkout_session", "client_secret": "cs_1_secret_abc"},
+            json={"id": "cs_1", "object": "checkout.session", "client_secret": "cs_1_secret_abc"},
         )
     )
     await async_client.checkout_sessions.create(
@@ -339,7 +486,7 @@ def test_checkout_session_create_with_customer_email(sync_client: BillKit) -> No
             200,
             json={
                 "id": "cs_1",
-                "object": "checkout_session",
+                "object": "checkout.session",
                 "customer_id": "cus_freshly_created",
                 "url": "https://checkout.mollie.com/cs_1",
             },
@@ -408,7 +555,7 @@ def test_one_shot_create_sync(sync_client: BillKit) -> None:
         customer_id="cus_1",
         amount_cents=2500,
         currency="EUR",
-        method="ideal",
+        payment_method="ideal",
         success_url="https://shop.example.com/thanks",
         refund_window_days=0,
     )
@@ -416,7 +563,7 @@ def test_one_shot_create_sync(sync_client: BillKit) -> None:
     body = last_request_body(route)
     assert body["customer_id"] == "cus_1"
     assert body["amount_cents"] == 2500
-    assert body["method"] == "ideal"
+    assert body["payment_method"] == "ideal"
     assert body["refund_window_days"] == 0
     assert "cancel_url" not in body
     # Hosted is the server default, so an omitted ui_mode is not sent at all:
@@ -426,7 +573,7 @@ def test_one_shot_create_sync(sync_client: BillKit) -> None:
 
 @respx.mock
 def test_one_shot_create_embedded_sync(sync_client: BillKit) -> None:
-    """Embedded mode sends ``ui_mode`` and no ``method`` (the payer picks it
+    """Embedded mode sends ``ui_mode`` and no ``payment_method`` (the payer picks it
     in the element), and hands back the ``client_secret`` untouched."""
     route = respx.post("https://test.billkit.eu/v1/checkout/one_shot").mock(
         return_value=httpx.Response(
@@ -436,7 +583,7 @@ def test_one_shot_create_embedded_sync(sync_client: BillKit) -> None:
                 "object": "one_shot_payment",
                 "status": "open",
                 "ui_mode": "embedded",
-                "method": None,
+                "payment_method": None,
                 "redirect_url": None,
                 "client_secret": "osp_1_secret_abc",
             },
@@ -453,7 +600,7 @@ def test_one_shot_create_embedded_sync(sync_client: BillKit) -> None:
     assert payment["redirect_url"] is None
     body = last_request_body(route)
     assert body["ui_mode"] == "embedded"
-    assert "method" not in body
+    assert "payment_method" not in body
 
 
 @pytest.mark.asyncio
@@ -475,7 +622,7 @@ async def test_one_shot_create_embedded_async(async_client: AsyncBillKit) -> Non
     assert payment["client_secret"] == "osp_2_secret_x"
     body = last_request_body(route)
     assert body["ui_mode"] == "embedded"
-    assert "method" not in body
+    assert "payment_method" not in body
 
 
 @respx.mock
@@ -500,7 +647,7 @@ async def test_one_shot_create_async(async_client: AsyncBillKit) -> None:
         customer_id="cus_1",
         amount_cents=1000,
         currency="EUR",
-        method="creditcard",
+        payment_method="creditcard",
         success_url="https://shop.example.com/thanks",
     )
     assert payment["status"] == "open"
@@ -651,7 +798,7 @@ def test_usage_record_create_sync(sync_client: BillKit) -> None:
     omitted optionals are dropped, not sent as null."""
     route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
         return_value=httpx.Response(
-            201,
+            200,
             json={
                 "id": "ur_1",
                 "object": "usage_record",
@@ -676,7 +823,7 @@ def test_usage_record_create_sync(sync_client: BillKit) -> None:
 @respx.mock
 def test_usage_record_create_minimal_body_and_idempotency(sync_client: BillKit) -> None:
     route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
-        return_value=httpx.Response(201, json={"id": "ur_1", "object": "usage_record"})
+        return_value=httpx.Response(200, json={"id": "ur_1", "object": "usage_record"})
     )
     sync_client.subscriptions.create_usage_record("sub_1", quantity=1, idempotency_key="usage-1")
     body = last_request_body(route)
@@ -715,7 +862,7 @@ def test_usage_record_iter_sync(sync_client: BillKit) -> None:
 async def test_usage_record_create_async(async_client: AsyncBillKit) -> None:
     respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
         return_value=httpx.Response(
-            201, json={"id": "ur_1", "object": "usage_record", "quantity": 7}
+            200, json={"id": "ur_1", "object": "usage_record", "quantity": 7}
         )
     )
     record = await async_client.subscriptions.create_usage_record("sub_1", quantity=7)
@@ -886,6 +1033,43 @@ def test_subscription_list_sends_customer_and_csv_status(sync_client: BillKit) -
 
 
 @respx.mock
+def test_subscription_list_joins_list_filters(sync_client: BillKit) -> None:
+    """``status`` and ``renewal_state`` are array query parameters
+    (``style=form, explode=false``): a list goes out comma-joined, never as
+    a repeated key or a Python repr."""
+    route = respx.get("https://test.billkit.eu/v1/subscriptions").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    sync_client.subscriptions.list(
+        status=["active", "past_due"], renewal_state=("paused", "canceling")
+    )
+    params = route.calls.last.request.url.params
+    assert params.get_list("status") == ["active,past_due"]
+    assert params.get_list("renewal_state") == ["paused,canceling"]
+    sync_client.subscriptions.list(status=[])
+    assert "status" not in route.calls.last.request.url.params
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dispute_and_event_lists_join_list_filters(async_client: AsyncBillKit) -> None:
+    disputes = respx.get("https://test.billkit.eu/v1/disputes").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    events = respx.get("https://test.billkit.eu/v1/events").mock(
+        return_value=httpx.Response(200, json={"object": "list", "data": [], "has_more": False})
+    )
+    await async_client.disputes.list(status=["open", "won"])
+    assert disputes.calls.last.request.url.params.get_list("status") == ["open,won"]
+    await async_client.events.list(type=["invoice.paid", "invoice.payment_failed"])
+    assert events.calls.last.request.url.params.get_list("type") == [
+        "invoice.paid,invoice.payment_failed"
+    ]
+    await async_client.events.list(type="customer.created")
+    assert events.calls.last.request.url.params["type"] == "customer.created"
+
+
+@respx.mock
 def test_subscription_iter_carries_filter_on_every_page(sync_client: BillKit) -> None:
     route = respx.get("https://test.billkit.eu/v1/subscriptions").mock(
         side_effect=[
@@ -897,7 +1081,7 @@ def test_subscription_iter_carries_filter_on_every_page(sync_client: BillKit) ->
             ),
         ]
     )
-    walked = [s["id"] for s in sync_client.subscriptions.iter(renewal_state="paused", page_size=1)]
+    walked = [s["id"] for s in sync_client.subscriptions.iter(renewal_state="paused", limit=1)]
     assert walked == ["sub_1", "sub_2"]
     assert all(c.request.url.params["renewal_state"] == "paused" for c in route.calls)
     # Page 2 carries the cursor alongside the filter.
@@ -1007,16 +1191,16 @@ def test_price_create_sends_a_tier_table(sync_client: BillKit) -> None:
         billing_scheme="tiered",
         tiers_mode="graduated",
         tiers=[
-            {"up_to": 1000, "unit_amount": 1},
-            {"up_to": "inf", "unit_amount_decimal": Decimal("0.5"), "flat_amount": 500},
+            {"up_to": 1000, "unit_amount_cents": 1},
+            {"up_to": "inf", "unit_amount_decimal": Decimal("0.5"), "flat_amount_cents": 500},
         ],
     )
     body = last_request_body(route)
     assert body["billing_scheme"] == "tiered"
     assert body["tiers_mode"] == "graduated"
     assert body["tiers"] == [
-        {"up_to": 1000, "unit_amount": 1},
-        {"up_to": "inf", "unit_amount_decimal": "0.5", "flat_amount": 500},
+        {"up_to": 1000, "unit_amount_cents": 1},
+        {"up_to": "inf", "unit_amount_decimal": "0.5", "flat_amount_cents": 500},
     ]
 
 
@@ -1027,7 +1211,7 @@ def test_tier_normalisation_does_not_mutate_the_callers_table(sync_client: BillK
     respx.post("https://test.billkit.eu/v1/prices").mock(
         return_value=httpx.Response(200, json={"id": "price_1"})
     )
-    tiers = [{"up_to": "inf", "unit_amount_decimal": Decimal("0.5")}]
+    tiers: list[PriceTierParam] = [{"up_to": "inf", "unit_amount_decimal": Decimal("0.5")}]
     sync_client.prices.create(
         product_id="prod_api",
         currency="EUR",
@@ -1055,7 +1239,7 @@ def test_price_create_refuses_a_float_inside_a_tier(sync_client: BillKit) -> Non
             usage_type="metered",
             billing_scheme="tiered",
             tiers_mode="graduated",
-            tiers=[{"up_to": "inf", "unit_amount_decimal": 0.5}],
+            tiers=[{"up_to": "inf", "unit_amount_decimal": 0.5}],  # type: ignore[typeddict-item]
         )
     assert "tiers[0].unit_amount_decimal" in str(excinfo.value)
     assert not route.called
@@ -1088,7 +1272,7 @@ def test_usage_record_create_carries_identifier(sync_client: BillKit) -> None:
     """
     route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
         return_value=httpx.Response(
-            201, json={"id": "ur_1", "object": "usage_record", "identifier": "job-42"}
+            200, json={"id": "ur_1", "object": "usage_record", "identifier": "job-42"}
         )
     )
     sync_client.subscriptions.create_usage_record("sub_1", quantity=10, identifier="job-42")
@@ -1100,7 +1284,7 @@ def test_usage_record_create_omits_identifier_when_none(sync_client: BillKit) ->
     """Dedupe is opt-in: two identical reports at different times are
     legitimately two records."""
     route = respx.post("https://test.billkit.eu/v1/subscriptions/sub_1/usage_records").mock(
-        return_value=httpx.Response(201, json={"id": "ur_1"})
+        return_value=httpx.Response(200, json={"id": "ur_1"})
     )
     sync_client.subscriptions.create_usage_record("sub_1", quantity=10)
     assert "identifier" not in last_request_body(route)
@@ -1275,7 +1459,7 @@ def test_tenant_billing_profile_round_trip(sync_client: BillKit) -> None:
     write = respx.post("https://test.billkit.eu/v1/tenant/billing_profile").mock(
         return_value=httpx.Response(200, json={"country_code": "NL"})
     )
-    assert sync_client.tenant.billing_profile()["effective_country_code"] == "NL"
+    assert sync_client.tenant.retrieve_billing_profile()["effective_country_code"] == "NL"
     assert read.called
     sync_client.tenant.set_billing_profile(country_code="NL", vat_id=None, city="Amsterdam")
     # An explicit None clears; an omitted keyword is left alone entirely.

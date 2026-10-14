@@ -27,18 +27,31 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from billkit import (
+    EVENT_TYPES,
+    AsyncBillKit,
     AuthenticationError,
     BillKit,
+    BillKitObject,
     ConflictError,
     InvalidRequestError,
-    PermissionError,
-    ResourceMissingError,
+    NotFoundError,
+    PermissionDeniedError,
     ServerError,
     WebhookSignature,
     WebhookVerificationError,
+)
+from billkit.types import (
+    CheckoutSession,
+    Customer,
+    CustomerCreatedEvent,
+    DiscountType,
+    OneShotPayment,
+    Subscription,
+    SubscriptionUpdatedEvent,
 )
 from tests.integration.conftest import (
     BASE_URL,
@@ -72,13 +85,14 @@ COVERED: set[str] = {
     "crud.price_archive",
     "crud.product_default_price",
     "crud.customer",
+    "crud.test_clock",
     "crud.coupon",
     "crud.tax_rate",
     "crud.webhook_endpoint",
     "crud.price_decimal_rate",
     "crud.price_tiered",
     "crud.price_update_fields",
-    "crud.coupon_discount_type_literals",
+    "crud.coupon_percent_off",
     "crud.credit_note_absent_until_refunded",
     "crud.nullable_fields_clear",
     "filters.subscription_renewal_state",
@@ -96,6 +110,7 @@ COVERED: set[str] = {
     "idempotency.replay",
     "idempotency.key_reuse_conflict",
     "idempotency.in_progress_converges",
+    "idempotency.blank_key_generated",
     "errors.not_found",
     "errors.invalid_request",
     "errors.status_drives_class",
@@ -114,9 +129,12 @@ COVERED: set[str] = {
     "webhooks.verify_roundtrip",
     "webhooks.reject_tampered",
     "webhooks.reject_stale",
+    "webhooks.event_type_constants",
     "methods.recurring_vocabulary",
     "methods.one_shot_vocabulary",
     "methods.banktransfer_settles_in_days",
+    "safety.purge_requires_confirmation",
+    "events.previous_attributes_nullable",
 }
 
 
@@ -201,7 +219,7 @@ def test_auth_scoped_key_denied(tenant: ITTenant) -> None:
     secret = mint_scoped_key(tenant, ["products:read"])
     scoped = BillKit(api_key=secret, base_url=BASE_URL)
     assert scoped.products.list()["object"] == "list"
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionDeniedError):
         scoped.customers.list()
 
 
@@ -301,8 +319,9 @@ def test_crud_product_default_price(client: BillKit) -> None:
 def test_crud_nullable_fields_clear() -> None:
     """[crud.nullable_fields_clear] an explicit None clears seven optional fields.
 
-    Each needs the ``_UNSET`` sentinel: this SDK drops ``None`` keywords
-    everywhere else, so without it the clear would never reach the wire.
+    Each is a ``NOT_GIVEN``-defaulted keyword: an explicit ``None`` is sent
+    as a JSON null, which clears, and omitting the keyword leaves the field
+    alone.
     A fresh tenant so the tax rate cannot collide with another scenario's.
     """
     c = BillKit(api_key=provision_tenant("nullable-clears").api_key, base_url=BASE_URL)
@@ -324,8 +343,7 @@ def test_crud_nullable_fields_clear() -> None:
     redeem_by = int(time.time()) + 30 * 86_400
     coupon = c.coupons.create(
         code=f"CLR{str(int(time.time()))[-8:]}",
-        discount_type="percent",
-        discount_value=10,
+        percent_off=10,
         duration="once",
         max_redemptions=5,
         redeem_by=redeem_by,
@@ -371,31 +389,37 @@ def test_crud_price_update_fields(client: BillKit) -> None:
     assert fetched["amount_cents"] == 1500
 
 
-def test_crud_coupon_discount_type_literals(client: BillKit) -> None:
-    """[crud.coupon_discount_type_literals] percent and fixed_cents, nothing else."""
-    percent = client.coupons.create(
-        code=f"PCT{idem_key()[-10:]}",
-        discount_type="percent",
-        discount_value=10,
-        duration="once",
-    )
-    assert percent["discount_type"] == "percent"
+def test_crud_coupon_percent_off(client: BillKit) -> None:
+    """[crud.coupon_percent_off] percent_off in, percent coupon out.
+
+    ``discount_type`` is inferred from which amount was sent, and the other
+    amount reads back as an explicit null. The 0.x ``discount_value`` and
+    ``fixed_cents`` no longer exist anywhere in the SDK.
+    """
+    percent = client.coupons.create(code=f"PCT{idem_key()[-10:]}", percent_off=10)
+    assert percent.percent_off == 10
+    assert percent.discount_type == DiscountType.PERCENT
+    assert percent["amount_off_cents"] is None
+    assert "amount_off_cents" in percent
 
     fixed = client.coupons.create(
-        code=f"FIX{idem_key()[-10:]}",
-        discount_type="fixed_cents",
-        discount_value=500,
-        duration="once",
+        code=f"FIX{idem_key()[-10:]}", amount_off_cents=500, currency="EUR"
     )
-    assert fixed["discount_type"] == "fixed_cents"
+    assert fixed.discount_type == DiscountType.FIXED_AMOUNT
+    assert fixed.amount_off_cents == 500
+    assert fixed.percent_off is None
 
-    # The value these SDKs used to document. It is not a synonym.
+    # A fractional percentage, up to two decimal places, is a number both
+    # ways: on create and on a later retrieve.
+    fractional = client.coupons.create(code=f"FRC{idem_key()[-10:]}", percent_off=12.5)
+    assert fractional.percent_off == 12.5
+    assert isinstance(fractional["percent_off"], float)
+    assert client.coupons.retrieve(fractional.id).percent_off == 12.5
+
+    # Both amounts at once is refused rather than guessed at.
     with pytest.raises(InvalidRequestError):
         client.coupons.create(
-            code=f"BAD{idem_key()[-10:]}",
-            discount_type="percentage",
-            discount_value=10,
-            duration="once",
+            code=f"BAD{idem_key()[-10:]}", percent_off=10, amount_off_cents=500, currency="EUR"
         )
 
 
@@ -408,18 +432,44 @@ def test_crud_customer(client: BillKit) -> None:
 
     deleted = client.customers.delete(created["id"])
     # The customer leaves the API, so the body is a marker, not a row.
-    assert deleted == {"id": created["id"], "object": "customer", "deleted": True}
+    assert deleted.to_dict() == {"id": created["id"], "object": "customer", "deleted": True}
 
     page = client.customers.list(limit=100)
     assert created["id"] not in [c["id"] for c in page["data"]]
 
 
+def test_crud_test_clock(client: BillKit) -> None:
+    """[crud.test_clock] test clock round-trips, carries a customer, and deletes."""
+    start = int(time.time())
+    clock = client.test_clocks.create(frozen_time=start, name="SDK IT")
+    assert clock["object"] == "test_clock"
+    assert clock["frozen_time"] == start
+
+    assert client.test_clocks.retrieve(clock["id"])["id"] == clock["id"]
+    assert clock["id"] in [c["id"] for c in client.test_clocks.list(limit=100)["data"]]
+
+    customer = client.customers.create(
+        email=f"clock-{idem_key()}@sdk-it.example.com", test_clock_id=clock["id"]
+    )
+    assert customer["test_clock_id"] == clock["id"]
+    assert "test_clock" not in customer
+    reread = client.customers.retrieve(customer["id"])
+    assert reread.test_clock_id == clock["id"]
+    assert "test_clock" not in reread
+
+    advanced = client.test_clocks.advance(clock["id"], frozen_time=start + 86_400)
+    assert advanced["frozen_time"] == start + 86_400
+
+    deleted = client.test_clocks.delete(clock["id"])
+    assert deleted.to_dict() == {"id": clock["id"], "object": "test_clock", "deleted": True}
+    with pytest.raises(NotFoundError):
+        client.test_clocks.retrieve(clock["id"])
+
+
 def test_crud_coupon(client: BillKit) -> None:
     """[crud.coupon] coupon creates, validates, updates, withdraws."""
     code = f"SAVE{str(int(time.time()))[-8:]}"
-    created = client.coupons.create(
-        code=code, discount_type="percent", discount_value=25, duration="once"
-    )
+    created = client.coupons.create(code=code, percent_off=25, duration="once")
     assert created["code"] == code
     assert client.coupons.validate(code=code)["valid"] is True
 
@@ -474,8 +524,8 @@ def test_crud_webhook_endpoint(client: BillKit) -> None:
     # Deleting is the other act, and it is a real one: a URL registered by
     # mistake leaves the account rather than sitting there disabled for good.
     gone = client.webhook_endpoints.delete(created["id"])
-    assert gone == {"id": created["id"], "object": "webhook_endpoint", "deleted": True}
-    with pytest.raises(ResourceMissingError):
+    assert gone.to_dict() == {"id": created["id"], "object": "webhook_endpoint", "deleted": True}
+    with pytest.raises(NotFoundError):
         client.webhook_endpoints.retrieve(created["id"])
     after = client.webhook_endpoints.list(limit=100)
     assert created["id"] not in [e["id"] for e in after["data"]]
@@ -535,7 +585,7 @@ def test_crud_credit_note_absent_until_refunded(client: BillKit) -> None:
     """[crud.credit_note_absent_until_refunded] credit notes are issued, never created."""
     page = client.credit_notes.list(limit=10)
     assert page["object"] == "list"
-    with pytest.raises(ResourceMissingError):
+    with pytest.raises(NotFoundError):
         client.credit_notes.retrieve("cn_does_not_exist")
 
 
@@ -556,18 +606,26 @@ def test_filters_subscription_renewal_state() -> None:
     assert paused["renewal_state"] == "paused"
     assert paused["status"] == "active"
 
-    by_renewal_state = c.subscriptions.list(renewal_state="paused")
+    by_renewal_state = c.subscriptions.list(renewal_state=["paused"])
     assert sub["id"] in [s["id"] for s in by_renewal_state["data"]]
 
+    # Both filters take a list, sent comma-joined, and match any value.
+    def listed(**filters: Any) -> bool:
+        return sub["id"] in [s["id"] for s in c.subscriptions.list(**filters)["data"]]
+
+    assert listed(renewal_state=["paused"], status=["active"])
+    assert listed(status=["past_due", "active"], renewal_state=["canceling", "paused"])
+    assert not listed(renewal_state=["auto_renew", "canceling"])
+
     # ...and it is still an `active` subscription to the status filter.
-    by_status = c.subscriptions.list(status="active")
+    by_status = c.subscriptions.list(status=["active"])
     assert sub["id"] in [s["id"] for s in by_status["data"]]
 
     # `status=paused` is not a value the API accepts. It used to be, and
     # returned a confident, wrong, empty page; now it is refused so the
     # mistake is visible.
     with pytest.raises(InvalidRequestError) as excinfo:
-        c.subscriptions.list(status="paused")
+        c.subscriptions.list(status=["paused"])
     assert excinfo.value.param == "status"
 
 
@@ -727,7 +785,7 @@ def test_routes_tenant_billing_profile() -> None:
     assert stored["country_code"] == "NL"
     assert stored["vat_id"] == "NL123456789B01"
 
-    read = c.tenant.billing_profile()
+    read = c.tenant.retrieve_billing_profile()
     assert read["vat_id"] == "NL123456789B01"
     # Stored and effective agree once something is stored; they differ only
     # when nothing ever was.
@@ -741,11 +799,11 @@ def test_routes_tenant_billing_profile() -> None:
         assert excinfo.value.param == "vat_id"
         assert excinfo.value.code == "parameter_invalid"
         assert "cannot be changed once it is set" in excinfo.value.message
-        assert excinfo.value.raw_body is not None
+        assert isinstance(excinfo.value.raw_body, dict)
         assert excinfo.value.raw_body["error"]["reason"] == "vat_id_locked"
 
     # The refused call wrote nothing, including the city it carried.
-    after = c.tenant.billing_profile()
+    after = c.tenant.retrieve_billing_profile()
     assert after["vat_id"] == "NL123456789B01"
     assert after["city"] == "Amsterdam"
 
@@ -777,7 +835,7 @@ def test_pagination_auto_iter() -> None:
     c = BillKit(api_key=t.api_key, base_url=BASE_URL)
     expected = {c.products.create(name=f"Iter {i}")["id"] for i in range(7)}
 
-    seen = [p["id"] for p in c.products.iter(page_size=2)]
+    seen = [p["id"] for p in c.products.iter(limit=2)]
     # Exactly-once is the real assertion: a cursor that mis-orders ties shows
     # up here as a duplicate or a dropped row, not as a crash.
     assert len(seen) == len(expected)
@@ -801,6 +859,20 @@ def test_idempotency_key_reuse_conflict(client: BillKit) -> None:
     client.products.create(name="First Body", idempotency_key=key)
     with pytest.raises(ConflictError):
         client.products.create(name="Different Body", idempotency_key=key)
+
+
+def test_idempotency_blank_key_generated(client: BillKit) -> None:
+    """[idempotency.blank_key_generated] a blank caller key is replaced, not sent.
+
+    A blank key on the wire is a 400 now, and before that it meant "no
+    idempotency" while the SDK still retried the POST. Each call here gets its
+    own generated key, so both succeed as two products.
+    """
+    empty, whitespace = "", "   "
+    first = client.products.create(name="Blank Key", idempotency_key=empty)
+    second = client.products.create(name="Blank Key", idempotency_key=whitespace)
+    assert first["id"]
+    assert second["id"] != first["id"]
 
 
 def test_idempotency_in_progress_converges() -> None:
@@ -842,8 +914,8 @@ def test_idempotency_in_progress_converges() -> None:
 
 
 def test_errors_not_found(client: BillKit) -> None:
-    """[errors.not_found] 404 maps to ResourceMissingError."""
-    with pytest.raises(ResourceMissingError):
+    """[errors.not_found] 404 maps to NotFoundError."""
+    with pytest.raises(NotFoundError):
         client.products.retrieve("prod_does_not_exist")
 
 
@@ -867,27 +939,29 @@ def test_errors_invalid_request(client: BillKit) -> None:
 
 
 def test_errors_status_drives_class(tenant: ITTenant) -> None:
-    """[errors.status_drives_class] a 4xx labelled ``api_error`` still maps on status.
+    """[errors.status_drives_class] the status, not the envelope type, picks the class.
 
-    Not a contrived body: every request that never reaches a route handler
-    is serialised by the API's framework-level handler as
-    ``{"type": "api_error", "code": "unhandled"}`` with the original 4xx
-    status. Mapping on ``type`` made a plain 404 — a typo'd id, an
-    SDK/API version skew — arrive as ``ServerError``, which is the class
-    retry and alerting policies key on.
+    An unmatched route answers 404 with
+    ``{"type": "invalid_request_error", "code": "route_not_found"}``.
+    Mapping on ``type`` would raise ``InvalidRequestError``; mapping on the
+    status raises ``NotFoundError``. Before 1.0 the same miss read
+    ``{"type": "api_error"}``, and mapping on ``type`` made a plain 404
+    arrive as ``ServerError``, the class retry and alerting policies key on.
 
     Driven through the transport rather than a resource because that is
     what a version skew looks like: the SDK asking for a route this API
     does not have.
     """
     c = BillKit(api_key=tenant.api_key, base_url=BASE_URL)
-    with pytest.raises(ResourceMissingError) as excinfo:
-        c._transport.request("GET", "/v1/no_such_resource")
+    with pytest.raises(NotFoundError) as excinfo:
+        c._transport.request("GET", "/v1/no_such_resource", cast_to=BillKitObject)
 
+    assert not isinstance(excinfo.value, InvalidRequestError)
     assert not isinstance(excinfo.value, ServerError)
-    # The envelope value is still carried verbatim; it just does not
+    # The envelope values are still carried verbatim; they just do not
     # choose the class.
-    assert excinfo.value.type == "api_error"
+    assert excinfo.value.type == "invalid_request_error"
+    assert excinfo.value.code == "route_not_found"
     assert excinfo.value.status_code == 404
 
 
@@ -977,7 +1051,14 @@ def test_money_dispute_opened(client: BillKit, tenant: ITTenant) -> None:
     match = [d for d in disputes["data"] if d["amount_cents"] == 7700]
     assert match, "a dispute should exist for the charged-back payment"
     assert match[0]["status"] == "open"
+    # Open means not reversed: the key is there, as an explicit null, under
+    # its 1.0 name.
+    assert "reversed_at" in match[0]
+    assert match[0]["reversed_at"] is None
+    assert "reversed" not in match[0]
     assert client.disputes.retrieve(match[0]["id"])["id"] == match[0]["id"]
+    both = client.disputes.list(status=["open", "won"], limit=100)
+    assert match[0]["id"] in [d["id"] for d in both["data"]]
 
 
 def test_money_credit_note_for_refund(client: BillKit, tenant: ITTenant) -> None:
@@ -1092,12 +1173,13 @@ def test_usage_list_reconciliation(client: BillKit, tenant: ITTenant) -> None:
 
 
 def test_usage_non_metered_rejected(client: BillKit, tenant: ITTenant) -> None:
-    """[usage.non_metered_rejected] posting usage to a licensed subscription is a typed 400."""
+    """[usage.non_metered_rejected] posting usage to a licensed subscription is a 409 state_conflict."""
     price = make_plan(client, amount_cents=2500)["price"]
     sub = active_subscription(client, tenant, price["id"])
 
-    with pytest.raises(InvalidRequestError):
+    with pytest.raises(ConflictError) as excinfo:
         client.subscriptions.create_usage_record(sub["id"], quantity=1)
+    assert excinfo.value.code == "state_conflict"
 
 
 def test_usage_dedupe_identifier(client: BillKit, tenant: ITTenant) -> None:
@@ -1178,6 +1260,13 @@ def test_webhooks_reject_stale() -> None:
         )
 
 
+def test_webhooks_event_type_constants(client: BillKit) -> None:
+    """[webhooks.event_type_constants] the exported constants equal the live catalogue."""
+    catalogue = client.webhook_endpoints.list_event_types()
+    live = {t for t in catalogue["data"] if t != catalogue["wildcard"]}
+    assert live == EVENT_TYPES
+
+
 # ── methods ──────────────────────────────────────────────────────────
 #
 # The two request surfaces take different method sets, and this SDK
@@ -1185,10 +1274,10 @@ def test_webhooks_reject_stale() -> None:
 # live call can tell you whether a promotion reached it.
 
 #: The vocabulary a *price* may offer. Mirrors the server's ``RecurringMethod``,
-#: which is also what this SDK's checkout ``method`` docstring spells out.
+#: which is also what this SDK's checkout ``payment_method`` docstring spells out.
 RECURRING_METHODS = ("creditcard", "directdebit", "ideal", "eps", "applepay", "paypal")
 
-#: The subset that can actually be a checkout's ``method``, i.e. that Mollie
+#: The subset that can actually be a checkout's ``payment_method``, i.e. that Mollie
 #: will mint a mandate from at ``sequenceType=first``.
 #:
 #: ``directdebit`` is the one member of ``RECURRING_METHODS`` missing here, and
@@ -1204,16 +1293,16 @@ MANDATE_CREATING_METHODS = ("creditcard", "ideal", "eps", "applepay", "paypal")
 ONE_SHOT_METHODS = (*MANDATE_CREATING_METHODS, "bancontact", "banktransfer")
 
 
-def _buyer(c: BillKit) -> dict[str, Any]:
+def _buyer(c: BillKit) -> Customer:
     return c.customers.create(email=f"method-{idem_key()}@sdk-it.example.com", country_code="AT")
 
 
-def _one_shot(c: BillKit, method: str) -> dict[str, Any]:
+def _one_shot(c: BillKit, method: str) -> OneShotPayment:
     return c.one_shot_payments.create(
         customer_id=_buyer(c)["id"],
         amount_cents=2500,
         currency="EUR",
-        method=method,
+        payment_method=method,
         success_url="https://merchant.example.com/ok",
     )
 
@@ -1240,14 +1329,14 @@ def test_methods_recurring_vocabulary() -> None:
         payment_methods=list(RECURRING_METHODS),
     )
 
-    def start_checkout(method: str) -> dict[str, Any]:
+    def start_checkout(method: str) -> CheckoutSession:
         # A customer each: an in-flight initial_checkout is guarded per
         # customer, so reusing one would fail the second method for a
         # reason that has nothing to do with its name.
         return c.checkout_sessions.create(
             customer_id=_buyer(c)["id"],
             price_id=price["id"],
-            method=method,
+            payment_method=method,
             success_url="https://merchant.example.com/ok",
             cancel_url="https://merchant.example.com/cancel",
         )
@@ -1288,6 +1377,7 @@ def test_methods_one_shot_vocabulary() -> None:
     for method in ONE_SHOT_METHODS:
         charge = _one_shot(c, method)
         assert charge["id"], f"{method} should take a one-off charge"
+        assert charge.payment_method == method
 
     for method in ("directdebit", "giropay"):
         with pytest.raises(InvalidRequestError):
@@ -1300,12 +1390,12 @@ def test_routes_one_shot_list() -> None:
     c = BillKit(api_key=t.api_key, base_url=BASE_URL)
     buyer = _buyer(c)
 
-    def charge() -> dict[str, Any]:
+    def charge() -> OneShotPayment:
         return c.one_shot_payments.create(
             customer_id=buyer["id"],
             amount_cents=2500,
             currency="EUR",
-            method="creditcard",
+            payment_method="creditcard",
             success_url="https://merchant.example.com/ok",
         )
 
@@ -1321,11 +1411,16 @@ def test_routes_one_shot_list() -> None:
     other = "paid" if status != "paid" else "failed"
     assert c.one_shot_payments.list(customer_id=buyer["id"], status=other)["data"] == []
 
-    walked = [o["id"] for o in c.one_shot_payments.iter(page_size=1, customer_id=buyer["id"])]
+    walked = [o["id"] for o in c.one_shot_payments.iter(limit=1, customer_id=buyer["id"])]
     assert walked == [second["id"], first["id"]]
 
     with pytest.raises(InvalidRequestError):
         c.one_shot_payments.list(status="not-a-status")
+
+    # Refunding a charge nobody paid is a state refusal, not a bad request.
+    with pytest.raises(ConflictError) as excinfo:
+        c.refunds.create(one_shot_payment_id=first["id"])
+    assert excinfo.value.code == "state_conflict"
 
 
 def test_routes_one_shot_embedded() -> None:
@@ -1341,7 +1436,9 @@ def test_routes_one_shot_embedded() -> None:
     )
     assert created["ui_mode"] == "embedded"
     assert created["redirect_url"] is None
-    assert created["method"] is None
+    assert created["payment_method"] is None
+    assert "method" not in created
+    assert created["metadata"] == {}
     secret = created["client_secret"]
     assert isinstance(secret, str)
     assert secret.startswith(f"{created['id']}_secret_")
@@ -1373,6 +1470,128 @@ def test_methods_banktransfer_settles_in_days() -> None:
 
 
 # ── parity gate ──────────────────────────────────────────────────────
+
+
+# ── safety ───────────────────────────────────────────────────────────
+
+
+def test_safety_purge_requires_confirmation() -> None:
+    """[safety.purge_requires_confirmation] no request leaves without confirmed=True.
+
+    The refusal is asserted on the wire, not on the API's answer: a stub
+    transport counts requests, so "fails locally" means nothing was sent.
+    """
+    t = provision_tenant("purge-confirm")
+    sent: list[httpx.Request] = []
+
+    def forward(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        with httpx.Client() as real:
+            return real.send(request)
+
+    with BillKit(
+        api_key=t.api_key,
+        base_url=BASE_URL,
+        httpx_client=httpx.Client(transport=httpx.MockTransport(forward)),
+    ) as c:
+        customer = c.customers.create(
+            email=f"purge-{idem_key()}@sdk-it.example.com", name="Ada Lovelace"
+        )
+        before = len(sent)
+        with pytest.raises(ValueError, match="confirmed=True"):
+            c.customers.purge(customer.id, confirmed=False)
+        with pytest.raises(TypeError):
+            c.customers.purge(customer.id)  # type: ignore[call-arg]
+        assert len(sent) == before
+
+        purged = c.customers.purge(customer.id, confirmed=True)
+        assert len(sent) == before + 1
+        # The marker, not the customer: its placeholder email would read as
+        # live data.
+        assert purged.to_dict() == {
+            "id": customer.id,
+            "object": "customer",
+            "deleted": True,
+            "purged": True,
+        }
+        with pytest.raises(NotFoundError):
+            c.customers.retrieve(customer.id)
+
+
+# ── events ───────────────────────────────────────────────────────────
+
+
+def _event_for(c: BillKit, event_type: str, object_id: str) -> str:
+    for event in c.events.iter(type=event_type, limit=100):
+        if event.data.get("id") == object_id:
+            return event.id
+    raise AssertionError(f"no {event_type} event for {object_id}")
+
+
+def test_events_previous_attributes_nullable() -> None:
+    """[events.previous_attributes_nullable] the key is always there, null or not.
+
+    A creation has no prior state, so it carries an explicit null; the
+    ``subscription.updated`` a pause emits carries what ``renewal_state``
+    was before. Both come back as typed events with typed ``data``.
+    """
+    t = provision_tenant("prev-attrs")
+    c = BillKit(api_key=t.api_key, base_url=BASE_URL)
+
+    customer = c.customers.create(email=f"prev-{idem_key()}@sdk-it.example.com")
+    created = c.events.retrieve(_event_for(c, "customer.created", customer.id))
+    assert isinstance(created, CustomerCreatedEvent)
+    assert "previous_attributes" in created
+    assert created.previous_attributes is None
+    assert created.data.id == customer.id
+
+    price = make_plan(c, amount_cents=1500)["price"]
+    checkout_to_active(c, t, price["id"])
+    sub = find_subscription(c, price["id"])
+    c.subscriptions.pause(sub["id"])
+
+    updated = None
+    for event in c.events.iter(type="subscription.updated", limit=100):
+        if (
+            isinstance(event, SubscriptionUpdatedEvent)
+            and event.data.id == sub["id"]
+            and event.data.renewal_state == "paused"
+        ):
+            updated = c.events.retrieve(event.id)
+            break
+    assert isinstance(updated, SubscriptionUpdatedEvent)
+    assert isinstance(updated.data, Subscription)
+    assert updated.previous_attributes is not None
+    assert updated.previous_attributes["renewal_state"] == "auto_renew"
+
+    # ``type`` takes a list, sent comma-joined, and returns exactly those.
+    wanted = ["customer.created", "subscription.updated"]
+    seen = {event.type for event in c.events.iter(type=wanted, limit=100)}
+    assert seen == set(wanted)
+    page = c.events.list(type=wanted, limit=100)
+    assert {event.type for event in page} == set(wanted)
+
+
+# ── async smoke ──────────────────────────────────────────────────────
+
+
+async def test_async_smoke(tenant: ITTenant) -> None:
+    """The async client drives the same wire contract: create, read back
+    typed, page with ``iter``, and map an error by status. Not a scenario
+    of its own: every scenario above runs the sync client, and this proves
+    the async twin is wired to the same transport."""
+    async with AsyncBillKit(api_key=tenant.api_key, base_url=BASE_URL) as c:
+        product = await c.products.create(name=f"Async {idem_key()}")
+        price = await c.prices.create(
+            product_id=product.id, amount_cents=900, currency="EUR", interval="month"
+        )
+        fetched = await c.prices.retrieve(price.id)
+        assert fetched.amount_cents == 900
+        assert fetched["product_id"] == product.id
+        ids = [p.id async for p in c.prices.iter(product_id=product.id, limit=1)]
+        assert ids == [price.id]
+        with pytest.raises(NotFoundError):
+            await c.customers.retrieve("cus_does_not_exist")
 
 
 def test_zz_manifest_coverage() -> None:

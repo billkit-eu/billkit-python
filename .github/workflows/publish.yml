@@ -4,27 +4,38 @@ name: Publish to PyPI
 # The tag's version must match ``project.version`` in ``pyproject.toml``.
 #
 # The distribution is ``billkit-eu``; the import name is ``billkit``.
+#
+# Two jobs, so the credential exists only where it is used. ``build`` checks
+# the tag, runs the tests and builds the distributions with no write access
+# to anything. ``publish`` only uploads what ``build`` produced, and is the
+# one job holding ``id-token: write``; it runs in the protected ``pypi``
+# environment, so a tag alone cannot publish until a reviewer approves the
+# deployment. Every action is pinned to a commit SHA, with the tag it was
+# resolved from in the comment beside it.
 on:
   push:
     tags:
       - 'v*'
 
+permissions:
+  contents: read
+
 jobs:
-  publish:
-    name: Build + publish
+  build:
+    name: Build
     runs-on: ubuntu-latest
-    permissions:
-      # PyPI trusted publishing (OIDC). Configure the ``billkit-eu`` project
-      # on PyPI to trust this workflow in this repository first.
-      id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install uv
-        uses: astral-sh/setup-uv@v9.0.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
       - name: Verify tag matches pyproject.toml
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PKG_VERSION="$(uv run python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          TAG_VERSION="${REF_NAME#v}"
+          PKG_VERSION="$(uv run --no-project python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
           if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
             echo "::error::Tag ($TAG_VERSION) does not match pyproject.toml ($PKG_VERSION)."
             exit 1
@@ -33,5 +44,30 @@ jobs:
         run: uv run pytest -q
       - name: Build
         run: uv build
+      - name: Upload distributions
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/billkit-eu/
+    permissions:
+      # PyPI trusted publishing (OIDC). Configure the ``billkit-eu`` project
+      # on PyPI to trust this workflow, this repository and the ``pypi``
+      # environment first.
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

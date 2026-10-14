@@ -1,14 +1,14 @@
 """Resource accessors mirroring the BillKit API surface.
 
-Each resource exposes the public verbs from ``/v1/<resource>``. The
-return type is ``dict[str, Any]``; the SDK doesn't ship Pydantic
-models for responses because the API is Stripe-shape and tenants
-typically forward the JSON through to their own data layer
-verbatim. Callers who want strong types can wrap the return value
-in their own Pydantic models or :class:`typing.TypedDict`.
+Each resource exposes the public verbs from ``/v1/<resource>``. Every
+method returns a model from :mod:`billkit.types` (a
+:class:`billkit.BillKitObject`, readable as attributes or as a mapping),
+a :class:`billkit.ListObject` page of them, or ``bytes`` for the PDF
+and export routes. Every method also takes the per-request options
+described in :mod:`billkit._options`.
 
 Every resource appears twice: once as ``Async<Name>`` and once as
-``<Name>``. The two halves are an exact mirror — same methods, same
+``<Name>``. The two halves are an exact mirror: same methods, same
 signatures, same docstrings, same bodies, differing only in
 ``async``/``await``, ``AsyncIterator`` vs ``Iterator``, and ``aiterate``
 vs ``paginate``. A caller who reads one half is reading the other.
@@ -29,43 +29,86 @@ the async side and said one line, or nothing, on the sync side.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from decimal import Decimal
-from enum import Enum
-from typing import Any, Final, Protocol
+from typing import Any, Protocol, TypeVar
 from urllib.parse import quote
 
+import httpx
+
+from billkit._models import ListObject, _BillKitModel
+from billkit._options import NOT_GIVEN, NotGiven, RequestOptions
 from billkit._pagination import aiterate, paginate
+from billkit._params import PriceTierParam
+from billkit.types import (
+    ApiKey,
+    AuditLog,
+    BillingPortalSession,
+    BillingPortalSessionRevocation,
+    CheckoutSession,
+    Coupon,
+    CouponValidation,
+    CreditNote,
+    Customer,
+    DeletedResource,
+    Dispute,
+    Event,
+    EventTypeList,
+    Invoice,
+    InvoiceEmail,
+    OneShotPayment,
+    Payment,
+    PlanChangePreview,
+    Price,
+    Product,
+    ProviderPayload,
+    PurgedResource,
+    Reauthorization,
+    Refund,
+    Subscription,
+    TaxRate,
+    TenantBillingProfile,
+    TenantCapabilities,
+    TenantPortalBranding,
+    TenantProviderCredential,
+    TestClock,
+    UsageRecord,
+    UsageSummary,
+    WebhookDelivery,
+    WebhookEndpoint,
+)
+
+_M = TypeVar("_M", bound=_BillKitModel)
 
 
 class _AsyncRequester(Protocol):
-    async def request_bytes(self, method: str, path: str) -> bytes: ...
+    async def request_bytes(self, method: str, path: str, *, options: RequestOptions) -> bytes: ...
 
     async def request(
         self,
         method: str,
         path: str,
         *,
+        cast_to: type[_M],
         params: dict[str, Any] | None = ...,
         json_body: dict[str, Any] | None = ...,
-        idempotency_key: str | None = ...,
-        extra_headers: dict[str, str] | None = ...,
-    ) -> dict[str, Any]: ...
+        options: RequestOptions,
+    ) -> _M: ...
 
 
 class _SyncRequester(Protocol):
-    def request_bytes(self, method: str, path: str) -> bytes: ...
+    def request_bytes(self, method: str, path: str, *, options: RequestOptions) -> bytes: ...
 
     def request(
         self,
         method: str,
         path: str,
         *,
+        cast_to: type[_M],
         params: dict[str, Any] | None = ...,
         json_body: dict[str, Any] | None = ...,
-        idempotency_key: str | None = ...,
-        extra_headers: dict[str, str] | None = ...,
-    ) -> dict[str, Any]: ...
+        options: RequestOptions,
+    ) -> _M: ...
 
 
 def _drop_none(d: dict[str, Any]) -> dict[str, Any]:
@@ -82,15 +125,74 @@ def _p(value: str) -> str:
     the route the method names, so a bad id is a clean 404 rather than a
     request somewhere else. ``safe=""`` because nothing in an id is a
     path delimiter here.
+
+    An empty or whitespace-only id, or ``.`` / ``..``, is refused with
+    :class:`ValueError` before any request: it would encode to nothing and leave
+    ``/v1/customers/``, a different route rather than a lookup that 404s.
+    Every id-bearing path goes through here, so this one check covers all.
     """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"BillKit: an id is required here, got {value!r}. "
+            "Pass the object's id (for example 'cus_...')."
+        )
+    # ``.`` and ``..`` survive percent-encoding unchanged and are resolved as
+    # dot segments: ``customers.retrieve("..")`` would become ``GET /v1/``.
+    if value in (".", ".."):
+        raise ValueError(
+            f"BillKit: {value!r} is not an id. Pass the object's id (for example 'cus_...')."
+        )
     return quote(value, safe="")
 
 
-def _expand_params(expand: list[str] | None) -> dict[str, Any] | None:
-    """Render ``?expand=a,b``, or nothing at all when none was asked for."""
+def _expand_params(expand: Sequence[str] | None) -> dict[str, Any] | None:
+    """Render ``?expand=a,b``, or nothing at all when none was asked for.
+
+    A bare string is one relation, not a sequence of letters:
+    ``expand="customer"`` means ``expand=["customer"]``.
+    """
     if not expand:
         return None
+    if isinstance(expand, str):
+        return {"expand": expand}
     return {"expand": ",".join(expand)}
+
+
+def _csv(value: str | Sequence[str] | None) -> str | None:
+    """Render a multi-value filter as the comma-joined string the API takes.
+
+    The four list filters that accept several values (``subscriptions``
+    ``status`` / ``renewal_state``, ``disputes`` ``status``, ``events``
+    ``type``) take either a sequence or one string, which is sent as
+    given, so ``"active,past_due"`` and ``["active", "past_due"]`` are the
+    same request. An empty sequence sends no filter at all.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    joined = ",".join(value)
+    return joined or None
+
+
+def _percent(value: int | float | Decimal | None) -> int | float | None:
+    """Render ``percent_off`` as a JSON number.
+
+    The API takes a percentage above 0 and at most 100 with up to two
+    decimal places (``12.5``, ``33.33``) and does the range and precision
+    checks itself. ``Decimal`` is accepted because that is how a caller
+    holding an exact rate keeps it, and is sent as an integer when it is
+    whole and as the nearest float otherwise, which two decimal places
+    always survive. ``bool`` is an ``int`` to Python and refused here,
+    because ``True`` is not a percentage.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        raise TypeError(
+            f"BillKit: percent_off must be an int, float or Decimal, got {type(value).__name__}."
+        )
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
 
 
 def _decimal_field(value: str | int | Decimal, *, field: str) -> str:
@@ -129,7 +231,7 @@ def _decimal_field(value: str | int | Decimal, *, field: str) -> str:
     return value
 
 
-def _normalize_tiers(tiers: list[dict[str, Any]], *, field: str) -> list[dict[str, Any]]:
+def _normalize_tiers(tiers: Sequence[PriceTierParam], *, field: str) -> list[dict[str, Any]]:
     """Copy a tier table, rendering each band's decimal rate as a string.
 
     Copies rather than mutates: the caller's price definition is often a
@@ -138,7 +240,7 @@ def _normalize_tiers(tiers: list[dict[str, Any]], *, field: str) -> list[dict[st
     """
     out: list[dict[str, Any]] = []
     for index, tier in enumerate(tiers):
-        band = dict(tier)
+        band: dict[str, Any] = dict(tier)
         raw = band.get("unit_amount_decimal")
         if raw is not None:
             band["unit_amount_decimal"] = _decimal_field(
@@ -148,8 +250,12 @@ def _normalize_tiers(tiers: list[dict[str, Any]], *, field: str) -> list[dict[st
     return out
 
 
-class _Unset(Enum):
-    """Sentinel for a keyword that was not passed.
+def _put_clearable(body: dict[str, Any], **fields: Any) -> dict[str, Any]:
+    """Add each keyword that was passed, ``None`` included, to ``body``.
+
+    ``None`` is sent as a JSON ``null``, which the API reads as "clear";
+    a keyword left at :data:`billkit.NOT_GIVEN` is not sent, which it reads
+    as "leave alone".
 
     Only needed where the API distinguishes "leave this alone" from "clear
     it" and spells the second as an explicit JSON ``null``: the tenant
@@ -161,22 +267,8 @@ class _Unset(Enum):
     else ``None`` means "omit" and :func:`_drop_none` is enough; the API
     refuses a ``null`` there with a 400.
     """
-
-    TOKEN = 0
-
-
-_UNSET: Final = _Unset.TOKEN
-
-
-def _put_clearable(body: dict[str, Any], **fields: Any) -> dict[str, Any]:
-    """Add each keyword that was passed, ``None`` included, to ``body``.
-
-    ``None`` is sent as a JSON ``null``, which the API reads as "clear";
-    a keyword left at :data:`_UNSET` is not sent, which it reads as
-    "leave alone".
-    """
     for key, value in fields.items():
-        if not isinstance(value, _Unset):
+        if not isinstance(value, NotGiven):
             body[key] = value
     return body
 
@@ -187,7 +279,7 @@ def _list_params(*, limit: int | None, starting_after: str | None) -> dict[str, 
     Deliberately only ``limit`` + ``starting_after``: BillKit's cursor
     pagination is forward-only (``api/billkit/api/pagination.py`` binds
     nothing else). An ``ending_before`` used to be accepted here and sent
-    on the wire, where the server ignored it and returned page 1 — a
+    on the wire, where the server ignored it and returned page 1, a
     backwards page that silently re-served the first one.
     """
     return _drop_none({"limit": limit, "starting_after": starting_after})
@@ -201,8 +293,8 @@ class AsyncCustomers:
 
     Customers are tenant-scoped buyer records. Use them as the anchor
     for checkout sessions, subscriptions, invoices, refunds, and audit
-    history. Methods return the API's raw JSON dictionaries so callers
-    can preserve fields added by newer API versions.
+    history. Methods return :class:`billkit.types.Customer`; fields a
+    newer API adds are still readable on it.
     """
 
     def __init__(self, transport: _AsyncRequester) -> None:
@@ -215,18 +307,42 @@ class AsyncCustomers:
         name: str | None = None,
         country_code: str | None = None,
         metadata: dict[str, str] | None = None,
+        test_clock_id: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Customer:
+        """Create a customer.
+
+        ``test_clock_id`` (test mode only) attaches the customer to a test
+        clock so its subscriptions follow that clock's time; see
+        ``test_clocks``. It is fixed at creation.
+        """
         body = _drop_none(
             {
                 "email": email,
                 "name": name,
                 "country_code": country_code,
                 "metadata": metadata,
+                "test_clock_id": test_clock_id,
             }
         )
         return await self._t.request(
-            "POST", "/v1/customers", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/customers",
+            json_body=body,
+            cast_to=Customer,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def set_vat_number(
@@ -236,7 +352,12 @@ class AsyncCustomers:
         vat_number: str | None,
         country_code: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Customer:
         """Attach, replace, or clear the customer's VAT number.
 
         Triggers server-side VIES validation. The response carries the
@@ -257,43 +378,105 @@ class AsyncCustomers:
             "POST",
             f"/v1/customers/{_p(customer_id)}/vat_number",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Customer,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def purge(
         self,
         customer_id: str,
         *,
-        confirmed: bool = True,
+        confirmed: bool,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        """Hard-purge a customer's PII for GDPR erasure requests.
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> PurgedResource:
+        """Erase a customer's personal data, for a GDPR erasure request. Irreversible.
 
-        Distinct from :meth:`delete` (soft delete): purge nulls email,
-        name, country, VAT, and metadata, sets ``purged_at``, and is
-        irreversible. ``confirmed=False`` no-ops at the API as a
-        fat-finger guard, so the SDK defaults it to ``True``.
+        The email is replaced with an unusable placeholder and the name,
+        metadata and VAT registration are cleared, including from the stored
+        payloads of past events. The customer is marked deleted and
+        :meth:`retrieve` 404s afterwards, so the answer is the deletion
+        marker :meth:`delete` returns plus ``purged``:
+        ``{"id", "object": "customer", "deleted": True, "purged": True}``. Payments, refunds, invoices and
+        credit notes are kept, with the buyer details printed on issued
+        documents, because those must be retained for accounting. Refused
+        with a 400 while the customer has a subscription that can still
+        charge them. A customer already removed with :meth:`delete` can
+        still be purged.
+
+        ``confirmed=True`` is required, and anything else raises
+        :class:`ValueError` here, before a request is made. It is a
+        keyword with no default on purpose: the one call in the SDK that
+        destroys data cannot be reached by a stray positional argument or
+        a default that changed under you. (0.x defaulted the API's
+        ``confirmed`` flag to ``True`` on your behalf.)
         """
+        if confirmed is not True:
+            raise ValueError(
+                "customers.purge erases personal data irreversibly. Pass confirmed=True to proceed."
+            )
         return await self._t.request(
             "POST",
             f"/v1/customers/{_p(customer_id)}/purge",
-            json_body={"confirmed": confirmed},
-            idempotency_key=idempotency_key,
+            json_body={"confirmed": True},
+            cast_to=PurgedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, customer_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/customers/{_p(customer_id)}")
+    async def retrieve(
+        self,
+        customer_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Customer:
+        return await self._t.request(
+            "GET",
+            f"/v1/customers/{_p(customer_id)}",
+            cast_to=Customer,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def update(
         self,
         customer_id: str,
         *,
         email: str | None = None,
-        name: str | _Unset | None = _UNSET,
+        name: str | NotGiven | None = NOT_GIVEN,
         country_code: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Customer:
         """Patch a customer. Only the keywords you pass change.
 
         ``metadata`` replaces the whole map. ``name=None`` passed
@@ -312,23 +495,47 @@ class AsyncCustomers:
             "POST",
             f"/v1/customers/{_p(customer_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Customer,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def delete(
-        self, customer_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        customer_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> DeletedResource:
         """Delete a customer. Returns ``{"id", "object", "deleted": True}``.
 
         The customer leaves the API: :meth:`retrieve` 404s and they drop
         out of :meth:`list`, which is why the response is a marker and
         not the customer. Their payments, invoices and refunds are
-        untouched, and so is their personal data — :meth:`purge` is the
+        untouched, and so is their personal data; :meth:`purge` is the
         GDPR erasure. Refused while they hold a subscription that can
         still charge them.
         """
         return await self._t.request(
-            "DELETE", f"/v1/customers/{_p(customer_id)}", idempotency_key=idempotency_key
+            "DELETE",
+            f"/v1/customers/{_p(customer_id)}",
+            cast_to=DeletedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     async def list(
@@ -337,8 +544,12 @@ class AsyncCustomers:
         limit: int | None = None,
         starting_after: str | None = None,
         provisional: bool | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Customer]:
         """List customers, newest first.
 
         ``provisional`` filters on whether the customer ever completed a
@@ -355,15 +566,49 @@ class AsyncCustomers:
         if provisional is not None:
             params["provisional"] = "true" if provisional else "false"
         params.update(_expand_params(expand) or {})
-        return await self._t.request("GET", "/v1/customers", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/customers",
+            params=params,
+            cast_to=ListObject[Customer],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        provisional: bool | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Customer]:
         """Walk every page of ``list()`` and yield each customer.
 
         Page size defaults to the server's default (10). Pass
-        ``page_size=100`` to reduce round-trips on large tenant data.
+        ``limit=100`` to reduce round-trips on large tenant data.
         """
-        return aiterate(self.list, page_size=page_size)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                provisional=provisional,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncProducts:
@@ -387,14 +632,19 @@ class AsyncProducts:
         metadata: dict[str, str] | None = None,
         allow_promotion_codes: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Product:
         """Create a catalog product and return the product object.
 
         ``allow_promotion_codes`` lets a *buyer* type a coupon code at the
         embedded checkout for this product. Defaults to ``False``. A coupon
         you apply yourself, by passing ``coupon_code`` when you create a
-        Checkout Session, is unaffected — that is you discounting your own
-        sale. Either way the code is redeemed only once the payment
+        Checkout Session, is unaffected, because that is you discounting your
+        own sale. Either way the code is redeemed only once the payment
         settles, so an abandoned checkout never uses one up.
         """
         body = _drop_none(
@@ -407,10 +657,30 @@ class AsyncProducts:
             }
         )
         return await self._t.request(
-            "POST", "/v1/products", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/products",
+            json_body=body,
+            cast_to=Product,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, product_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+    async def retrieve(
+        self,
+        product_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Product:
         """Fetch one product by id.
 
         Expandable: ``prices`` (every price on the product, archived ones
@@ -418,7 +688,16 @@ class AsyncProducts:
         price ``default_price_id`` names).
         """
         return await self._t.request(
-            "GET", f"/v1/products/{_p(product_id)}", params=_expand_params(expand)
+            "GET",
+            f"/v1/products/{_p(product_id)}",
+            params=_expand_params(expand),
+            cast_to=Product,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     async def update(
@@ -426,14 +705,19 @@ class AsyncProducts:
         product_id: str,
         *,
         name: str | None = None,
-        description: str | _Unset | None = _UNSET,
-        marketing_features: list[str] | _Unset | None = _UNSET,
+        description: str | NotGiven | None = NOT_GIVEN,
+        marketing_features: list[str] | NotGiven | None = NOT_GIVEN,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
         allow_promotion_codes: bool | None = None,
-        default_price_id: str | _Unset | None = _UNSET,
+        default_price_id: str | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Product:
         """Patch mutable product fields, or archive the product.
 
         Pass only the fields you want to change. ``active=False``
@@ -472,7 +756,15 @@ class AsyncProducts:
             "POST",
             f"/v1/products/{_p(product_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Product,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def list(
@@ -480,19 +772,55 @@ class AsyncProducts:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Product]:
         """List products in reverse creation order.
 
         Expandable: ``prices``, ``stats``, ``default_price``.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_expand_params(expand) or {})
-        return await self._t.request("GET", "/v1/products", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/products",
+            params=params,
+            cast_to=ListObject[Product],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Product]:
         """Walk every page of ``list()`` and yield each product."""
-        return aiterate(self.list, page_size=page_size)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncPrices:
@@ -511,7 +839,7 @@ class AsyncPrices:
         unit_amount_decimal: str | int | Decimal | None = None,
         billing_scheme: str | None = None,
         tiers_mode: str | None = None,
-        tiers: list[dict[str, Any]] | None = None,
+        tiers: Sequence[PriceTierParam] | None = None,
         metadata: dict[str, str] | None = None,
         trial_days: int | None = None,
         trial_verification_cents: int | None = None,
@@ -522,7 +850,12 @@ class AsyncPrices:
         tax_behavior: str | None = None,
         usage_type: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Price:
         """Create a price for an existing product.
 
         Prices are append-only billing terms. Create a new Price when
@@ -550,7 +883,7 @@ class AsyncPrices:
         last charge, ``"prorated"`` the unused part of the current period.
         Both non-none modes also end access immediately, and both are still
         bounded by the refund window. Metered prices must leave this at
-        ``"none"`` — see below.
+        ``"none"`` (see below).
 
         ``usage_type`` selects the billing model. ``"licensed"`` (the
         default when ``None``) bills ``amount_cents`` per period
@@ -570,7 +903,7 @@ class AsyncPrices:
 
         ``unit_amount_decimal``
             A rate finer than one minor unit, in minor units, to 12 decimal
-            places. ``"0.02"`` is 0.02 cents, i.e. €0.0002 per unit — the
+            places. ``"0.02"`` is 0.02 cents, i.e. €0.0002 per unit: the
             canonical per-API-call price, and not expressible as an integer.
             Pass a ``str``, an ``int`` or a ``Decimal``; a ``float`` raises
             ``TypeError``, because a float cannot hold 0.0002 exactly and
@@ -585,11 +918,12 @@ class AsyncPrices:
             modes is a different bill, so the mode is required rather than
             defaulted. Each band is a dict: ``up_to`` (a positive int, or
             ``"inf"`` on the last band, which is mandatory because a bounded
-            top band cannot price the usage above it), plus ``unit_amount``
-            (whole minor units), ``unit_amount_decimal`` (same float rule as
-            above) and/or ``flat_amount`` charged once for reaching the band.
-            Write a free band as ``unit_amount=0``. A tiered price sends no
-            ``amount_cents``::
+            top band cannot price the usage above it), plus
+            ``unit_amount_cents`` (whole minor units), ``unit_amount_decimal``
+            (same float rule as above) and/or ``flat_amount_cents`` charged
+            once for reaching the band. Write a free band as
+            ``unit_amount_cents=0``. :class:`billkit.PriceTierParam` types a
+            band. A tiered price sends no ``amount_cents``::
 
                 await client.prices.create(
                     product_id="prod_api",
@@ -599,7 +933,7 @@ class AsyncPrices:
                     billing_scheme="tiered",
                     tiers_mode="graduated",
                     tiers=[
-                        {"up_to": 1000, "unit_amount": 1},
+                        {"up_to": 1000, "unit_amount_cents": 1},
                         {"up_to": "inf", "unit_amount_decimal": "0.5"},
                     ],
                 )
@@ -634,11 +968,40 @@ class AsyncPrices:
             }
         )
         return await self._t.request(
-            "POST", "/v1/prices", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/prices",
+            json_body=body,
+            cast_to=Price,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, price_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/prices/{_p(price_id)}")
+    async def retrieve(
+        self,
+        price_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Price:
+        return await self._t.request(
+            "GET",
+            f"/v1/prices/{_p(price_id)}",
+            cast_to=Price,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def update(
         self,
@@ -649,10 +1012,15 @@ class AsyncPrices:
         tax_behavior: str | None = None,
         payment_methods: list[str] | None = None,
         refund_on_cancel: str | None = None,
-        refund_window_initial_days: int | _Unset | None = _UNSET,
-        refund_window_renewal_days: int | _Unset | None = _UNSET,
+        refund_window_initial_days: int | NotGiven | None = NOT_GIVEN,
+        refund_window_renewal_days: int | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Price:
         """Change what a price does next. Omitted fields are left alone.
 
         The dividing line is what a field decides. ``amount_cents``,
@@ -705,7 +1073,15 @@ class AsyncPrices:
             "POST",
             f"/v1/prices/{_p(price_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Price,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def list(
@@ -714,7 +1090,11 @@ class AsyncPrices:
         product_id: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Price]:
         """List prices, optionally narrowed to one product.
 
         ``product_id`` is applied server-side (``GET
@@ -724,17 +1104,43 @@ class AsyncPrices:
         params = _list_params(limit=limit, starting_after=starting_after)
         if product_id is not None:
             params["product_id"] = product_id
-        return await self._t.request("GET", "/v1/prices", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/prices",
+            params=params,
+            cast_to=ListObject[Price],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
-        self, *, product_id: str | None = None, page_size: int | None = None
-    ) -> AsyncIterator[dict[str, Any]]:
+        self,
+        *,
+        product_id: str | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Price]:
         """Walk every page of ``list()`` and yield each price."""
-
-        async def _bound(**kwargs: Any) -> dict[str, Any]:
-            return await self.list(product_id=product_id, **kwargs)
-
-        return aiterate(_bound, page_size=page_size)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                product_id=product_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncCheckoutSessions:
@@ -750,14 +1156,19 @@ class AsyncCheckoutSessions:
         price_id: str,
         success_url: str,
         cancel_url: str,
-        method: str | None = None,
+        payment_method: str | None = None,
         country: str | None = None,
         coupon_code: str | None = None,
         trial_days_override: int | None = None,
         ui_mode: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> CheckoutSession:
         """Create a hosted checkout session.
 
         Pass **exactly one of** ``customer_id`` (existing Customer) or
@@ -774,7 +1185,7 @@ class AsyncCheckoutSessions:
         after the charge exists. It never overwrites a country the
         customer already has.
 
-        ``method`` pins the Mollie payment method (``"creditcard"``,
+        ``payment_method`` pins the Mollie payment method (``"creditcard"``,
         ``"directdebit"``, ``"ideal"``, ``"eps"``, ``"applepay"`` or
         ``"paypal"``); ``None`` lets Mollie pick. ``coupon_code`` is
         atomically claimed at session creation. ``trial_days_override``
@@ -801,7 +1212,7 @@ class AsyncCheckoutSessions:
           a short-lived ``client_secret`` (``url`` stays ``None``) for
           ``<CheckoutElement/>`` from ``@billkit-eu/js`` / ``@billkit-eu/react``
           to mount against, so the card form renders in your own page.
-          ``method`` must be omitted; it is chosen inside the element.
+          ``payment_method`` must be omitted; it is chosen inside the element.
 
         Either way tenant branding kicks in once the buyer reaches the
         post-purchase portal via ``billing_portal_sessions.create``.
@@ -814,7 +1225,7 @@ class AsyncCheckoutSessions:
                 "price_id": price_id,
                 "success_url": success_url,
                 "cancel_url": cancel_url,
-                "method": method,
+                "payment_method": payment_method,
                 "country": country,
                 "coupon_code": coupon_code,
                 "trial_days_override": trial_days_override,
@@ -826,11 +1237,37 @@ class AsyncCheckoutSessions:
             "POST",
             "/v1/checkout/sessions",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=CheckoutSession,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, session_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/checkout/sessions/{_p(session_id)}")
+    async def retrieve(
+        self,
+        session_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> CheckoutSession:
+        return await self._t.request(
+            "GET",
+            f"/v1/checkout/sessions/{_p(session_id)}",
+            cast_to=CheckoutSession,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
 
 class AsyncOneShotPayments:
@@ -853,7 +1290,7 @@ class AsyncOneShotPayments:
         amount_cents: int,
         currency: str,
         success_url: str,
-        method: str | None = None,
+        payment_method: str | None = None,
         ui_mode: str | None = None,
         cancel_url: str | None = None,
         description: str | None = None,
@@ -861,24 +1298,29 @@ class AsyncOneShotPayments:
         tax_behavior: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> OneShotPayment:
         """Create a one-off charge.
 
         ``ui_mode`` picks how the payer pays. ``"hosted"`` (the server
-        default when omitted) needs ``method`` and answers with a
+        default when omitted) needs ``payment_method`` and answers with a
         ``redirect_url`` on Mollie's hosted page. ``"embedded"`` must be
-        sent WITHOUT ``method``: no provider payment is created yet, and
+        sent WITHOUT ``payment_method``: no provider payment is created yet, and
         the response carries a short-lived ``client_secret`` (and a null
         ``redirect_url``) for the browser payment element
         (``mountOneShotPaymentElement`` in ``@billkit-eu/js``), where the
-        payer picks the method. ``method`` stays null until they confirm,
+        payer picks the method. ``payment_method`` stays null until they confirm,
         and ``expires_at`` is when the secret and the unconfirmed charge
         lapse. The secret is returned on create only; a retrieve reads it
         back as null. Events, refunds and the payment id are the same in
         both modes. The server is the authority on the method and
-        ``ui_mode`` combination and answers 422 for a wrong one.
+        ``ui_mode`` combination and answers 400 for a wrong one.
 
-        In hosted mode ``method`` is required and validated against the tenant's Mollie
+        In hosted mode ``payment_method`` is required and validated against the tenant's Mollie
         capability allowlist for ``currency`` (one-off-only methods like
         ``bancontact`` / ``banktransfer`` are allowed here even though they
         can't back a subscription; ``banktransfer`` in particular settles
@@ -906,7 +1348,7 @@ class AsyncOneShotPayments:
                 "customer_id": customer_id,
                 "amount_cents": amount_cents,
                 "currency": currency,
-                "method": method,
+                "payment_method": payment_method,
                 "ui_mode": ui_mode,
                 "success_url": success_url,
                 "cancel_url": cancel_url,
@@ -917,11 +1359,40 @@ class AsyncOneShotPayments:
             }
         )
         return await self._t.request(
-            "POST", "/v1/checkout/one_shot", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/checkout/one_shot",
+            json_body=body,
+            cast_to=OneShotPayment,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, one_shot_payment_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}")
+    async def retrieve(
+        self,
+        one_shot_payment_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> OneShotPayment:
+        return await self._t.request(
+            "GET",
+            f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}",
+            cast_to=OneShotPayment,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def list(
         self,
@@ -930,7 +1401,11 @@ class AsyncOneShotPayments:
         starting_after: str | None = None,
         customer_id: str | None = None,
         status: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[OneShotPayment]:
         """List one-off payments, newest first.
 
         The counterpart of ``payments.list``, which lists subscription
@@ -943,17 +1418,45 @@ class AsyncOneShotPayments:
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_drop_none({"customer_id": customer_id, "status": status}))
-        return await self._t.request("GET", "/v1/checkout/one_shot", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/checkout/one_shot",
+            params=params,
+            cast_to=ListObject[OneShotPayment],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         customer_id: str | None = None,
         status: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[OneShotPayment]:
         """Walk every page of ``list()``; the filters are carried on each."""
-        return aiterate(self.list, page_size=page_size, customer_id=customer_id, status=status)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                customer_id=customer_id,
+                status=status,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncSubscriptions:
@@ -961,8 +1464,15 @@ class AsyncSubscriptions:
         self._t = transport
 
     async def retrieve(
-        self, subscription_id: str, *, expand: list[str] | None = None
-    ) -> dict[str, Any]:
+        self,
+        subscription_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         """Fetch one subscription.
 
         Expandable: ``customer``, ``price``, ``refund_eligibility``.
@@ -971,22 +1481,34 @@ class AsyncSubscriptions:
             "GET",
             f"/v1/subscriptions/{_p(subscription_id)}",
             params=_expand_params(expand),
+            cast_to=Subscription,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     async def list(
         self,
         *,
         customer_id: str | None = None,
-        status: str | None = None,
-        renewal_state: str | None = None,
+        status: str | Sequence[str] | None = None,
+        renewal_state: str | Sequence[str] | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Subscription]:
         """List subscriptions, newest first, optionally filtered.
 
-        ``status`` and ``renewal_state`` each take a comma-separated
-        list (``status="active,past_due"``). An unrecognised value is a
+        ``status`` and ``renewal_state`` each take a list
+        (``status=["active", "past_due"]``), sent comma-joined; one
+        string, commas included, is sent as given. An unrecognised value is a
         400 naming the ones that work, rather than being ignored.
 
         The two answer different questions, and confusing them is the
@@ -1007,69 +1529,154 @@ class AsyncSubscriptions:
             _drop_none(
                 {
                     "customer_id": customer_id,
-                    "status": status,
-                    "renewal_state": renewal_state,
+                    "status": _csv(status),
+                    "renewal_state": _csv(renewal_state),
                 }
             )
         )
         params.update(_expand_params(expand) or {})
-        return await self._t.request("GET", "/v1/subscriptions", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/subscriptions",
+            params=params,
+            cast_to=ListObject[Subscription],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
         customer_id: str | None = None,
-        status: str | None = None,
-        renewal_state: str | None = None,
-        page_size: int | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+        status: str | Sequence[str] | None = None,
+        renewal_state: str | Sequence[str] | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Subscription]:
         """Walk every page of ``list()`` and yield each subscription.
 
         The filters are carried onto every page request, so a filtered
         walk narrows server-side instead of paging the whole history and
         discarding rows locally.
         """
-
-        async def _bound(**kwargs: Any) -> dict[str, Any]:
-            return await self.list(
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
                 customer_id=customer_id,
                 status=status,
                 renewal_state=renewal_state,
-                **kwargs,
-            )
-
-        return aiterate(_bound, page_size=page_size)
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
     async def cancel(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
+        """Cancel at the end of the current period.
+
+        While a renewal payment for the subscription is still settling,
+        this, ``pause`` and ``update`` raise :class:`ConflictError` (``409
+        operation_pending``, ``reason == "renewal_processing"``) whose
+        message names when to retry.
+        """
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/cancel",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def pause(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/pause",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def resume(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/resume",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def reactivate(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         """Reactivate a subscription that's been canceled but is still
         inside its paid-through period.
 
@@ -1081,14 +1688,42 @@ class AsyncSubscriptions:
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/reactivate",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def preview_update(self, subscription_id: str, *, target_price_id: str) -> dict[str, Any]:
+    async def preview_update(
+        self,
+        subscription_id: str,
+        *,
+        target_price_id: str,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> PlanChangePreview:
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/preview_update",
             json_body={"target_price_id": target_price_id},
+            cast_to=PlanChangePreview,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def update(
@@ -1097,12 +1732,25 @@ class AsyncSubscriptions:
         *,
         target_price_id: str,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/update",
             json_body={"target_price_id": target_price_id},
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def reauthorize_payment_method(
@@ -1111,12 +1759,25 @@ class AsyncSubscriptions:
         *,
         return_url: str,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Reauthorization:
         return await self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/reauthorize_payment_method",
             json_body={"return_url": return_url},
-            idempotency_key=idempotency_key,
+            cast_to=Reauthorization,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def create_usage_record(
@@ -1128,7 +1789,12 @@ class AsyncSubscriptions:
         identifier: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> UsageRecord:
         """Report consumption against a metered subscription.
 
         Only valid when the subscription's price is
@@ -1150,7 +1816,7 @@ class AsyncSubscriptions:
             inside :mod:`billkit` can never double-count.
 
         ``identifier``
-            Covers a retry of *your own call* — a job runner replaying a
+            Covers a retry of *your own call*: a job runner replaying a
             task, a queue delivering twice, your code re-invoking after its
             own timeout. Those arrive at the API as a genuinely new request
             with a new key, so the transport-level key cannot see them.
@@ -1173,7 +1839,15 @@ class AsyncSubscriptions:
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/usage_records",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=UsageRecord,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def list_usage_records(
@@ -1183,7 +1857,11 @@ class AsyncSubscriptions:
         invoice_id: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[UsageRecord]:
         """List usage records for one subscription.
 
         ``invoice_id`` filters by billing state: ``"pending"`` selects
@@ -1195,7 +1873,16 @@ class AsyncSubscriptions:
         if invoice_id is not None:
             params["invoice_id"] = invoice_id
         return await self._t.request(
-            "GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_records", params=params
+            "GET",
+            f"/v1/subscriptions/{_p(subscription_id)}/usage_records",
+            params=params,
+            cast_to=ListObject[UsageRecord],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def iter_usage_records(
@@ -1203,16 +1890,37 @@ class AsyncSubscriptions:
         subscription_id: str,
         *,
         invoice_id: str | None = None,
-        page_size: int | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[UsageRecord]:
         """Walk every page of ``list_usage_records()`` for one subscription."""
+        return aiterate(
+            lambda cursor: self.list_usage_records(
+                subscription_id,
+                limit=limit,
+                starting_after=cursor,
+                invoice_id=invoice_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
-        async def _bound(**kwargs: Any) -> dict[str, Any]:
-            return await self.list_usage_records(subscription_id, invoice_id=invoice_id, **kwargs)
-
-        return aiterate(_bound, page_size=page_size)
-
-    async def retrieve_usage_summary(self, subscription_id: str) -> dict[str, Any]:
+    async def retrieve_usage_summary(
+        self,
+        subscription_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> UsageSummary:
         """Price the usage that is pending, before the close bills it.
 
         :meth:`list_usage_records` with ``invoice_id="pending"`` tells you
@@ -1232,7 +1940,15 @@ class AsyncSubscriptions:
         still unsettled; while one is open, this period cannot be charged.
         """
         return await self._t.request(
-            "GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_summary"
+            "GET",
+            f"/v1/subscriptions/{_p(subscription_id)}/usage_summary",
+            cast_to=UsageSummary,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
 
@@ -1249,13 +1965,24 @@ class AsyncRefunds:
         amount_cents: int | None = None,
         reason: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        # Pass exactly one target: ``payment_id`` / ``subscription_id`` for a
-        # subscription-bound charge, or ``one_shot_payment_id`` for a
-        # mandate-less one-shot. The server rejects an ambiguous combination.
-        # ``amount_cents`` is optional: omit it to refund the whole remaining
-        # balance, or pass a smaller amount for a partial refund (a payment may
-        # carry several partials up to the charged amount).
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Refund:
+        """Refund a payment, in full or (with ``amount_cents``) in part.
+
+        Name the charge with exactly one of ``payment_id``,
+        ``subscription_id`` (its latest payment) or
+        ``one_shot_payment_id``. A payment that is not ``paid``, or is
+        outside its refund window, is a ``409`` :class:`ConflictError`
+        with ``code`` ``state_conflict``: the request was well formed, the
+        payment just cannot take it. So are the settled facts
+        ``charge_already_refunded``, ``charge_disputed`` and
+        ``refund_duplicate``. An amount above what is left is a 400. A
+        refund is usually ``pending`` on return; handle ``refund.failed``.
+        """
         body = _drop_none(
             {
                 "payment_id": payment_id,
@@ -1266,27 +1993,86 @@ class AsyncRefunds:
             }
         )
         return await self._t.request(
-            "POST", "/v1/refunds", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/refunds",
+            json_body=body,
+            cast_to=Refund,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, refund_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/refunds/{_p(refund_id)}")
+    async def retrieve(
+        self,
+        refund_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Refund:
+        return await self._t.request(
+            "GET",
+            f"/v1/refunds/{_p(refund_id)}",
+            cast_to=Refund,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Refund]:
         return await self._t.request(
             "GET",
             "/v1/refunds",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[Refund],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Refund]:
         """Walk every page of ``list()`` and yield each refund."""
-        return aiterate(self.list, page_size=page_size)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncDisputes:
@@ -1302,47 +2088,275 @@ class AsyncDisputes:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, dispute_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/disputes/{_p(dispute_id)}")
+    async def retrieve(
+        self,
+        dispute_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Dispute:
+        return await self._t.request(
+            "GET",
+            f"/v1/disputes/{_p(dispute_id)}",
+            cast_to=Dispute,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
         payment_id: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Dispute]:
         """List chargebacks raised against your payments, newest first.
 
-        ``status`` takes a comma-separated list of ``open`` / ``won``.
+        ``status`` takes a list of ``open`` / ``won`` (or one string).
         There is no ``lost``: the provider gives no signal for one, so a
         dispute you lost stays ``open``. ``payment_id`` matches
         subscription payments only, not one-off charges.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
-        params.update(_drop_none({"status": status, "payment_id": payment_id}))
-        return await self._t.request("GET", "/v1/disputes", params=params)
+        params.update(_drop_none({"status": _csv(status), "payment_id": payment_id}))
+        return await self._t.request(
+            "GET",
+            "/v1/disputes",
+            params=params,
+            cast_to=ListObject[Dispute],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
         payment_id: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Dispute]:
         """Walk every page of ``list()`` and yield each dispute.
 
         Filters are carried onto every page request.
         """
-        return aiterate(self.list, page_size=page_size, status=status, payment_id=payment_id)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                status=status,
+                payment_id=payment_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
+
+
+class AsyncTestClocks:
+    """Test clocks: virtual time for test mode.
+
+    Create a clock, create customers with ``test_clock_id=clock["id"]``, then
+    :meth:`advance` it to make trials end, renewals fall due and dunning run
+    for those customers only, without waiting. Every route is test mode
+    only; a live key gets :class:`~billkit.InvalidRequestError`.
+    """
+
+    def __init__(self, transport: _AsyncRequester) -> None:
+        self._t = transport
+
+    async def create(
+        self,
+        *,
+        frozen_time: int,
+        name: str | None = None,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TestClock:
+        """Create a clock frozen at ``frozen_time`` (Unix seconds)."""
+        body = _drop_none({"frozen_time": frozen_time, "name": name})
+        return await self._t.request(
+            "POST",
+            "/v1/test_clocks",
+            json_body=body,
+            cast_to=TestClock,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
+        )
+
+    async def retrieve(
+        self,
+        test_clock_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TestClock:
+        return await self._t.request(
+            "GET",
+            f"/v1/test_clocks/{_p(test_clock_id)}",
+            cast_to=TestClock,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
+
+    async def advance(
+        self,
+        test_clock_id: str,
+        *,
+        frozen_time: int,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TestClock:
+        """Move the clock forward to ``frozen_time`` and run what falls due.
+
+        ``frozen_time`` must be later than the clock's current time. The
+        work is done before this returns. The SDK always sends an
+        ``Idempotency-Key``, so its own retries replay rather than advance
+        twice.
+        """
+        return await self._t.request(
+            "POST",
+            f"/v1/test_clocks/{_p(test_clock_id)}/advance",
+            json_body={"frozen_time": frozen_time},
+            cast_to=TestClock,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
+        )
+
+    async def delete(
+        self,
+        test_clock_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> DeletedResource:
+        """Delete a clock. Returns ``{"id", "object": "test_clock", "deleted": True}``.
+
+        Its customers are not deleted; they return to real time.
+        """
+        return await self._t.request(
+            "DELETE",
+            f"/v1/test_clocks/{_p(test_clock_id)}",
+            cast_to=DeletedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
+
+    async def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[TestClock]:
+        """List test clocks, newest first."""
+        return await self._t.request(
+            "GET",
+            "/v1/test_clocks",
+            params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[TestClock],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
+
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[TestClock]:
+        """Walk every page of ``list()`` and yield each clock."""
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncWebhookEndpoints:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def list_event_types(self) -> dict[str, Any]:
+    async def list_event_types(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> EventTypeList:
         """Every event type this deployment can deliver, plus the wildcard.
 
         ``enabled_events`` rejects anything not on this list, so read it
@@ -1350,7 +2364,17 @@ class AsyncWebhookEndpoints:
         registration and leaves you with an endpoint that never fires.
         Read-only and the same for every caller.
         """
-        return await self._t.request("GET", "/v1/webhook_endpoints/event_types")
+        return await self._t.request(
+            "GET",
+            "/v1/webhook_endpoints/event_types",
+            cast_to=EventTypeList,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def create(
         self,
@@ -1359,7 +2383,12 @@ class AsyncWebhookEndpoints:
         enabled_events: list[str] | None = None,
         description: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
         body = _drop_none(
             {"url": url, "enabled_events": enabled_events, "description": description}
         )
@@ -1367,11 +2396,37 @@ class AsyncWebhookEndpoints:
             "POST",
             "/v1/webhook_endpoints",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, endpoint_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/webhook_endpoints/{_p(endpoint_id)}")
+    async def retrieve(
+        self,
+        endpoint_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
+        return await self._t.request(
+            "GET",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}",
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def update(
         self,
@@ -1379,10 +2434,15 @@ class AsyncWebhookEndpoints:
         *,
         url: str | None = None,
         enabled_events: list[str] | None = None,
-        description: str | _Unset | None = _UNSET,
+        description: str | NotGiven | None = NOT_GIVEN,
         status: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
         """Patch an endpoint, or stop delivery with ``status="disabled"``.
 
         Disabling keeps the endpoint, its signing secret and its delivery
@@ -1405,12 +2465,27 @@ class AsyncWebhookEndpoints:
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def delete(
-        self, endpoint_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        endpoint_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> DeletedResource:
         """Delete an endpoint. Returns ``{"deleted": True}``, not the endpoint.
 
         A URL registered by mistake should not be a permanent fixture of
@@ -1426,16 +2501,39 @@ class AsyncWebhookEndpoints:
         return await self._t.request(
             "DELETE",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}",
-            idempotency_key=idempotency_key,
+            cast_to=DeletedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     async def rotate_secret(
-        self, endpoint_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        endpoint_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
         return await self._t.request(
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/rotate_secret",
-            idempotency_key=idempotency_key,
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def list(
@@ -1443,16 +2541,46 @@ class AsyncWebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[WebhookEndpoint]:
         return await self._t.request(
             "GET",
             "/v1/webhook_endpoints",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[WebhookEndpoint],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[WebhookEndpoint]:
         """Walk every page of ``list()`` and yield each endpoint."""
-        return aiterate(self.list, page_size=page_size)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
     async def list_deliveries(
         self,
@@ -1460,7 +2588,11 @@ class AsyncWebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[WebhookDelivery]:
         """List per-attempt delivery records for one endpoint.
 
         Useful when a tenant's receiver is failing. Surfaces the
@@ -1471,19 +2603,50 @@ class AsyncWebhookEndpoints:
             "GET",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[WebhookDelivery],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def iter_deliveries(
-        self, endpoint_id: str, *, page_size: int | None = None
-    ) -> AsyncIterator[dict[str, Any]]:
+        self,
+        endpoint_id: str,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[WebhookDelivery]:
         """Walk every page of ``list_deliveries`` for one endpoint."""
+        return aiterate(
+            lambda cursor: self.list_deliveries(
+                endpoint_id,
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
-        async def _bound(**kwargs: Any) -> dict[str, Any]:
-            return await self.list_deliveries(endpoint_id, **kwargs)
-
-        return aiterate(_bound, page_size=page_size)
-
-    async def retrieve_delivery(self, endpoint_id: str, delivery_id: str) -> dict[str, Any]:
+    async def retrieve_delivery(
+        self,
+        endpoint_id: str,
+        delivery_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> WebhookDelivery:
         """Fetch one delivery record.
 
         The single-row counterpart to :meth:`list_deliveries`. Carries
@@ -1494,6 +2657,13 @@ class AsyncWebhookEndpoints:
         return await self._t.request(
             "GET",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}",
+            cast_to=WebhookDelivery,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     async def redeliver(
@@ -1502,7 +2672,12 @@ class AsyncWebhookEndpoints:
         delivery_id: str,
         *,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookDelivery:
         """Re-enqueue a delivery row for the dispatcher.
 
         Idempotent: a row already in ``delivered`` returns unchanged.
@@ -1513,7 +2688,15 @@ class AsyncWebhookEndpoints:
         return await self._t.request(
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}/redeliver",
-            idempotency_key=idempotency_key,
+            cast_to=WebhookDelivery,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
@@ -1521,35 +2704,93 @@ class AsyncEvents:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, event_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/events/{_p(event_id)}")
+    async def retrieve(
+        self,
+        event_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Event:
+        return await self._t.request(
+            "GET",
+            f"/v1/events/{_p(event_id)}",
+            cast_to=Event,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        type: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        type: str | Sequence[str] | None = None,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Event]:
         """List events, newest first.
+
+        ``type`` narrows to one event type or a list of them
+        (``type=["invoice.paid", "invoice.payment_failed"]``), sent
+        comma-joined. An unknown type is a 400.
 
         Expandable: ``customer``. ``events.retrieve`` accepts none.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
-        if type is not None:
-            params["type"] = type
+        if (types := _csv(type)) is not None:
+            params["type"] = types
         params.update(_expand_params(expand) or {})
-        return await self._t.request("GET", "/v1/events", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/events",
+            params=params,
+            cast_to=ListObject[Event],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
-        self, *, page_size: int | None = None, type: str | None = None
-    ) -> AsyncIterator[dict[str, Any]]:
+        self,
+        *,
+        type: str | Sequence[str] | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Event]:
         """Walk every page of ``list()`` and yield each event.
 
         Pass ``type="customer.created"`` to filter at the server.
         """
-        return aiterate(self.list, page_size=page_size, type=type)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                type=type,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncTenant:
@@ -1557,12 +2798,13 @@ class AsyncTenant:
 
     Today exposes:
 
-    * :meth:`capabilities`: cached Mollie profile shape.
-    * :meth:`portal_branding` / :meth:`set_portal_branding`: the
+    * :meth:`retrieve_capabilities`: what your payment provider account
+      can do (methods, currencies), as BillKit last read it.
+    * :meth:`retrieve_portal_branding` / :meth:`set_portal_branding`: the
       customer-facing portal chrome (business name, support email,
       logo URL, theme tokens, capability flags).
-    * :meth:`billing_profile` / :meth:`set_billing_profile`: your own
-      registered country, VAT id and invoice address.
+    * :meth:`retrieve_billing_profile` / :meth:`set_billing_profile`: your
+      own registered country, VAT id and invoice address.
     * :meth:`export`: everything in the account as one JSON document.
     * :meth:`rotate_provider_credential`: replace the encrypted
       Mollie API key without re-running ``provision_tenant --force``.
@@ -1571,45 +2813,100 @@ class AsyncTenant:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def capabilities(self) -> dict[str, Any]:
-        return await self._t.request("GET", "/v1/tenant/capabilities")
+    async def retrieve_capabilities(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TenantCapabilities:
+        return await self._t.request(
+            "GET",
+            "/v1/tenant/capabilities",
+            cast_to=TenantCapabilities,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    async def portal_branding(self) -> dict[str, Any]:
-        return await self._t.request("GET", "/v1/tenant/portal_branding")
+    async def retrieve_portal_branding(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TenantPortalBranding:
+        return await self._t.request(
+            "GET",
+            "/v1/tenant/portal_branding",
+            cast_to=TenantPortalBranding,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def set_portal_branding(
         self,
         *,
-        business_name: str | None = None,
-        support_email: str | None = None,
-        logo_url: str | None = None,
-        theme: dict[str, Any] | None = None,
-        capabilities: dict[str, Any] | None = None,
+        business_name: str | NotGiven | None = NOT_GIVEN,
+        support_email: str | NotGiven | None = NOT_GIVEN,
+        logo_url: str | NotGiven | None = NOT_GIVEN,
+        theme: dict[str, Any] | NotGiven | None = NOT_GIVEN,
+        capabilities: dict[str, Any] | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        """Partial-update the portal branding row.
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TenantPortalBranding:
+        """Change the billing portal's branding. Only the keywords you pass change.
 
-        Unset fields are left alone: an explicit ``None`` is **not** sent,
-        it is dropped like any other omitted keyword. Clear a field by
-        sending an empty value for it.
+        ``None`` passed explicitly **clears** a field (sent as a JSON null),
+        so the portal falls back to its default for it; omit a keyword to
+        leave it alone. ``logo_url`` must use ``https``. The portal is shared
+        by live and test mode, so this needs a live-mode key. (0.x dropped an
+        explicit ``None`` here, which left no way to clear a field.)
         """
-        body = _drop_none(
-            {
-                "business_name": business_name,
-                "support_email": support_email,
-                "logo_url": logo_url,
-                "theme": theme,
-                "capabilities": capabilities,
-            }
+        body = _put_clearable(
+            {},
+            business_name=business_name,
+            support_email=support_email,
+            logo_url=logo_url,
+            theme=theme,
+            capabilities=capabilities,
         )
         return await self._t.request(
             "POST",
             "/v1/tenant/portal_branding",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TenantPortalBranding,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def billing_profile(self) -> dict[str, Any]:
+    async def retrieve_billing_profile(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TenantBillingProfile:
         """Read your own registered country and VAT number.
 
         These are what your customers' VAT is decided against, so check
@@ -1620,20 +2917,35 @@ class AsyncTenant:
         exactly the case worth spotting. ``vat_id`` has no effective
         counterpart, because nothing can stand in for a registration.
         """
-        return await self._t.request("GET", "/v1/tenant/billing_profile")
+        return await self._t.request(
+            "GET",
+            "/v1/tenant/billing_profile",
+            cast_to=TenantBillingProfile,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def set_billing_profile(
         self,
         *,
         country_code: str,
-        vat_id: str | _Unset | None = _UNSET,
-        address_line1: str | _Unset | None = _UNSET,
-        address_line2: str | _Unset | None = _UNSET,
-        postal_code: str | _Unset | None = _UNSET,
-        city: str | _Unset | None = _UNSET,
-        registration_number: str | _Unset | None = _UNSET,
+        vat_id: str | NotGiven | None = NOT_GIVEN,
+        address_line1: str | NotGiven | None = NOT_GIVEN,
+        address_line2: str | NotGiven | None = NOT_GIVEN,
+        postal_code: str | NotGiven | None = NOT_GIVEN,
+        city: str | NotGiven | None = NOT_GIVEN,
+        registration_number: str | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TenantBillingProfile:
         """Set the seller identity: jurisdiction, VAT id, invoice address.
 
         ``country_code`` is required on every call: there is nothing to
@@ -1668,16 +2980,31 @@ class AsyncTenant:
             ("city", city),
             ("registration_number", registration_number),
         ):
-            if not isinstance(value, _Unset):
+            if not isinstance(value, NotGiven):
                 body[key] = value
         return await self._t.request(
             "POST",
             "/v1/tenant/billing_profile",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TenantBillingProfile,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def export(self) -> bytes:
+    async def export(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> bytes:
         """Download everything in the account as one JSON document.
 
         .. code-block:: python
@@ -1691,13 +3018,24 @@ class AsyncTenant:
         its ``GET`` route returns, and ``billkit_export_version`` names
         the shape.
 
-        It is ``application/json`` streamed inline, with no redirect, and it
-        can be large, so write it to a file rather than holding it in
-        memory. Test and live data export separately: you get whichever
+        The server sends ``application/json`` inline, with no redirect, and
+        this method returns the whole file as ``bytes``: it is read into
+        memory before the call returns, so a large account needs the memory
+        for all of it. Write it straight to a file and drop the reference
+        rather than keeping it around. Test and live data export separately: you get whichever
         mode the calling key belongs to. Nothing is changed, but the
         access is recorded in your audit log.
         """
-        return await self._t.request_bytes("GET", "/v1/tenant/export")
+        return await self._t.request_bytes(
+            "GET",
+            "/v1/tenant/export",
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def rotate_provider_credential(
         self,
@@ -1706,7 +3044,12 @@ class AsyncTenant:
         mode: str | None = None,
         provider: str = "mollie",
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TenantProviderCredential:
         """Rotate the encrypted provider credential for this tenant.
 
         ``api_key`` is encrypted server-side; nothing is logged.
@@ -1719,7 +3062,15 @@ class AsyncTenant:
             "POST",
             "/v1/tenant/provider_credential",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TenantProviderCredential,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
@@ -1733,47 +3084,110 @@ class AsyncCoupons:
         self,
         *,
         code: str,
-        discount_type: str,
-        discount_value: int,
-        duration: str,
+        percent_off: int | float | Decimal | None = None,
+        amount_off_cents: int | None = None,
+        discount_type: str | None = None,
+        duration: str | None = None,
         duration_in_months: int | None = None,
         max_redemptions: int | None = None,
         redeem_by: int | None = None,
         applies_to_price_ids: list[str] | None = None,
         min_amount_cents: int | None = None,
+        currency: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Coupon:
+        """Create a promotional code.
+
+        Pass exactly one of ``percent_off`` (more than 0 and at most 100,
+        with up to two decimal places: ``10``, ``12.5`` or
+        ``Decimal("33.33")``) and
+        ``amount_off_cents`` (a fixed amount in minor units). The API infers
+        ``discount_type`` (``"percent"`` or ``"fixed_amount"``) from which
+        one you sent; pass it as well only if you want that checked, and a
+        disagreement is a 400.
+
+        ``duration`` is ``"once"`` (the API's default), ``"forever"`` or
+        ``"repeating"``, the last with ``duration_in_months``.
+
+        ``currency`` (ISO 4217, ``"EUR"``) is the currency of
+        ``amount_off_cents`` and of ``min_amount_cents``; the coupon then
+        applies only to prices in it. Required with either when the account
+        has more than one currency enabled, otherwise it defaults to the one
+        currency. A percent coupon with no minimum needs none and applies in
+        any currency.
+        """
         body = _drop_none(
             {
                 "code": code,
+                "percent_off": _percent(percent_off),
+                "amount_off_cents": amount_off_cents,
                 "discount_type": discount_type,
-                "discount_value": discount_value,
                 "duration": duration,
                 "duration_in_months": duration_in_months,
                 "max_redemptions": max_redemptions,
                 "redeem_by": redeem_by,
                 "applies_to_price_ids": applies_to_price_ids,
                 "min_amount_cents": min_amount_cents,
+                "currency": currency,
             }
         )
         return await self._t.request(
-            "POST", "/v1/coupons", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/coupons",
+            json_body=body,
+            cast_to=Coupon,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, coupon_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/coupons/{_p(coupon_id)}")
+    async def retrieve(
+        self,
+        coupon_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Coupon:
+        return await self._t.request(
+            "GET",
+            f"/v1/coupons/{_p(coupon_id)}",
+            cast_to=Coupon,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def update(
         self,
         coupon_id: str,
         *,
         active: bool | None = None,
-        max_redemptions: int | _Unset | None = _UNSET,
-        redeem_by: int | _Unset | None = _UNSET,
-        applies_to_price_ids: list[str] | _Unset | None = _UNSET,
-        min_amount_cents: int | _Unset | None = _UNSET,
+        max_redemptions: int | NotGiven | None = NOT_GIVEN,
+        redeem_by: int | NotGiven | None = NOT_GIVEN,
+        applies_to_price_ids: list[str] | NotGiven | None = NOT_GIVEN,
+        min_amount_cents: int | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Coupon:
         """Patch a coupon's limits, or withdraw it with ``active=False``.
 
         A withdrawn code is refused at checkout while the coupon stays
@@ -1799,7 +3213,15 @@ class AsyncCoupons:
             "POST",
             f"/v1/coupons/{_p(coupon_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Coupon,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def validate(
@@ -1808,7 +3230,14 @@ class AsyncCoupons:
         code: str,
         price_id: str | None = None,
         amount_cents: int | None = None,
-    ) -> dict[str, Any]:
+        currency: str | None = None,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> CouponValidation:
         """Server-side dry-run of a coupon redemption.
 
         Returns the discount math without atomically claiming the
@@ -1819,29 +3248,77 @@ class AsyncCoupons:
         active, not exhausted, not expired). Supply ``price_id`` to also
         check the coupon's ``applies_to_price_ids`` restriction, and
         ``amount_cents`` to get the discount math plus the
-        ``min_amount_cents`` check.
+        ``min_amount_cents`` check. ``currency`` names the charge's
+        currency when no ``price_id`` does; a coupon in another currency
+        comes back ``valid: False`` with ``reason ==
+        "coupon_currency_mismatch"``.
         """
         body: dict[str, Any] = {"code": code}
         if price_id is not None:
             body["price_id"] = price_id
         if amount_cents is not None:
             body["amount_cents"] = amount_cents
-        return await self._t.request("POST", "/v1/coupons/validate", json_body=body)
+        if currency is not None:
+            body["currency"] = currency
+        return await self._t.request(
+            "POST",
+            "/v1/coupons/validate",
+            json_body=body,
+            cast_to=CouponValidation,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
+        )
 
     async def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Coupon]:
         return await self._t.request(
             "GET",
             "/v1/coupons",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[Coupon],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
-        return aiterate(self.list, page_size=page_size)
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Coupon]:
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncTaxRates:
@@ -1858,7 +3335,12 @@ class AsyncTaxRates:
         display_name: str | None = None,
         inclusive: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TaxRate:
         body = _drop_none(
             {
                 "country_code": country_code,
@@ -1868,22 +3350,56 @@ class AsyncTaxRates:
             }
         )
         return await self._t.request(
-            "POST", "/v1/tax_rates", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/tax_rates",
+            json_body=body,
+            cast_to=TaxRate,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, tax_rate_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/tax_rates/{_p(tax_rate_id)}")
+    async def retrieve(
+        self,
+        tax_rate_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TaxRate:
+        return await self._t.request(
+            "GET",
+            f"/v1/tax_rates/{_p(tax_rate_id)}",
+            cast_to=TaxRate,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def update(
         self,
         tax_rate_id: str,
         *,
         rate_basis_points: int | None = None,
-        display_name: str | _Unset | None = _UNSET,
+        display_name: str | NotGiven | None = NOT_GIVEN,
         inclusive: bool | None = None,
         active: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TaxRate:
         """Correct a rate, retire it with ``active=False``, or bring one back.
 
         Retiring is how you stop charging VAT in a country. The rate
@@ -1906,7 +3422,15 @@ class AsyncTaxRates:
             "POST",
             f"/v1/tax_rates/{_p(tax_rate_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TaxRate,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def list(
@@ -1914,15 +3438,45 @@ class AsyncTaxRates:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[TaxRate]:
         return await self._t.request(
             "GET",
             "/v1/tax_rates",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[TaxRate],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
-        return aiterate(self.list, page_size=page_size)
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[TaxRate]:
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncInvoices:
@@ -1938,16 +3492,42 @@ class AsyncInvoices:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, invoice_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+    async def retrieve(
+        self,
+        invoice_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Invoice:
         """Fetch one invoice, line items included.
 
         Expandable: ``customer``.
         """
         return await self._t.request(
-            "GET", f"/v1/invoices/{_p(invoice_id)}", params=_expand_params(expand)
+            "GET",
+            f"/v1/invoices/{_p(invoice_id)}",
+            params=_expand_params(expand),
+            cast_to=Invoice,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    async def retrieve_pdf(self, invoice_id: str) -> bytes:
+    async def retrieve_pdf(
+        self,
+        invoice_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> bytes:
         """Download the rendered invoice PDF as raw bytes.
 
         .. code-block:: python
@@ -1957,7 +3537,7 @@ class AsyncInvoices:
 
         Blob-backed deployments stream the bytes inline; S3-backed ones
         answer ``302`` to a presigned URL, which the transport follows
-        under the SDK's own timeout and retry policy — so both storage
+        under the SDK's own timeout and retry policy, so both storage
         adapters look identical from here.
 
         Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
@@ -1966,11 +3546,28 @@ class AsyncInvoices:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured invoice for tenants who render their own.
         """
-        return await self._t.request_bytes("GET", f"/v1/invoices/{_p(invoice_id)}/pdf")
+        return await self._t.request_bytes(
+            "GET",
+            f"/v1/invoices/{_p(invoice_id)}/pdf",
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def send_email(
-        self, invoice_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        invoice_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> InvoiceEmail:
         """Send the customer their invoice again.
 
         The same tenant-branded "your invoice is ready" email, with a
@@ -1987,7 +3584,15 @@ class AsyncInvoices:
         return await self._t.request(
             "POST",
             f"/v1/invoices/{_p(invoice_id)}/email",
-            idempotency_key=idempotency_key,
+            cast_to=InvoiceEmail,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def list(
@@ -1999,15 +3604,19 @@ class AsyncInvoices:
         subscription_id: str | None = None,
         payment_id: str | None = None,
         status: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Invoice]:
         """List invoices, newest first. Line items are left out here.
 
         ``customer_id``, ``subscription_id`` and ``payment_id`` each
         narrow to one, which is how you ask "show me this customer's
         invoices" or "which invoice did this charge produce" without
-        paging the whole account. ``status`` takes one of ``draft``,
-        ``open``, ``paid``, ``void``, ``uncollectible``.
+        paging the whole account. ``status`` takes one of ``open``,
+        ``paid``, ``void``, ``uncollectible``; anything else is a 400.
 
         Expandable: ``customer``.
         """
@@ -2023,25 +3632,50 @@ class AsyncInvoices:
             )
         )
         params.update(_expand_params(expand) or {})
-        return await self._t.request("GET", "/v1/invoices", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/invoices",
+            params=params,
+            cast_to=ListObject[Invoice],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         customer_id: str | None = None,
         subscription_id: str | None = None,
         payment_id: str | None = None,
         status: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Invoice]:
         """Walk every page of ``list()``; filters are carried on each."""
         return aiterate(
-            self.list,
-            page_size=page_size,
-            customer_id=customer_id,
-            subscription_id=subscription_id,
-            payment_id=payment_id,
-            status=status,
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                customer_id=customer_id,
+                subscription_id=subscription_id,
+                payment_id=payment_id,
+                status=status,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
         )
 
     async def void(
@@ -2050,17 +3684,22 @@ class AsyncInvoices:
         *,
         reason: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Invoice:
         """Void an invoice: state that the sale was never owed.
 
-        The invoice keeps its number and stays readable — a gapless
-        series cannot lose a row — and stops being a receivable. Use it
+        The invoice keeps its number and stays readable (a gapless
+        series cannot lose a row) and stops being a receivable. Use it
         for an invoice that should not have been issued.
 
         A **paid** invoice is refused with :class:`ConflictError` whose
         ``code`` is ``invoice_not_voidable``. That is deliberate: once
         the money has moved, "never owed" is false, and the document that
-        reverses a real sale is a credit note — refund the payment and
+        reverses a real sale is a credit note. Refund the payment and
         one is issued when the refund settles.
 
         Idempotent: voiding an already-void invoice returns it unchanged.
@@ -2072,12 +3711,20 @@ class AsyncInvoices:
             "POST",
             f"/v1/invoices/{_p(invoice_id)}/void",
             json_body=_drop_none({"reason": reason}),
-            idempotency_key=idempotency_key,
+            cast_to=Invoice,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
 class AsyncCreditNotes:
-    """Read-only access to credit notes — the documents that reverse an
+    """Read-only access to credit notes, the documents that reverse an
     issued invoice.
 
     There is no create. A credit note is issued for you when a refund
@@ -2090,10 +3737,36 @@ class AsyncCreditNotes:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, credit_note_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/credit_notes/{_p(credit_note_id)}")
+    async def retrieve(
+        self,
+        credit_note_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> CreditNote:
+        return await self._t.request(
+            "GET",
+            f"/v1/credit_notes/{_p(credit_note_id)}",
+            cast_to=CreditNote,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    async def retrieve_pdf(self, credit_note_id: str) -> bytes:
+    async def retrieve_pdf(
+        self,
+        credit_note_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> bytes:
         """Download the rendered credit note PDF as raw bytes.
 
         .. code-block:: python
@@ -2103,7 +3776,7 @@ class AsyncCreditNotes:
 
         Blob-backed deployments stream the bytes inline; S3-backed ones
         answer ``302`` to a presigned URL, which the transport follows
-        under the SDK's own timeout and retry policy — so both storage
+        under the SDK's own timeout and retry policy, so both storage
         adapters look identical from here.
 
         Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
@@ -2112,7 +3785,16 @@ class AsyncCreditNotes:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured credit note for tenants who render their own.
         """
-        return await self._t.request_bytes("GET", f"/v1/credit_notes/{_p(credit_note_id)}/pdf")
+        return await self._t.request_bytes(
+            "GET",
+            f"/v1/credit_notes/{_p(credit_note_id)}/pdf",
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def list(
         self,
@@ -2121,7 +3803,11 @@ class AsyncCreditNotes:
         starting_after: str | None = None,
         invoice_id: str | None = None,
         customer_id: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[CreditNote]:
         """One page of credit notes, newest first.
 
         ``invoice_id`` answers "was this sale credited, and by how much",
@@ -2132,17 +3818,43 @@ class AsyncCreditNotes:
         for key, value in (("invoice_id", invoice_id), ("customer_id", customer_id)):
             if value is not None:
                 params[key] = value
-        return await self._t.request("GET", "/v1/credit_notes", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/credit_notes",
+            params=params,
+            cast_to=ListObject[CreditNote],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         invoice_id: str | None = None,
         customer_id: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[CreditNote]:
         return aiterate(
-            self.list, page_size=page_size, invoice_id=invoice_id, customer_id=customer_id
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                invoice_id=invoice_id,
+                customer_id=customer_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
         )
 
 
@@ -2152,8 +3864,26 @@ class AsyncAuditLogs:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, audit_log_id: str) -> dict[str, Any]:
-        return await self._t.request("GET", f"/v1/audit_logs/{_p(audit_log_id)}")
+    async def retrieve(
+        self,
+        audit_log_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AuditLog:
+        return await self._t.request(
+            "GET",
+            f"/v1/audit_logs/{_p(audit_log_id)}",
+            cast_to=AuditLog,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def list(
         self,
@@ -2164,14 +3894,18 @@ class AsyncAuditLogs:
         resource_type: str | None = None,
         resource_id: str | None = None,
         actor_id: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[AuditLog]:
         """List audit-log entries, newest first, optionally filtered.
 
         All four filters match exactly and combine. ``resource_type``
         narrows to a kind (``"customer"``, ``"price"``); ``resource_id``
         narrows to one row, which is the "everything that ever happened
         to this customer" question an audit log mostly exists for. Pair
-        them or pass ``resource_id`` alone — ids are already unique.
+        them or pass ``resource_id`` alone, since ids are already unique.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         for key, value in (
@@ -2182,26 +3916,49 @@ class AsyncAuditLogs:
         ):
             if value is not None:
                 params[key] = value
-        return await self._t.request("GET", "/v1/audit_logs", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/audit_logs",
+            params=params,
+            cast_to=ListObject[AuditLog],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         action: str | None = None,
         resource_type: str | None = None,
         resource_id: str | None = None,
         actor_id: str | None = None,
-    ) -> AsyncIterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[AuditLog]:
         """Walk every page of ``list()``; filters are forwarded
         unchanged so ``action="customer.created"`` etc. work."""
         return aiterate(
-            self.list,
-            page_size=page_size,
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            actor_id=actor_id,
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                actor_id=actor_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
         )
 
 
@@ -2216,7 +3973,16 @@ class AsyncPayments:
     def __init__(self, transport: _AsyncRequester) -> None:
         self._t = transport
 
-    async def retrieve(self, payment_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+    async def retrieve(
+        self,
+        payment_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Payment:
         """Fetch one subscription payment.
 
         Expandable: ``customer``, ``subscription``, ``refund_eligibility``.
@@ -2233,10 +3999,27 @@ class AsyncPayments:
         still can); treat any other value as "not refundable".
         """
         return await self._t.request(
-            "GET", f"/v1/payments/{_p(payment_id)}", params=_expand_params(expand)
+            "GET",
+            f"/v1/payments/{_p(payment_id)}",
+            params=_expand_params(expand),
+            cast_to=Payment,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    async def retrieve_provider(self, payment_id: str) -> dict[str, Any]:
+    async def retrieve_provider(
+        self,
+        payment_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ProviderPayload:
         """Fetch the provider's own record of this charge, live.
 
         Reads Mollie at request time rather than a stored copy, so it
@@ -2247,7 +4030,17 @@ class AsyncPayments:
         all answer ``200`` with ``available: False`` and a short reason,
         so render the rest of the page regardless.
         """
-        return await self._t.request("GET", f"/v1/payments/{_p(payment_id)}/provider")
+        return await self._t.request(
+            "GET",
+            f"/v1/payments/{_p(payment_id)}/provider",
+            cast_to=ProviderPayload,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def list(
         self,
@@ -2255,8 +4048,12 @@ class AsyncPayments:
         limit: int | None = None,
         starting_after: str | None = None,
         customer_id: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Payment]:
         """List subscription payments, newest first.
 
         ``customer_id`` narrows to one customer. Failed and pending
@@ -2270,13 +4067,45 @@ class AsyncPayments:
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_drop_none({"customer_id": customer_id}))
         params.update(_expand_params(expand) or {})
-        return await self._t.request("GET", "/v1/payments", params=params)
+        return await self._t.request(
+            "GET",
+            "/v1/payments",
+            params=params,
+            cast_to=ListObject[Payment],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
-        self, *, page_size: int | None = None, customer_id: str | None = None
-    ) -> AsyncIterator[dict[str, Any]]:
+        self,
+        *,
+        customer_id: str | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[Payment]:
         """Walk every page of ``list()``; ``customer_id`` is carried on each."""
-        return aiterate(self.list, page_size=page_size, customer_id=customer_id)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                customer_id=customer_id,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class AsyncBillingPortalSessions:
@@ -2298,7 +4127,12 @@ class AsyncBillingPortalSessions:
         return_url: str,
         deliver_email: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> BillingPortalSession:
         """Mint a portal session for one subscription.
 
         ``deliver_email=True`` also emails the link to the subscription's
@@ -2317,17 +4151,41 @@ class AsyncBillingPortalSessions:
             "POST",
             "/v1/billing_portal/sessions",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=BillingPortalSession,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def revoke(
-        self, session_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> BillingPortalSessionRevocation:
         """Kill an in-the-wild portal session. Idempotent."""
         return await self._t.request(
             "POST",
             f"/v1/billing_portal/sessions/{_p(session_id)}/revoke",
-            idempotency_key=idempotency_key,
+            cast_to=BillingPortalSessionRevocation,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
@@ -2349,7 +4207,12 @@ class AsyncApiKeys:
         label: str | None = None,
         scopes: list[str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> ApiKey:
         """Issue a new key.
 
         The response's ``secret`` is the only time the full key exists
@@ -2362,21 +4225,58 @@ class AsyncApiKeys:
         """
         body = _drop_none({"label": label, "scopes": scopes})
         return await self._t.request(
-            "POST", "/v1/api_keys", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/api_keys",
+            json_body=body,
+            cast_to=ApiKey,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    async def retrieve(self, api_key_id: str) -> dict[str, Any]:
+    async def retrieve(
+        self,
+        api_key_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ApiKey:
         """One key's metadata: prefix, label, scopes, ``revoked_at``.
 
         The key itself is never returned. ``last_used_at`` is the useful
         field, since it tells you whether a key is still in service before
         you revoke it.
         """
-        return await self._t.request("GET", f"/v1/api_keys/{_p(api_key_id)}")
+        return await self._t.request(
+            "GET",
+            f"/v1/api_keys/{_p(api_key_id)}",
+            cast_to=ApiKey,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     async def revoke(
-        self, api_key_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        api_key_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> ApiKey:
         """Revoke a key so it stops working.
 
         Immediate and irreversible; issue a new key instead. Revoking an
@@ -2387,7 +4287,15 @@ class AsyncApiKeys:
         return await self._t.request(
             "POST",
             f"/v1/api_keys/{_p(api_key_id)}/revoke",
-            idempotency_key=idempotency_key,
+            cast_to=ApiKey,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     async def list(
@@ -2395,7 +4303,11 @@ class AsyncApiKeys:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[ApiKey]:
         """List your API keys, newest first.
 
         Only keys in the calling key's mode are listed. Revoked ones are
@@ -2405,11 +4317,37 @@ class AsyncApiKeys:
             "GET",
             "/v1/api_keys",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[ApiKey],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AsyncIterator[ApiKey]:
         """Walk every page of ``list()`` and yield each key."""
-        return aiterate(self.list, page_size=page_size)
+        return aiterate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 # ─── Sync resources ────────────────────────────────────────────────
@@ -2424,8 +4362,8 @@ class Customers:
 
     Customers are tenant-scoped buyer records. Use them as the anchor
     for checkout sessions, subscriptions, invoices, refunds, and audit
-    history. Methods return the API's raw JSON dictionaries so callers
-    can preserve fields added by newer API versions.
+    history. Methods return :class:`billkit.types.Customer`; fields a
+    newer API adds are still readable on it.
     """
 
     def __init__(self, transport: _SyncRequester) -> None:
@@ -2438,18 +4376,42 @@ class Customers:
         name: str | None = None,
         country_code: str | None = None,
         metadata: dict[str, str] | None = None,
+        test_clock_id: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Customer:
+        """Create a customer.
+
+        ``test_clock_id`` (test mode only) attaches the customer to a test
+        clock so its subscriptions follow that clock's time; see
+        ``test_clocks``. It is fixed at creation.
+        """
         body = _drop_none(
             {
                 "email": email,
                 "name": name,
                 "country_code": country_code,
                 "metadata": metadata,
+                "test_clock_id": test_clock_id,
             }
         )
         return self._t.request(
-            "POST", "/v1/customers", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/customers",
+            json_body=body,
+            cast_to=Customer,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def set_vat_number(
@@ -2459,7 +4421,12 @@ class Customers:
         vat_number: str | None,
         country_code: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Customer:
         """Attach, replace, or clear the customer's VAT number.
 
         Triggers server-side VIES validation. The response carries the
@@ -2480,43 +4447,105 @@ class Customers:
             "POST",
             f"/v1/customers/{_p(customer_id)}/vat_number",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Customer,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def purge(
         self,
         customer_id: str,
         *,
-        confirmed: bool = True,
+        confirmed: bool,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        """Hard-purge a customer's PII for GDPR erasure requests.
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> PurgedResource:
+        """Erase a customer's personal data, for a GDPR erasure request. Irreversible.
 
-        Distinct from :meth:`delete` (soft delete): purge nulls email,
-        name, country, VAT, and metadata, sets ``purged_at``, and is
-        irreversible. ``confirmed=False`` no-ops at the API as a
-        fat-finger guard, so the SDK defaults it to ``True``.
+        The email is replaced with an unusable placeholder and the name,
+        metadata and VAT registration are cleared, including from the stored
+        payloads of past events. The customer is marked deleted and
+        :meth:`retrieve` 404s afterwards, so the answer is the deletion
+        marker :meth:`delete` returns plus ``purged``:
+        ``{"id", "object": "customer", "deleted": True, "purged": True}``. Payments, refunds, invoices and
+        credit notes are kept, with the buyer details printed on issued
+        documents, because those must be retained for accounting. Refused
+        with a 400 while the customer has a subscription that can still
+        charge them. A customer already removed with :meth:`delete` can
+        still be purged.
+
+        ``confirmed=True`` is required, and anything else raises
+        :class:`ValueError` here, before a request is made. It is a
+        keyword with no default on purpose: the one call in the SDK that
+        destroys data cannot be reached by a stray positional argument or
+        a default that changed under you. (0.x defaulted the API's
+        ``confirmed`` flag to ``True`` on your behalf.)
         """
+        if confirmed is not True:
+            raise ValueError(
+                "customers.purge erases personal data irreversibly. Pass confirmed=True to proceed."
+            )
         return self._t.request(
             "POST",
             f"/v1/customers/{_p(customer_id)}/purge",
-            json_body={"confirmed": confirmed},
-            idempotency_key=idempotency_key,
+            json_body={"confirmed": True},
+            cast_to=PurgedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, customer_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/customers/{_p(customer_id)}")
+    def retrieve(
+        self,
+        customer_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Customer:
+        return self._t.request(
+            "GET",
+            f"/v1/customers/{_p(customer_id)}",
+            cast_to=Customer,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def update(
         self,
         customer_id: str,
         *,
         email: str | None = None,
-        name: str | _Unset | None = _UNSET,
+        name: str | NotGiven | None = NOT_GIVEN,
         country_code: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Customer:
         """Patch a customer. Only the keywords you pass change.
 
         ``metadata`` replaces the whole map. ``name=None`` passed
@@ -2535,21 +4564,47 @@ class Customers:
             "POST",
             f"/v1/customers/{_p(customer_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Customer,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def delete(self, customer_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def delete(
+        self,
+        customer_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> DeletedResource:
         """Delete a customer. Returns ``{"id", "object", "deleted": True}``.
 
         The customer leaves the API: :meth:`retrieve` 404s and they drop
         out of :meth:`list`, which is why the response is a marker and
         not the customer. Their payments, invoices and refunds are
-        untouched, and so is their personal data — :meth:`purge` is the
+        untouched, and so is their personal data; :meth:`purge` is the
         GDPR erasure. Refused while they hold a subscription that can
         still charge them.
         """
         return self._t.request(
-            "DELETE", f"/v1/customers/{_p(customer_id)}", idempotency_key=idempotency_key
+            "DELETE",
+            f"/v1/customers/{_p(customer_id)}",
+            cast_to=DeletedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def list(
@@ -2558,8 +4613,12 @@ class Customers:
         limit: int | None = None,
         starting_after: str | None = None,
         provisional: bool | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Customer]:
         """List customers, newest first.
 
         ``provisional`` filters on whether the customer ever completed a
@@ -2576,15 +4635,49 @@ class Customers:
         if provisional is not None:
             params["provisional"] = "true" if provisional else "false"
         params.update(_expand_params(expand) or {})
-        return self._t.request("GET", "/v1/customers", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/customers",
+            params=params,
+            cast_to=ListObject[Customer],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        provisional: bool | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Customer]:
         """Walk every page of ``list()`` and yield each customer.
 
         Page size defaults to the server's default (10). Pass
-        ``page_size=100`` to reduce round-trips on large tenant data.
+        ``limit=100`` to reduce round-trips on large tenant data.
         """
-        return paginate(self.list, page_size=page_size)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                provisional=provisional,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class Products:
@@ -2608,14 +4701,19 @@ class Products:
         metadata: dict[str, str] | None = None,
         allow_promotion_codes: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Product:
         """Create a catalog product and return the product object.
 
         ``allow_promotion_codes`` lets a *buyer* type a coupon code at the
         embedded checkout for this product. Defaults to ``False``. A coupon
         you apply yourself, by passing ``coupon_code`` when you create a
-        Checkout Session, is unaffected — that is you discounting your own
-        sale. Either way the code is redeemed only once the payment
+        Checkout Session, is unaffected, because that is you discounting your
+        own sale. Either way the code is redeemed only once the payment
         settles, so an abandoned checkout never uses one up.
         """
         body = _drop_none(
@@ -2628,10 +4726,30 @@ class Products:
             }
         )
         return self._t.request(
-            "POST", "/v1/products", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/products",
+            json_body=body,
+            cast_to=Product,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, product_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+    def retrieve(
+        self,
+        product_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Product:
         """Fetch one product by id.
 
         Expandable: ``prices`` (every price on the product, archived ones
@@ -2639,7 +4757,16 @@ class Products:
         price ``default_price_id`` names).
         """
         return self._t.request(
-            "GET", f"/v1/products/{_p(product_id)}", params=_expand_params(expand)
+            "GET",
+            f"/v1/products/{_p(product_id)}",
+            params=_expand_params(expand),
+            cast_to=Product,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def update(
@@ -2647,14 +4774,19 @@ class Products:
         product_id: str,
         *,
         name: str | None = None,
-        description: str | _Unset | None = _UNSET,
-        marketing_features: list[str] | _Unset | None = _UNSET,
+        description: str | NotGiven | None = NOT_GIVEN,
+        marketing_features: list[str] | NotGiven | None = NOT_GIVEN,
         metadata: dict[str, str] | None = None,
         active: bool | None = None,
         allow_promotion_codes: bool | None = None,
-        default_price_id: str | _Unset | None = _UNSET,
+        default_price_id: str | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Product:
         """Patch mutable product fields, or archive the product.
 
         Pass only the fields you want to change. ``active=False``
@@ -2693,7 +4825,15 @@ class Products:
             "POST",
             f"/v1/products/{_p(product_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Product,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def list(
@@ -2701,19 +4841,55 @@ class Products:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Product]:
         """List products in reverse creation order.
 
         Expandable: ``prices``, ``stats``, ``default_price``.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_expand_params(expand) or {})
-        return self._t.request("GET", "/v1/products", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/products",
+            params=params,
+            cast_to=ListObject[Product],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Product]:
         """Walk every page of ``list()`` and yield each product."""
-        return paginate(self.list, page_size=page_size)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class Prices:
@@ -2732,7 +4908,7 @@ class Prices:
         unit_amount_decimal: str | int | Decimal | None = None,
         billing_scheme: str | None = None,
         tiers_mode: str | None = None,
-        tiers: list[dict[str, Any]] | None = None,
+        tiers: Sequence[PriceTierParam] | None = None,
         metadata: dict[str, str] | None = None,
         trial_days: int | None = None,
         trial_verification_cents: int | None = None,
@@ -2743,7 +4919,12 @@ class Prices:
         tax_behavior: str | None = None,
         usage_type: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Price:
         """Create a price for an existing product.
 
         Prices are append-only billing terms. Create a new Price when
@@ -2771,7 +4952,7 @@ class Prices:
         last charge, ``"prorated"`` the unused part of the current period.
         Both non-none modes also end access immediately, and both are still
         bounded by the refund window. Metered prices must leave this at
-        ``"none"`` — see below.
+        ``"none"`` (see below).
 
         ``usage_type`` selects the billing model. ``"licensed"`` (the
         default when ``None``) bills ``amount_cents`` per period
@@ -2791,7 +4972,7 @@ class Prices:
 
         ``unit_amount_decimal``
             A rate finer than one minor unit, in minor units, to 12 decimal
-            places. ``"0.02"`` is 0.02 cents, i.e. €0.0002 per unit — the
+            places. ``"0.02"`` is 0.02 cents, i.e. €0.0002 per unit: the
             canonical per-API-call price, and not expressible as an integer.
             Pass a ``str``, an ``int`` or a ``Decimal``; a ``float`` raises
             ``TypeError``, because a float cannot hold 0.0002 exactly and
@@ -2806,11 +4987,12 @@ class Prices:
             modes is a different bill, so the mode is required rather than
             defaulted. Each band is a dict: ``up_to`` (a positive int, or
             ``"inf"`` on the last band, which is mandatory because a bounded
-            top band cannot price the usage above it), plus ``unit_amount``
-            (whole minor units), ``unit_amount_decimal`` (same float rule as
-            above) and/or ``flat_amount`` charged once for reaching the band.
-            Write a free band as ``unit_amount=0``. A tiered price sends no
-            ``amount_cents``::
+            top band cannot price the usage above it), plus
+            ``unit_amount_cents`` (whole minor units), ``unit_amount_decimal``
+            (same float rule as above) and/or ``flat_amount_cents`` charged
+            once for reaching the band. Write a free band as
+            ``unit_amount_cents=0``. :class:`billkit.PriceTierParam` types a
+            band. A tiered price sends no ``amount_cents``::
 
                 client.prices.create(
                     product_id="prod_api",
@@ -2820,7 +5002,7 @@ class Prices:
                     billing_scheme="tiered",
                     tiers_mode="graduated",
                     tiers=[
-                        {"up_to": 1000, "unit_amount": 1},
+                        {"up_to": 1000, "unit_amount_cents": 1},
                         {"up_to": "inf", "unit_amount_decimal": "0.5"},
                     ],
                 )
@@ -2855,11 +5037,40 @@ class Prices:
             }
         )
         return self._t.request(
-            "POST", "/v1/prices", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/prices",
+            json_body=body,
+            cast_to=Price,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, price_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/prices/{_p(price_id)}")
+    def retrieve(
+        self,
+        price_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Price:
+        return self._t.request(
+            "GET",
+            f"/v1/prices/{_p(price_id)}",
+            cast_to=Price,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def update(
         self,
@@ -2870,10 +5081,15 @@ class Prices:
         tax_behavior: str | None = None,
         payment_methods: list[str] | None = None,
         refund_on_cancel: str | None = None,
-        refund_window_initial_days: int | _Unset | None = _UNSET,
-        refund_window_renewal_days: int | _Unset | None = _UNSET,
+        refund_window_initial_days: int | NotGiven | None = NOT_GIVEN,
+        refund_window_renewal_days: int | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Price:
         """Change what a price does next. Omitted fields are left alone.
 
         The dividing line is what a field decides. ``amount_cents``,
@@ -2926,7 +5142,15 @@ class Prices:
             "POST",
             f"/v1/prices/{_p(price_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Price,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def list(
@@ -2935,7 +5159,11 @@ class Prices:
         product_id: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Price]:
         """List prices, optionally narrowed to one product.
 
         ``product_id`` is applied server-side (``GET
@@ -2945,17 +5173,43 @@ class Prices:
         params = _list_params(limit=limit, starting_after=starting_after)
         if product_id is not None:
             params["product_id"] = product_id
-        return self._t.request("GET", "/v1/prices", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/prices",
+            params=params,
+            cast_to=ListObject[Price],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
-        self, *, product_id: str | None = None, page_size: int | None = None
-    ) -> Iterator[dict[str, Any]]:
+        self,
+        *,
+        product_id: str | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Price]:
         """Walk every page of ``list()`` and yield each price."""
-
-        def _bound(**kwargs: Any) -> dict[str, Any]:
-            return self.list(product_id=product_id, **kwargs)
-
-        return paginate(_bound, page_size=page_size)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                product_id=product_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class CheckoutSessions:
@@ -2971,14 +5225,19 @@ class CheckoutSessions:
         price_id: str,
         success_url: str,
         cancel_url: str,
-        method: str | None = None,
+        payment_method: str | None = None,
         country: str | None = None,
         coupon_code: str | None = None,
         trial_days_override: int | None = None,
         ui_mode: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> CheckoutSession:
         """Create a hosted checkout session.
 
         Pass **exactly one of** ``customer_id`` (existing Customer) or
@@ -2995,7 +5254,7 @@ class CheckoutSessions:
         after the charge exists. It never overwrites a country the
         customer already has.
 
-        ``method`` pins the Mollie payment method (``"creditcard"``,
+        ``payment_method`` pins the Mollie payment method (``"creditcard"``,
         ``"directdebit"``, ``"ideal"``, ``"eps"``, ``"applepay"`` or
         ``"paypal"``); ``None`` lets Mollie pick. ``coupon_code`` is
         atomically claimed at session creation. ``trial_days_override``
@@ -3022,7 +5281,7 @@ class CheckoutSessions:
           a short-lived ``client_secret`` (``url`` stays ``None``) for
           ``<CheckoutElement/>`` from ``@billkit-eu/js`` / ``@billkit-eu/react``
           to mount against, so the card form renders in your own page.
-          ``method`` must be omitted; it is chosen inside the element.
+          ``payment_method`` must be omitted; it is chosen inside the element.
 
         Either way tenant branding kicks in once the buyer reaches the
         post-purchase portal via ``billing_portal_sessions.create``.
@@ -3035,7 +5294,7 @@ class CheckoutSessions:
                 "price_id": price_id,
                 "success_url": success_url,
                 "cancel_url": cancel_url,
-                "method": method,
+                "payment_method": payment_method,
                 "country": country,
                 "coupon_code": coupon_code,
                 "trial_days_override": trial_days_override,
@@ -3047,11 +5306,37 @@ class CheckoutSessions:
             "POST",
             "/v1/checkout/sessions",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=CheckoutSession,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, session_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/checkout/sessions/{_p(session_id)}")
+    def retrieve(
+        self,
+        session_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> CheckoutSession:
+        return self._t.request(
+            "GET",
+            f"/v1/checkout/sessions/{_p(session_id)}",
+            cast_to=CheckoutSession,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
 
 class OneShotPayments:
@@ -3074,7 +5359,7 @@ class OneShotPayments:
         amount_cents: int,
         currency: str,
         success_url: str,
-        method: str | None = None,
+        payment_method: str | None = None,
         ui_mode: str | None = None,
         cancel_url: str | None = None,
         description: str | None = None,
@@ -3082,24 +5367,29 @@ class OneShotPayments:
         tax_behavior: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> OneShotPayment:
         """Create a one-off charge.
 
         ``ui_mode`` picks how the payer pays. ``"hosted"`` (the server
-        default when omitted) needs ``method`` and answers with a
+        default when omitted) needs ``payment_method`` and answers with a
         ``redirect_url`` on Mollie's hosted page. ``"embedded"`` must be
-        sent WITHOUT ``method``: no provider payment is created yet, and
+        sent WITHOUT ``payment_method``: no provider payment is created yet, and
         the response carries a short-lived ``client_secret`` (and a null
         ``redirect_url``) for the browser payment element
         (``mountOneShotPaymentElement`` in ``@billkit-eu/js``), where the
-        payer picks the method. ``method`` stays null until they confirm,
+        payer picks the method. ``payment_method`` stays null until they confirm,
         and ``expires_at`` is when the secret and the unconfirmed charge
         lapse. The secret is returned on create only; a retrieve reads it
         back as null. Events, refunds and the payment id are the same in
         both modes. The server is the authority on the method and
-        ``ui_mode`` combination and answers 422 for a wrong one.
+        ``ui_mode`` combination and answers 400 for a wrong one.
 
-        In hosted mode ``method`` is required and validated against the tenant's Mollie
+        In hosted mode ``payment_method`` is required and validated against the tenant's Mollie
         capability allowlist for ``currency`` (one-off-only methods like
         ``bancontact`` / ``banktransfer`` are allowed here even though they
         can't back a subscription; ``banktransfer`` in particular settles
@@ -3127,7 +5417,7 @@ class OneShotPayments:
                 "customer_id": customer_id,
                 "amount_cents": amount_cents,
                 "currency": currency,
-                "method": method,
+                "payment_method": payment_method,
                 "ui_mode": ui_mode,
                 "success_url": success_url,
                 "cancel_url": cancel_url,
@@ -3138,11 +5428,40 @@ class OneShotPayments:
             }
         )
         return self._t.request(
-            "POST", "/v1/checkout/one_shot", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/checkout/one_shot",
+            json_body=body,
+            cast_to=OneShotPayment,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, one_shot_payment_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}")
+    def retrieve(
+        self,
+        one_shot_payment_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> OneShotPayment:
+        return self._t.request(
+            "GET",
+            f"/v1/checkout/one_shot/{_p(one_shot_payment_id)}",
+            cast_to=OneShotPayment,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def list(
         self,
@@ -3151,7 +5470,11 @@ class OneShotPayments:
         starting_after: str | None = None,
         customer_id: str | None = None,
         status: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[OneShotPayment]:
         """List one-off payments, newest first.
 
         The counterpart of ``payments.list``, which lists subscription
@@ -3164,24 +5487,61 @@ class OneShotPayments:
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_drop_none({"customer_id": customer_id, "status": status}))
-        return self._t.request("GET", "/v1/checkout/one_shot", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/checkout/one_shot",
+            params=params,
+            cast_to=ListObject[OneShotPayment],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         customer_id: str | None = None,
         status: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[OneShotPayment]:
         """Walk every page of ``list()``; the filters are carried on each."""
-        return paginate(self.list, page_size=page_size, customer_id=customer_id, status=status)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                customer_id=customer_id,
+                status=status,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class Subscriptions:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, subscription_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+    def retrieve(
+        self,
+        subscription_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         """Fetch one subscription.
 
         Expandable: ``customer``, ``price``, ``refund_eligibility``.
@@ -3190,22 +5550,34 @@ class Subscriptions:
             "GET",
             f"/v1/subscriptions/{_p(subscription_id)}",
             params=_expand_params(expand),
+            cast_to=Subscription,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def list(
         self,
         *,
         customer_id: str | None = None,
-        status: str | None = None,
-        renewal_state: str | None = None,
+        status: str | Sequence[str] | None = None,
+        renewal_state: str | Sequence[str] | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Subscription]:
         """List subscriptions, newest first, optionally filtered.
 
-        ``status`` and ``renewal_state`` each take a comma-separated
-        list (``status="active,past_due"``). An unrecognised value is a
+        ``status`` and ``renewal_state`` each take a list
+        (``status=["active", "past_due"]``), sent comma-joined; one
+        string, commas included, is sent as given. An unrecognised value is a
         400 naming the ones that work, rather than being ignored.
 
         The two answer different questions, and confusing them is the
@@ -3226,63 +5598,154 @@ class Subscriptions:
             _drop_none(
                 {
                     "customer_id": customer_id,
-                    "status": status,
-                    "renewal_state": renewal_state,
+                    "status": _csv(status),
+                    "renewal_state": _csv(renewal_state),
                 }
             )
         )
         params.update(_expand_params(expand) or {})
-        return self._t.request("GET", "/v1/subscriptions", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/subscriptions",
+            params=params,
+            cast_to=ListObject[Subscription],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
         customer_id: str | None = None,
-        status: str | None = None,
-        renewal_state: str | None = None,
-        page_size: int | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        status: str | Sequence[str] | None = None,
+        renewal_state: str | Sequence[str] | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Subscription]:
         """Walk every page of ``list()`` and yield each subscription.
 
         The filters are carried onto every page request, so a filtered
         walk narrows server-side instead of paging the whole history and
         discarding rows locally.
         """
-
-        def _bound(**kwargs: Any) -> dict[str, Any]:
-            return self.list(
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
                 customer_id=customer_id,
                 status=status,
                 renewal_state=renewal_state,
-                **kwargs,
-            )
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
-        return paginate(_bound, page_size=page_size)
+    def cancel(
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
+        """Cancel at the end of the current period.
 
-    def cancel(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+        While a renewal payment for the subscription is still settling,
+        this, ``pause`` and ``update`` raise :class:`ConflictError` (``409
+        operation_pending``, ``reason == "renewal_processing"``) whose
+        message names when to retry.
+        """
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/cancel",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def pause(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def pause(
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/pause",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def resume(self, subscription_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def resume(
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/resume",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def reactivate(
-        self, subscription_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        subscription_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         """Reactivate a subscription that's been canceled but is still
         inside its paid-through period.
 
@@ -3294,14 +5757,42 @@ class Subscriptions:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/reactivate",
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def preview_update(self, subscription_id: str, *, target_price_id: str) -> dict[str, Any]:
+    def preview_update(
+        self,
+        subscription_id: str,
+        *,
+        target_price_id: str,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> PlanChangePreview:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/preview_update",
             json_body={"target_price_id": target_price_id},
+            cast_to=PlanChangePreview,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def update(
@@ -3310,12 +5801,25 @@ class Subscriptions:
         *,
         target_price_id: str,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Subscription:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/update",
             json_body={"target_price_id": target_price_id},
-            idempotency_key=idempotency_key,
+            cast_to=Subscription,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def reauthorize_payment_method(
@@ -3324,12 +5828,25 @@ class Subscriptions:
         *,
         return_url: str,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Reauthorization:
         return self._t.request(
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/reauthorize_payment_method",
             json_body={"return_url": return_url},
-            idempotency_key=idempotency_key,
+            cast_to=Reauthorization,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def create_usage_record(
@@ -3341,7 +5858,12 @@ class Subscriptions:
         identifier: str | None = None,
         metadata: dict[str, str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> UsageRecord:
         """Report consumption against a metered subscription.
 
         Only valid when the subscription's price is
@@ -3363,7 +5885,7 @@ class Subscriptions:
             inside :mod:`billkit` can never double-count.
 
         ``identifier``
-            Covers a retry of *your own call* — a job runner replaying a
+            Covers a retry of *your own call*: a job runner replaying a
             task, a queue delivering twice, your code re-invoking after its
             own timeout. Those arrive at the API as a genuinely new request
             with a new key, so the transport-level key cannot see them.
@@ -3386,7 +5908,15 @@ class Subscriptions:
             "POST",
             f"/v1/subscriptions/{_p(subscription_id)}/usage_records",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=UsageRecord,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def list_usage_records(
@@ -3396,7 +5926,11 @@ class Subscriptions:
         invoice_id: str | None = None,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[UsageRecord]:
         """List usage records for one subscription.
 
         ``invoice_id`` filters by billing state: ``"pending"`` selects
@@ -3408,7 +5942,16 @@ class Subscriptions:
         if invoice_id is not None:
             params["invoice_id"] = invoice_id
         return self._t.request(
-            "GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_records", params=params
+            "GET",
+            f"/v1/subscriptions/{_p(subscription_id)}/usage_records",
+            params=params,
+            cast_to=ListObject[UsageRecord],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def iter_usage_records(
@@ -3416,16 +5959,37 @@ class Subscriptions:
         subscription_id: str,
         *,
         invoice_id: str | None = None,
-        page_size: int | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[UsageRecord]:
         """Walk every page of ``list_usage_records()`` for one subscription."""
+        return paginate(
+            lambda cursor: self.list_usage_records(
+                subscription_id,
+                limit=limit,
+                starting_after=cursor,
+                invoice_id=invoice_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
-        def _bound(**kwargs: Any) -> dict[str, Any]:
-            return self.list_usage_records(subscription_id, invoice_id=invoice_id, **kwargs)
-
-        return paginate(_bound, page_size=page_size)
-
-    def retrieve_usage_summary(self, subscription_id: str) -> dict[str, Any]:
+    def retrieve_usage_summary(
+        self,
+        subscription_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> UsageSummary:
         """Price the usage that is pending, before the close bills it.
 
         :meth:`list_usage_records` with ``invoice_id="pending"`` tells you
@@ -3444,7 +6008,17 @@ class Subscriptions:
         ``open_invoice_id`` names an earlier cycle that is invoiced and
         still unsettled; while one is open, this period cannot be charged.
         """
-        return self._t.request("GET", f"/v1/subscriptions/{_p(subscription_id)}/usage_summary")
+        return self._t.request(
+            "GET",
+            f"/v1/subscriptions/{_p(subscription_id)}/usage_summary",
+            cast_to=UsageSummary,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
 
 class Refunds:
@@ -3460,13 +6034,24 @@ class Refunds:
         amount_cents: int | None = None,
         reason: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        # Pass exactly one target: ``payment_id`` / ``subscription_id`` for a
-        # subscription-bound charge, or ``one_shot_payment_id`` for a
-        # mandate-less one-shot. The server rejects an ambiguous combination.
-        # ``amount_cents`` is optional: omit it to refund the whole remaining
-        # balance, or pass a smaller amount for a partial refund (a payment may
-        # carry several partials up to the charged amount).
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Refund:
+        """Refund a payment, in full or (with ``amount_cents``) in part.
+
+        Name the charge with exactly one of ``payment_id``,
+        ``subscription_id`` (its latest payment) or
+        ``one_shot_payment_id``. A payment that is not ``paid``, or is
+        outside its refund window, is a ``409`` :class:`ConflictError`
+        with ``code`` ``state_conflict``: the request was well formed, the
+        payment just cannot take it. So are the settled facts
+        ``charge_already_refunded``, ``charge_disputed`` and
+        ``refund_duplicate``. An amount above what is left is a 400. A
+        refund is usually ``pending`` on return; handle ``refund.failed``.
+        """
         body = _drop_none(
             {
                 "payment_id": payment_id,
@@ -3477,27 +6062,86 @@ class Refunds:
             }
         )
         return self._t.request(
-            "POST", "/v1/refunds", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/refunds",
+            json_body=body,
+            cast_to=Refund,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, refund_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/refunds/{_p(refund_id)}")
+    def retrieve(
+        self,
+        refund_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Refund:
+        return self._t.request(
+            "GET",
+            f"/v1/refunds/{_p(refund_id)}",
+            cast_to=Refund,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Refund]:
         return self._t.request(
             "GET",
             "/v1/refunds",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[Refund],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Refund]:
         """Walk every page of ``list()`` and yield each refund."""
-        return paginate(self.list, page_size=page_size)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class Disputes:
@@ -3513,47 +6157,275 @@ class Disputes:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, dispute_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/disputes/{_p(dispute_id)}")
+    def retrieve(
+        self,
+        dispute_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Dispute:
+        return self._t.request(
+            "GET",
+            f"/v1/disputes/{_p(dispute_id)}",
+            cast_to=Dispute,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
         payment_id: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Dispute]:
         """List chargebacks raised against your payments, newest first.
 
-        ``status`` takes a comma-separated list of ``open`` / ``won``.
+        ``status`` takes a list of ``open`` / ``won`` (or one string).
         There is no ``lost``: the provider gives no signal for one, so a
         dispute you lost stays ``open``. ``payment_id`` matches
         subscription payments only, not one-off charges.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
-        params.update(_drop_none({"status": status, "payment_id": payment_id}))
-        return self._t.request("GET", "/v1/disputes", params=params)
+        params.update(_drop_none({"status": _csv(status), "payment_id": payment_id}))
+        return self._t.request(
+            "GET",
+            "/v1/disputes",
+            params=params,
+            cast_to=ListObject[Dispute],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
-        status: str | None = None,
+        status: str | Sequence[str] | None = None,
         payment_id: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Dispute]:
         """Walk every page of ``list()`` and yield each dispute.
 
         Filters are carried onto every page request.
         """
-        return paginate(self.list, page_size=page_size, status=status, payment_id=payment_id)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                status=status,
+                payment_id=payment_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
+
+
+class TestClocks:
+    """Test clocks: virtual time for test mode.
+
+    Create a clock, create customers with ``test_clock_id=clock["id"]``, then
+    :meth:`advance` it to make trials end, renewals fall due and dunning run
+    for those customers only, without waiting. Every route is test mode
+    only; a live key gets :class:`~billkit.InvalidRequestError`.
+    """
+
+    def __init__(self, transport: _SyncRequester) -> None:
+        self._t = transport
+
+    def create(
+        self,
+        *,
+        frozen_time: int,
+        name: str | None = None,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TestClock:
+        """Create a clock frozen at ``frozen_time`` (Unix seconds)."""
+        body = _drop_none({"frozen_time": frozen_time, "name": name})
+        return self._t.request(
+            "POST",
+            "/v1/test_clocks",
+            json_body=body,
+            cast_to=TestClock,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
+        )
+
+    def retrieve(
+        self,
+        test_clock_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TestClock:
+        return self._t.request(
+            "GET",
+            f"/v1/test_clocks/{_p(test_clock_id)}",
+            cast_to=TestClock,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
+
+    def advance(
+        self,
+        test_clock_id: str,
+        *,
+        frozen_time: int,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TestClock:
+        """Move the clock forward to ``frozen_time`` and run what falls due.
+
+        ``frozen_time`` must be later than the clock's current time. The
+        work is done before this returns. The SDK always sends an
+        ``Idempotency-Key``, so its own retries replay rather than advance
+        twice.
+        """
+        return self._t.request(
+            "POST",
+            f"/v1/test_clocks/{_p(test_clock_id)}/advance",
+            json_body={"frozen_time": frozen_time},
+            cast_to=TestClock,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
+        )
+
+    def delete(
+        self,
+        test_clock_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> DeletedResource:
+        """Delete a clock. Returns ``{"id", "object": "test_clock", "deleted": True}``.
+
+        Its customers are not deleted; they return to real time.
+        """
+        return self._t.request(
+            "DELETE",
+            f"/v1/test_clocks/{_p(test_clock_id)}",
+            cast_to=DeletedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
+
+    def list(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[TestClock]:
+        """List test clocks, newest first."""
+        return self._t.request(
+            "GET",
+            "/v1/test_clocks",
+            params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[TestClock],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
+
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[TestClock]:
+        """Walk every page of ``list()`` and yield each clock."""
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class WebhookEndpoints:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def list_event_types(self) -> dict[str, Any]:
+    def list_event_types(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> EventTypeList:
         """Every event type this deployment can deliver, plus the wildcard.
 
         ``enabled_events`` rejects anything not on this list, so read it
@@ -3561,7 +6433,17 @@ class WebhookEndpoints:
         registration and leaves you with an endpoint that never fires.
         Read-only and the same for every caller.
         """
-        return self._t.request("GET", "/v1/webhook_endpoints/event_types")
+        return self._t.request(
+            "GET",
+            "/v1/webhook_endpoints/event_types",
+            cast_to=EventTypeList,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def create(
         self,
@@ -3570,7 +6452,12 @@ class WebhookEndpoints:
         enabled_events: list[str] | None = None,
         description: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
         body = _drop_none(
             {"url": url, "enabled_events": enabled_events, "description": description}
         )
@@ -3578,11 +6465,37 @@ class WebhookEndpoints:
             "POST",
             "/v1/webhook_endpoints",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, endpoint_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/webhook_endpoints/{_p(endpoint_id)}")
+    def retrieve(
+        self,
+        endpoint_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
+        return self._t.request(
+            "GET",
+            f"/v1/webhook_endpoints/{_p(endpoint_id)}",
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def update(
         self,
@@ -3590,10 +6503,15 @@ class WebhookEndpoints:
         *,
         url: str | None = None,
         enabled_events: list[str] | None = None,
-        description: str | _Unset | None = _UNSET,
+        description: str | NotGiven | None = NOT_GIVEN,
         status: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
         """Patch an endpoint, or stop delivery with ``status="disabled"``.
 
         Disabling keeps the endpoint, its signing secret and its delivery
@@ -3616,10 +6534,27 @@ class WebhookEndpoints:
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def delete(self, endpoint_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def delete(
+        self,
+        endpoint_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> DeletedResource:
         """Delete an endpoint. Returns ``{"deleted": True}``, not the endpoint.
 
         A URL registered by mistake should not be a permanent fixture of
@@ -3635,16 +6570,39 @@ class WebhookEndpoints:
         return self._t.request(
             "DELETE",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}",
-            idempotency_key=idempotency_key,
+            cast_to=DeletedResource,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def rotate_secret(
-        self, endpoint_id: str, *, idempotency_key: str | None = None
-    ) -> dict[str, Any]:
+        self,
+        endpoint_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookEndpoint:
         return self._t.request(
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/rotate_secret",
-            idempotency_key=idempotency_key,
+            cast_to=WebhookEndpoint,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def list(
@@ -3652,16 +6610,46 @@ class WebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[WebhookEndpoint]:
         return self._t.request(
             "GET",
             "/v1/webhook_endpoints",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[WebhookEndpoint],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[WebhookEndpoint]:
         """Walk every page of ``list()`` and yield each endpoint."""
-        return paginate(self.list, page_size=page_size)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
     def list_deliveries(
         self,
@@ -3669,7 +6657,11 @@ class WebhookEndpoints:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[WebhookDelivery]:
         """List per-attempt delivery records for one endpoint.
 
         Useful when a tenant's receiver is failing. Surfaces the
@@ -3680,19 +6672,50 @@ class WebhookEndpoints:
             "GET",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[WebhookDelivery],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def iter_deliveries(
-        self, endpoint_id: str, *, page_size: int | None = None
-    ) -> Iterator[dict[str, Any]]:
+        self,
+        endpoint_id: str,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[WebhookDelivery]:
         """Walk every page of ``list_deliveries`` for one endpoint."""
+        return paginate(
+            lambda cursor: self.list_deliveries(
+                endpoint_id,
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
-        def _bound(**kwargs: Any) -> dict[str, Any]:
-            return self.list_deliveries(endpoint_id, **kwargs)
-
-        return paginate(_bound, page_size=page_size)
-
-    def retrieve_delivery(self, endpoint_id: str, delivery_id: str) -> dict[str, Any]:
+    def retrieve_delivery(
+        self,
+        endpoint_id: str,
+        delivery_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> WebhookDelivery:
         """Fetch one delivery record.
 
         The single-row counterpart to :meth:`list_deliveries`. Carries
@@ -3703,6 +6726,13 @@ class WebhookEndpoints:
         return self._t.request(
             "GET",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}",
+            cast_to=WebhookDelivery,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
     def redeliver(
@@ -3711,7 +6741,12 @@ class WebhookEndpoints:
         delivery_id: str,
         *,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> WebhookDelivery:
         """Re-enqueue a delivery row for the dispatcher.
 
         Idempotent: a row already in ``delivered`` returns unchanged.
@@ -3722,7 +6757,15 @@ class WebhookEndpoints:
         return self._t.request(
             "POST",
             f"/v1/webhook_endpoints/{_p(endpoint_id)}/deliveries/{_p(delivery_id)}/redeliver",
-            idempotency_key=idempotency_key,
+            cast_to=WebhookDelivery,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
@@ -3730,35 +6773,93 @@ class Events:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, event_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/events/{_p(event_id)}")
+    def retrieve(
+        self,
+        event_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Event:
+        return self._t.request(
+            "GET",
+            f"/v1/events/{_p(event_id)}",
+            cast_to=Event,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-        type: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        type: str | Sequence[str] | None = None,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Event]:
         """List events, newest first.
+
+        ``type`` narrows to one event type or a list of them
+        (``type=["invoice.paid", "invoice.payment_failed"]``), sent
+        comma-joined. An unknown type is a 400.
 
         Expandable: ``customer``. ``events.retrieve`` accepts none.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
-        if type is not None:
-            params["type"] = type
+        if (types := _csv(type)) is not None:
+            params["type"] = types
         params.update(_expand_params(expand) or {})
-        return self._t.request("GET", "/v1/events", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/events",
+            params=params,
+            cast_to=ListObject[Event],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
-        self, *, page_size: int | None = None, type: str | None = None
-    ) -> Iterator[dict[str, Any]]:
+        self,
+        *,
+        type: str | Sequence[str] | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Event]:
         """Walk every page of ``list()`` and yield each event.
 
         Pass ``type="customer.created"`` to filter at the server.
         """
-        return paginate(self.list, page_size=page_size, type=type)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                type=type,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class Tenant:
@@ -3766,12 +6867,13 @@ class Tenant:
 
     Today exposes:
 
-    * :meth:`capabilities`: cached Mollie profile shape.
-    * :meth:`portal_branding` / :meth:`set_portal_branding`: the
+    * :meth:`retrieve_capabilities`: what your payment provider account
+      can do (methods, currencies), as BillKit last read it.
+    * :meth:`retrieve_portal_branding` / :meth:`set_portal_branding`: the
       customer-facing portal chrome (business name, support email,
       logo URL, theme tokens, capability flags).
-    * :meth:`billing_profile` / :meth:`set_billing_profile`: your own
-      registered country, VAT id and invoice address.
+    * :meth:`retrieve_billing_profile` / :meth:`set_billing_profile`: your
+      own registered country, VAT id and invoice address.
     * :meth:`export`: everything in the account as one JSON document.
     * :meth:`rotate_provider_credential`: replace the encrypted
       Mollie API key without re-running ``provision_tenant --force``.
@@ -3780,45 +6882,100 @@ class Tenant:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def capabilities(self) -> dict[str, Any]:
-        return self._t.request("GET", "/v1/tenant/capabilities")
+    def retrieve_capabilities(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TenantCapabilities:
+        return self._t.request(
+            "GET",
+            "/v1/tenant/capabilities",
+            cast_to=TenantCapabilities,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def portal_branding(self) -> dict[str, Any]:
-        return self._t.request("GET", "/v1/tenant/portal_branding")
+    def retrieve_portal_branding(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TenantPortalBranding:
+        return self._t.request(
+            "GET",
+            "/v1/tenant/portal_branding",
+            cast_to=TenantPortalBranding,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def set_portal_branding(
         self,
         *,
-        business_name: str | None = None,
-        support_email: str | None = None,
-        logo_url: str | None = None,
-        theme: dict[str, Any] | None = None,
-        capabilities: dict[str, Any] | None = None,
+        business_name: str | NotGiven | None = NOT_GIVEN,
+        support_email: str | NotGiven | None = NOT_GIVEN,
+        logo_url: str | NotGiven | None = NOT_GIVEN,
+        theme: dict[str, Any] | NotGiven | None = NOT_GIVEN,
+        capabilities: dict[str, Any] | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
-        """Partial-update the portal branding row.
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TenantPortalBranding:
+        """Change the billing portal's branding. Only the keywords you pass change.
 
-        Unset fields are left alone: an explicit ``None`` is **not** sent,
-        it is dropped like any other omitted keyword. Clear a field by
-        sending an empty value for it.
+        ``None`` passed explicitly **clears** a field (sent as a JSON null),
+        so the portal falls back to its default for it; omit a keyword to
+        leave it alone. ``logo_url`` must use ``https``. The portal is shared
+        by live and test mode, so this needs a live-mode key. (0.x dropped an
+        explicit ``None`` here, which left no way to clear a field.)
         """
-        body = _drop_none(
-            {
-                "business_name": business_name,
-                "support_email": support_email,
-                "logo_url": logo_url,
-                "theme": theme,
-                "capabilities": capabilities,
-            }
+        body = _put_clearable(
+            {},
+            business_name=business_name,
+            support_email=support_email,
+            logo_url=logo_url,
+            theme=theme,
+            capabilities=capabilities,
         )
         return self._t.request(
             "POST",
             "/v1/tenant/portal_branding",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TenantPortalBranding,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def billing_profile(self) -> dict[str, Any]:
+    def retrieve_billing_profile(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TenantBillingProfile:
         """Read your own registered country and VAT number.
 
         These are what your customers' VAT is decided against, so check
@@ -3829,20 +6986,35 @@ class Tenant:
         exactly the case worth spotting. ``vat_id`` has no effective
         counterpart, because nothing can stand in for a registration.
         """
-        return self._t.request("GET", "/v1/tenant/billing_profile")
+        return self._t.request(
+            "GET",
+            "/v1/tenant/billing_profile",
+            cast_to=TenantBillingProfile,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def set_billing_profile(
         self,
         *,
         country_code: str,
-        vat_id: str | _Unset | None = _UNSET,
-        address_line1: str | _Unset | None = _UNSET,
-        address_line2: str | _Unset | None = _UNSET,
-        postal_code: str | _Unset | None = _UNSET,
-        city: str | _Unset | None = _UNSET,
-        registration_number: str | _Unset | None = _UNSET,
+        vat_id: str | NotGiven | None = NOT_GIVEN,
+        address_line1: str | NotGiven | None = NOT_GIVEN,
+        address_line2: str | NotGiven | None = NOT_GIVEN,
+        postal_code: str | NotGiven | None = NOT_GIVEN,
+        city: str | NotGiven | None = NOT_GIVEN,
+        registration_number: str | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TenantBillingProfile:
         """Set the seller identity: jurisdiction, VAT id, invoice address.
 
         ``country_code`` is required on every call: there is nothing to
@@ -3877,16 +7049,31 @@ class Tenant:
             ("city", city),
             ("registration_number", registration_number),
         ):
-            if not isinstance(value, _Unset):
+            if not isinstance(value, NotGiven):
                 body[key] = value
         return self._t.request(
             "POST",
             "/v1/tenant/billing_profile",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TenantBillingProfile,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def export(self) -> bytes:
+    def export(
+        self,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> bytes:
         """Download everything in the account as one JSON document.
 
         .. code-block:: python
@@ -3900,13 +7087,24 @@ class Tenant:
         its ``GET`` route returns, and ``billkit_export_version`` names
         the shape.
 
-        It is ``application/json`` streamed inline, with no redirect, and it
-        can be large, so write it to a file rather than holding it in
-        memory. Test and live data export separately: you get whichever
+        The server sends ``application/json`` inline, with no redirect, and
+        this method returns the whole file as ``bytes``: it is read into
+        memory before the call returns, so a large account needs the memory
+        for all of it. Write it straight to a file and drop the reference
+        rather than keeping it around. Test and live data export separately: you get whichever
         mode the calling key belongs to. Nothing is changed, but the
         access is recorded in your audit log.
         """
-        return self._t.request_bytes("GET", "/v1/tenant/export")
+        return self._t.request_bytes(
+            "GET",
+            "/v1/tenant/export",
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def rotate_provider_credential(
         self,
@@ -3915,7 +7113,12 @@ class Tenant:
         mode: str | None = None,
         provider: str = "mollie",
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TenantProviderCredential:
         """Rotate the encrypted provider credential for this tenant.
 
         ``api_key`` is encrypted server-side; nothing is logged.
@@ -3928,7 +7131,15 @@ class Tenant:
             "POST",
             "/v1/tenant/provider_credential",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TenantProviderCredential,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
@@ -3942,47 +7153,110 @@ class Coupons:
         self,
         *,
         code: str,
-        discount_type: str,
-        discount_value: int,
-        duration: str,
+        percent_off: int | float | Decimal | None = None,
+        amount_off_cents: int | None = None,
+        discount_type: str | None = None,
+        duration: str | None = None,
         duration_in_months: int | None = None,
         max_redemptions: int | None = None,
         redeem_by: int | None = None,
         applies_to_price_ids: list[str] | None = None,
         min_amount_cents: int | None = None,
+        currency: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Coupon:
+        """Create a promotional code.
+
+        Pass exactly one of ``percent_off`` (more than 0 and at most 100,
+        with up to two decimal places: ``10``, ``12.5`` or
+        ``Decimal("33.33")``) and
+        ``amount_off_cents`` (a fixed amount in minor units). The API infers
+        ``discount_type`` (``"percent"`` or ``"fixed_amount"``) from which
+        one you sent; pass it as well only if you want that checked, and a
+        disagreement is a 400.
+
+        ``duration`` is ``"once"`` (the API's default), ``"forever"`` or
+        ``"repeating"``, the last with ``duration_in_months``.
+
+        ``currency`` (ISO 4217, ``"EUR"``) is the currency of
+        ``amount_off_cents`` and of ``min_amount_cents``; the coupon then
+        applies only to prices in it. Required with either when the account
+        has more than one currency enabled, otherwise it defaults to the one
+        currency. A percent coupon with no minimum needs none and applies in
+        any currency.
+        """
         body = _drop_none(
             {
                 "code": code,
+                "percent_off": _percent(percent_off),
+                "amount_off_cents": amount_off_cents,
                 "discount_type": discount_type,
-                "discount_value": discount_value,
                 "duration": duration,
                 "duration_in_months": duration_in_months,
                 "max_redemptions": max_redemptions,
                 "redeem_by": redeem_by,
                 "applies_to_price_ids": applies_to_price_ids,
                 "min_amount_cents": min_amount_cents,
+                "currency": currency,
             }
         )
         return self._t.request(
-            "POST", "/v1/coupons", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/coupons",
+            json_body=body,
+            cast_to=Coupon,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, coupon_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/coupons/{_p(coupon_id)}")
+    def retrieve(
+        self,
+        coupon_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Coupon:
+        return self._t.request(
+            "GET",
+            f"/v1/coupons/{_p(coupon_id)}",
+            cast_to=Coupon,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def update(
         self,
         coupon_id: str,
         *,
         active: bool | None = None,
-        max_redemptions: int | _Unset | None = _UNSET,
-        redeem_by: int | _Unset | None = _UNSET,
-        applies_to_price_ids: list[str] | _Unset | None = _UNSET,
-        min_amount_cents: int | _Unset | None = _UNSET,
+        max_redemptions: int | NotGiven | None = NOT_GIVEN,
+        redeem_by: int | NotGiven | None = NOT_GIVEN,
+        applies_to_price_ids: list[str] | NotGiven | None = NOT_GIVEN,
+        min_amount_cents: int | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Coupon:
         """Patch a coupon's limits, or withdraw it with ``active=False``.
 
         A withdrawn code is refused at checkout while the coupon stays
@@ -4008,7 +7282,15 @@ class Coupons:
             "POST",
             f"/v1/coupons/{_p(coupon_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=Coupon,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def validate(
@@ -4017,7 +7299,14 @@ class Coupons:
         code: str,
         price_id: str | None = None,
         amount_cents: int | None = None,
-    ) -> dict[str, Any]:
+        currency: str | None = None,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> CouponValidation:
         """Server-side dry-run of a coupon redemption.
 
         Returns the discount math without atomically claiming the
@@ -4028,29 +7317,77 @@ class Coupons:
         active, not exhausted, not expired). Supply ``price_id`` to also
         check the coupon's ``applies_to_price_ids`` restriction, and
         ``amount_cents`` to get the discount math plus the
-        ``min_amount_cents`` check.
+        ``min_amount_cents`` check. ``currency`` names the charge's
+        currency when no ``price_id`` does; a coupon in another currency
+        comes back ``valid: False`` with ``reason ==
+        "coupon_currency_mismatch"``.
         """
         body: dict[str, Any] = {"code": code}
         if price_id is not None:
             body["price_id"] = price_id
         if amount_cents is not None:
             body["amount_cents"] = amount_cents
-        return self._t.request("POST", "/v1/coupons/validate", json_body=body)
+        if currency is not None:
+            body["currency"] = currency
+        return self._t.request(
+            "POST",
+            "/v1/coupons/validate",
+            json_body=body,
+            cast_to=CouponValidation,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
+        )
 
     def list(
         self,
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Coupon]:
         return self._t.request(
             "GET",
             "/v1/coupons",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[Coupon],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
-        return paginate(self.list, page_size=page_size)
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Coupon]:
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class TaxRates:
@@ -4067,7 +7404,12 @@ class TaxRates:
         display_name: str | None = None,
         inclusive: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TaxRate:
         body = _drop_none(
             {
                 "country_code": country_code,
@@ -4077,22 +7419,56 @@ class TaxRates:
             }
         )
         return self._t.request(
-            "POST", "/v1/tax_rates", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/tax_rates",
+            json_body=body,
+            cast_to=TaxRate,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, tax_rate_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/tax_rates/{_p(tax_rate_id)}")
+    def retrieve(
+        self,
+        tax_rate_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> TaxRate:
+        return self._t.request(
+            "GET",
+            f"/v1/tax_rates/{_p(tax_rate_id)}",
+            cast_to=TaxRate,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def update(
         self,
         tax_rate_id: str,
         *,
         rate_basis_points: int | None = None,
-        display_name: str | _Unset | None = _UNSET,
+        display_name: str | NotGiven | None = NOT_GIVEN,
         inclusive: bool | None = None,
         active: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> TaxRate:
         """Correct a rate, retire it with ``active=False``, or bring one back.
 
         Retiring is how you stop charging VAT in a country. The rate
@@ -4115,7 +7491,15 @@ class TaxRates:
             "POST",
             f"/v1/tax_rates/{_p(tax_rate_id)}",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=TaxRate,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def list(
@@ -4123,15 +7507,45 @@ class TaxRates:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[TaxRate]:
         return self._t.request(
             "GET",
             "/v1/tax_rates",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[TaxRate],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
-        return paginate(self.list, page_size=page_size)
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[TaxRate]:
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class Invoices:
@@ -4147,16 +7561,42 @@ class Invoices:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, invoice_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+    def retrieve(
+        self,
+        invoice_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Invoice:
         """Fetch one invoice, line items included.
 
         Expandable: ``customer``.
         """
         return self._t.request(
-            "GET", f"/v1/invoices/{_p(invoice_id)}", params=_expand_params(expand)
+            "GET",
+            f"/v1/invoices/{_p(invoice_id)}",
+            params=_expand_params(expand),
+            cast_to=Invoice,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def retrieve_pdf(self, invoice_id: str) -> bytes:
+    def retrieve_pdf(
+        self,
+        invoice_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> bytes:
         """Download the rendered invoice PDF as raw bytes.
 
         .. code-block:: python
@@ -4166,7 +7606,7 @@ class Invoices:
 
         Blob-backed deployments stream the bytes inline; S3-backed ones
         answer ``302`` to a presigned URL, which the transport follows
-        under the SDK's own timeout and retry policy — so both storage
+        under the SDK's own timeout and retry policy, so both storage
         adapters look identical from here.
 
         Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
@@ -4175,9 +7615,28 @@ class Invoices:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured invoice for tenants who render their own.
         """
-        return self._t.request_bytes("GET", f"/v1/invoices/{_p(invoice_id)}/pdf")
+        return self._t.request_bytes(
+            "GET",
+            f"/v1/invoices/{_p(invoice_id)}/pdf",
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def send_email(self, invoice_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def send_email(
+        self,
+        invoice_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> InvoiceEmail:
         """Send the customer their invoice again.
 
         The same tenant-branded "your invoice is ready" email, with a
@@ -4194,7 +7653,15 @@ class Invoices:
         return self._t.request(
             "POST",
             f"/v1/invoices/{_p(invoice_id)}/email",
-            idempotency_key=idempotency_key,
+            cast_to=InvoiceEmail,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def list(
@@ -4206,15 +7673,19 @@ class Invoices:
         subscription_id: str | None = None,
         payment_id: str | None = None,
         status: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Invoice]:
         """List invoices, newest first. Line items are left out here.
 
         ``customer_id``, ``subscription_id`` and ``payment_id`` each
         narrow to one, which is how you ask "show me this customer's
         invoices" or "which invoice did this charge produce" without
-        paging the whole account. ``status`` takes one of ``draft``,
-        ``open``, ``paid``, ``void``, ``uncollectible``.
+        paging the whole account. ``status`` takes one of ``open``,
+        ``paid``, ``void``, ``uncollectible``; anything else is a 400.
 
         Expandable: ``customer``.
         """
@@ -4230,25 +7701,50 @@ class Invoices:
             )
         )
         params.update(_expand_params(expand) or {})
-        return self._t.request("GET", "/v1/invoices", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/invoices",
+            params=params,
+            cast_to=ListObject[Invoice],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         customer_id: str | None = None,
         subscription_id: str | None = None,
         payment_id: str | None = None,
         status: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Invoice]:
         """Walk every page of ``list()``; filters are carried on each."""
         return paginate(
-            self.list,
-            page_size=page_size,
-            customer_id=customer_id,
-            subscription_id=subscription_id,
-            payment_id=payment_id,
-            status=status,
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                customer_id=customer_id,
+                subscription_id=subscription_id,
+                payment_id=payment_id,
+                status=status,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
         )
 
     def void(
@@ -4257,17 +7753,22 @@ class Invoices:
         *,
         reason: str | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> Invoice:
         """Void an invoice: state that the sale was never owed.
 
-        The invoice keeps its number and stays readable — a gapless
-        series cannot lose a row — and stops being a receivable. Use it
+        The invoice keeps its number and stays readable (a gapless
+        series cannot lose a row) and stops being a receivable. Use it
         for an invoice that should not have been issued.
 
         A **paid** invoice is refused with :class:`ConflictError` whose
         ``code`` is ``invoice_not_voidable``. That is deliberate: once
         the money has moved, "never owed" is false, and the document that
-        reverses a real sale is a credit note — refund the payment and
+        reverses a real sale is a credit note. Refund the payment and
         one is issued when the refund settles.
 
         Idempotent: voiding an already-void invoice returns it unchanged.
@@ -4279,12 +7780,20 @@ class Invoices:
             "POST",
             f"/v1/invoices/{_p(invoice_id)}/void",
             json_body=_drop_none({"reason": reason}),
-            idempotency_key=idempotency_key,
+            cast_to=Invoice,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
 class CreditNotes:
-    """Read-only access to credit notes — the documents that reverse an
+    """Read-only access to credit notes, the documents that reverse an
     issued invoice.
 
     There is no create. A credit note is issued for you when a refund
@@ -4297,10 +7806,36 @@ class CreditNotes:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, credit_note_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/credit_notes/{_p(credit_note_id)}")
+    def retrieve(
+        self,
+        credit_note_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> CreditNote:
+        return self._t.request(
+            "GET",
+            f"/v1/credit_notes/{_p(credit_note_id)}",
+            cast_to=CreditNote,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def retrieve_pdf(self, credit_note_id: str) -> bytes:
+    def retrieve_pdf(
+        self,
+        credit_note_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> bytes:
         """Download the rendered credit note PDF as raw bytes.
 
         .. code-block:: python
@@ -4310,7 +7845,7 @@ class CreditNotes:
 
         Blob-backed deployments stream the bytes inline; S3-backed ones
         answer ``302`` to a presigned URL, which the transport follows
-        under the SDK's own timeout and retry policy — so both storage
+        under the SDK's own timeout and retry policy, so both storage
         adapters look identical from here.
 
         Deployments with ``INVOICE_PDF_ENABLED=false`` never render one
@@ -4319,7 +7854,16 @@ class CreditNotes:
         ``"rendering_pending"``; :meth:`retrieve` still returns the
         structured credit note for tenants who render their own.
         """
-        return self._t.request_bytes("GET", f"/v1/credit_notes/{_p(credit_note_id)}/pdf")
+        return self._t.request_bytes(
+            "GET",
+            f"/v1/credit_notes/{_p(credit_note_id)}/pdf",
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def list(
         self,
@@ -4328,7 +7872,11 @@ class CreditNotes:
         starting_after: str | None = None,
         invoice_id: str | None = None,
         customer_id: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[CreditNote]:
         """One page of credit notes, newest first.
 
         ``invoice_id`` answers "was this sale credited, and by how much",
@@ -4339,17 +7887,43 @@ class CreditNotes:
         for key, value in (("invoice_id", invoice_id), ("customer_id", customer_id)):
             if value is not None:
                 params[key] = value
-        return self._t.request("GET", "/v1/credit_notes", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/credit_notes",
+            params=params,
+            cast_to=ListObject[CreditNote],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         invoice_id: str | None = None,
         customer_id: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[CreditNote]:
         return paginate(
-            self.list, page_size=page_size, invoice_id=invoice_id, customer_id=customer_id
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                invoice_id=invoice_id,
+                customer_id=customer_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
         )
 
 
@@ -4359,8 +7933,26 @@ class AuditLogs:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, audit_log_id: str) -> dict[str, Any]:
-        return self._t.request("GET", f"/v1/audit_logs/{_p(audit_log_id)}")
+    def retrieve(
+        self,
+        audit_log_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> AuditLog:
+        return self._t.request(
+            "GET",
+            f"/v1/audit_logs/{_p(audit_log_id)}",
+            cast_to=AuditLog,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def list(
         self,
@@ -4371,14 +7963,18 @@ class AuditLogs:
         resource_type: str | None = None,
         resource_id: str | None = None,
         actor_id: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[AuditLog]:
         """List audit-log entries, newest first, optionally filtered.
 
         All four filters match exactly and combine. ``resource_type``
         narrows to a kind (``"customer"``, ``"price"``); ``resource_id``
         narrows to one row, which is the "everything that ever happened
         to this customer" question an audit log mostly exists for. Pair
-        them or pass ``resource_id`` alone — ids are already unique.
+        them or pass ``resource_id`` alone, since ids are already unique.
         """
         params = _list_params(limit=limit, starting_after=starting_after)
         for key, value in (
@@ -4389,26 +7985,49 @@ class AuditLogs:
         ):
             if value is not None:
                 params[key] = value
-        return self._t.request("GET", "/v1/audit_logs", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/audit_logs",
+            params=params,
+            cast_to=ListObject[AuditLog],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
         self,
         *,
-        page_size: int | None = None,
         action: str | None = None,
         resource_type: str | None = None,
         resource_id: str | None = None,
         actor_id: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[AuditLog]:
         """Walk every page of ``list()``; filters are forwarded
         unchanged so ``action="customer.created"`` etc. work."""
         return paginate(
-            self.list,
-            page_size=page_size,
-            action=action,
-            resource_type=resource_type,
-            resource_id=resource_id,
-            actor_id=actor_id,
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                action=action,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                actor_id=actor_id,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
         )
 
 
@@ -4423,7 +8042,16 @@ class Payments:
     def __init__(self, transport: _SyncRequester) -> None:
         self._t = transport
 
-    def retrieve(self, payment_id: str, *, expand: list[str] | None = None) -> dict[str, Any]:
+    def retrieve(
+        self,
+        payment_id: str,
+        *,
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Payment:
         """Fetch one subscription payment.
 
         Expandable: ``customer``, ``subscription``, ``refund_eligibility``.
@@ -4440,10 +8068,27 @@ class Payments:
         still can); treat any other value as "not refundable".
         """
         return self._t.request(
-            "GET", f"/v1/payments/{_p(payment_id)}", params=_expand_params(expand)
+            "GET",
+            f"/v1/payments/{_p(payment_id)}",
+            params=_expand_params(expand),
+            cast_to=Payment,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def retrieve_provider(self, payment_id: str) -> dict[str, Any]:
+    def retrieve_provider(
+        self,
+        payment_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ProviderPayload:
         """Fetch the provider's own record of this charge, live.
 
         Reads Mollie at request time rather than a stored copy, so it
@@ -4454,7 +8099,17 @@ class Payments:
         all answer ``200`` with ``available: False`` and a short reason,
         so render the rest of the page regardless.
         """
-        return self._t.request("GET", f"/v1/payments/{_p(payment_id)}/provider")
+        return self._t.request(
+            "GET",
+            f"/v1/payments/{_p(payment_id)}/provider",
+            cast_to=ProviderPayload,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def list(
         self,
@@ -4462,8 +8117,12 @@ class Payments:
         limit: int | None = None,
         starting_after: str | None = None,
         customer_id: str | None = None,
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
+        expand: Sequence[str] | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[Payment]:
         """List subscription payments, newest first.
 
         ``customer_id`` narrows to one customer. Failed and pending
@@ -4477,13 +8136,45 @@ class Payments:
         params = _list_params(limit=limit, starting_after=starting_after)
         params.update(_drop_none({"customer_id": customer_id}))
         params.update(_expand_params(expand) or {})
-        return self._t.request("GET", "/v1/payments", params=params)
+        return self._t.request(
+            "GET",
+            "/v1/payments",
+            params=params,
+            cast_to=ListObject[Payment],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
     def iter(
-        self, *, page_size: int | None = None, customer_id: str | None = None
-    ) -> Iterator[dict[str, Any]]:
+        self,
+        *,
+        customer_id: str | None = None,
+        expand: Sequence[str] | None = None,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[Payment]:
         """Walk every page of ``list()``; ``customer_id`` is carried on each."""
-        return paginate(self.list, page_size=page_size, customer_id=customer_id)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                customer_id=customer_id,
+                expand=expand,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
 
 
 class BillingPortalSessions:
@@ -4505,7 +8196,12 @@ class BillingPortalSessions:
         return_url: str,
         deliver_email: bool | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> BillingPortalSession:
         """Mint a portal session for one subscription.
 
         ``deliver_email=True`` also emails the link to the subscription's
@@ -4524,15 +8220,41 @@ class BillingPortalSessions:
             "POST",
             "/v1/billing_portal/sessions",
             json_body=body,
-            idempotency_key=idempotency_key,
+            cast_to=BillingPortalSession,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def revoke(self, session_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def revoke(
+        self,
+        session_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> BillingPortalSessionRevocation:
         """Kill an in-the-wild portal session. Idempotent."""
         return self._t.request(
             "POST",
             f"/v1/billing_portal/sessions/{_p(session_id)}/revoke",
-            idempotency_key=idempotency_key,
+            cast_to=BillingPortalSessionRevocation,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
 
@@ -4554,7 +8276,12 @@ class ApiKeys:
         label: str | None = None,
         scopes: list[str] | None = None,
         idempotency_key: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> ApiKey:
         """Issue a new key.
 
         The response's ``secret`` is the only time the full key exists
@@ -4567,19 +8294,58 @@ class ApiKeys:
         """
         body = _drop_none({"label": label, "scopes": scopes})
         return self._t.request(
-            "POST", "/v1/api_keys", json_body=body, idempotency_key=idempotency_key
+            "POST",
+            "/v1/api_keys",
+            json_body=body,
+            cast_to=ApiKey,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
-    def retrieve(self, api_key_id: str) -> dict[str, Any]:
+    def retrieve(
+        self,
+        api_key_id: str,
+        *,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ApiKey:
         """One key's metadata: prefix, label, scopes, ``revoked_at``.
 
         The key itself is never returned. ``last_used_at`` is the useful
         field, since it tells you whether a key is still in service before
         you revoke it.
         """
-        return self._t.request("GET", f"/v1/api_keys/{_p(api_key_id)}")
+        return self._t.request(
+            "GET",
+            f"/v1/api_keys/{_p(api_key_id)}",
+            cast_to=ApiKey,
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+        )
 
-    def revoke(self, api_key_id: str, *, idempotency_key: str | None = None) -> dict[str, Any]:
+    def revoke(
+        self,
+        api_key_id: str,
+        *,
+        idempotency_key: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+        extra_body: Mapping[str, Any] | None = None,
+    ) -> ApiKey:
         """Revoke a key so it stops working.
 
         Immediate and irreversible; issue a new key instead. Revoking an
@@ -4590,7 +8356,15 @@ class ApiKeys:
         return self._t.request(
             "POST",
             f"/v1/api_keys/{_p(api_key_id)}/revoke",
-            idempotency_key=idempotency_key,
+            cast_to=ApiKey,
+            options=RequestOptions(
+                idempotency_key=idempotency_key,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+                extra_body=extra_body,
+            ),
         )
 
     def list(
@@ -4598,7 +8372,11 @@ class ApiKeys:
         *,
         limit: int | None = None,
         starting_after: str | None = None,
-    ) -> dict[str, Any]:
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> ListObject[ApiKey]:
         """List your API keys, newest first.
 
         Only keys in the calling key's mode are listed. Revoked ones are
@@ -4608,8 +8386,34 @@ class ApiKeys:
             "GET",
             "/v1/api_keys",
             params=_list_params(limit=limit, starting_after=starting_after),
+            cast_to=ListObject[ApiKey],
+            options=RequestOptions(
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
         )
 
-    def iter(self, *, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+    def iter(
+        self,
+        *,
+        limit: int | None = None,
+        starting_after: str | None = None,
+        timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
+        max_retries: int | NotGiven = NOT_GIVEN,
+        extra_headers: Mapping[str, str] | None = None,
+        extra_query: Mapping[str, Any] | None = None,
+    ) -> Iterator[ApiKey]:
         """Walk every page of ``list()`` and yield each key."""
-        return paginate(self.list, page_size=page_size)
+        return paginate(
+            lambda cursor: self.list(
+                limit=limit,
+                starting_after=cursor,
+                timeout=timeout,
+                max_retries=max_retries,
+                extra_headers=extra_headers,
+                extra_query=extra_query,
+            ),
+            starting_after=starting_after,
+        )
