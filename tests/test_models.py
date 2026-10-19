@@ -27,6 +27,7 @@ from billkit.types import (
     CustomerSummary,
     Invoice,
     InvoiceLineItem,
+    Price,
     PriceSummary,
     RenewalState,
     Subscription,
@@ -265,6 +266,24 @@ def test_price_summary_and_lists_of_models() -> None:
     assert isinstance(inv.lines[0], InvoiceLineItem)
     assert inv.lines[0].amount_cents == 100
     assert PriceSummary.model_fields["unit_amount_decimal"].annotation is not None
+
+
+def test_price_and_summary_carry_payment_methods_from_account() -> None:
+    price = construct(
+        Price,
+        {
+            "id": "price_1",
+            "object": "price",
+            "payment_methods": ["creditcard"],
+            "payment_methods_from_account": False,
+        },
+    )
+    assert price.payment_methods_from_account is False
+    summary = construct(
+        PriceSummary,
+        {"id": "price_1", "object": "price.summary", "payment_methods_from_account": True},
+    )
+    assert summary.payment_methods_from_account is True
 
 
 # ── ListObject ─────────────────────────────────────────────────────
@@ -559,7 +578,9 @@ def test_construct_treats_every_key_as_data() -> None:
 
 _SYNTHETIC_SPEC: dict[str, Any] = {
     "openapi": "3.1.0",
-    "info": {"title": "t", "version": "1.0.0"},
+    # Not a semver string: the release check scans every tracked file for a
+    # version declaration, and a "1.0.0" here would block any other release.
+    "info": {"title": "t", "version": "synthetic"},
     "paths": {
         "/v1/widgets": {
             "get": {

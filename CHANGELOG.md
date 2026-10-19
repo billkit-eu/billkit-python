@@ -15,6 +15,32 @@ Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-19
+
+### Added
+
+- `Price` and `PriceSummary` carry `payment_methods_from_account`: `True`
+  when the price follows the account's payment methods, `False` when it has
+  its own list. When it is `True`, `payment_methods` lists the account's
+  methods (every recurring method the workspace has not switched off).
+- `prices.update(price_id, follow_account_payment_methods=True)` drops the
+  price's own `payment_methods` list (sent as a JSON null), so the price
+  follows the account's payment methods again. `payment_methods=None` still
+  means "leave it unchanged", as in 1.0.
+- Generated from API contract 1.1.0: the audit log `AuditLogAction` enum gains
+  `tenant.test_mode_email_enabled`, `tenant.test_mode_email_disabled`,
+  `tenant.invoice_pdf_attach_enabled`, `tenant.invoice_pdf_attach_disabled`
+  and `tenant.payment_methods_updated`.
+
+### Changed
+
+- A price created without `payment_methods` now follows the account's
+  payment methods instead of defaulting to `["creditcard"]` (an API change in
+  contract 1.1.0; the SDK never sent a default and still sends no key).
+- Every field on the typed responses in `billkit.types` carries the API
+  reference's description as a docstring, so an editor shows what it means.
+  No type or behaviour changed.
+
 ## [1.0.0] - 2026-10-14
 
 The first stable release, built against the API's 1.0 contract. From here the
@@ -67,8 +93,9 @@ The API froze its `/v1` contract for 1.0; these are the parts a caller sees.
   exactly one `status`, from a closed set.
 - `percent_off` on a coupon takes up to two decimal places (more than 0, at
   most 100): `coupons.create(percent_off=...)` accepts an `int`, `float` or
-  `Decimal`, and `Coupon.percent_off` / `CouponValidation.percent_off` read
-  back as a `float`.
+  `Decimal`, and `Coupon.percent_off` / `CouponValidation.percent_off` are
+  typed `float`: a fractional percent reads back as a `float` (`12.5`), a
+  whole one as an `int` (`99`).
 - `OneShotPayment.metadata` is always an object, `{}` when none was set.
 - `BillingPortalSession.subscription_id` (and the revocation's) is nullable.
 - `customers.purge` returns a `PurgedResource`

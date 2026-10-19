@@ -263,7 +263,9 @@ def _put_clearable(body: dict[str, Any], **fields: Any) -> dict[str, Any]:
     ``marketing_features``, a price's two refund windows, a customer's
     ``name``, a webhook endpoint's ``description``, a coupon's
     ``max_redemptions``, ``redeem_by``, ``applies_to_price_ids`` and
-    ``min_amount_cents``, and a tax rate's ``display_name``. Everywhere
+    ``min_amount_cents``, and a tax rate's ``display_name``. (A price's
+    ``payment_methods`` is cleared through its own keyword instead; see
+    ``Prices.update``.) Everywhere
     else ``None`` means "omit" and :func:`_drop_none` is enough; the API
     refuses a ``null`` there with a 400.
     """
@@ -859,8 +861,14 @@ class AsyncPrices:
         """Create a price for an existing product.
 
         Prices are append-only billing terms. Create a new Price when
-        changing amount, interval, trial, or supported payment methods;
-        existing subscriptions keep pointing at their original Price.
+        changing amount, interval or trial; existing subscriptions keep
+        pointing at their original Price.
+
+        ``payment_methods`` gives the price its own list of methods a
+        checkout may offer. Leave it ``None`` (it is then not sent) to make
+        the price follow the account instead: checkouts offer every method
+        switched on in Mollie and not switched off in the workspace's
+        settings, and the response says ``payment_methods_from_account=True``.
 
         ``refund_window_initial_days`` and ``refund_window_renewal_days``
         override the default refund policy (7d / 30d initial, 3d
@@ -1011,6 +1019,7 @@ class AsyncPrices:
         metadata: dict[str, str] | None = None,
         tax_behavior: str | None = None,
         payment_methods: list[str] | None = None,
+        follow_account_payment_methods: bool = False,
         refund_on_cancel: str | None = None,
         refund_window_initial_days: int | NotGiven | None = NOT_GIVEN,
         refund_window_renewal_days: int | NotGiven | None = NOT_GIVEN,
@@ -1049,7 +1058,15 @@ class AsyncPrices:
         ``refund_window_renewal_days=None`` passed explicitly clear the
         price's override (each sent as a JSON null), so the window falls
         back to the default; omit either to leave it alone. On every other
-        keyword ``None`` means "not given".
+        keyword ``None`` means "not given", ``payment_methods`` included.
+
+        ``follow_account_payment_methods=True`` drops the price's own
+        ``payment_methods`` list (sent as a JSON null), so the price follows
+        the account's payment methods again and
+        ``payment_methods_from_account`` reads ``True``. It is a keyword of
+        its own, not ``payment_methods=None``, because ``None`` has meant
+        "leave it alone" since 1.0; passing it with ``payment_methods``
+        raises ``ValueError``.
 
         Sending the value a price already has returns it unchanged and
         emits no second event, which makes a retry safe. Archiving emits
@@ -1060,10 +1077,17 @@ class AsyncPrices:
                 "active": active,
                 "metadata": metadata,
                 "tax_behavior": tax_behavior,
-                "payment_methods": payment_methods,
                 "refund_on_cancel": refund_on_cancel,
             }
         )
+        if follow_account_payment_methods:
+            if payment_methods is not None:
+                raise ValueError(
+                    "Pass payment_methods or follow_account_payment_methods=True, not both."
+                )
+            body["payment_methods"] = None
+        elif payment_methods is not None:
+            body["payment_methods"] = payment_methods
         _put_clearable(
             body,
             refund_window_initial_days=refund_window_initial_days,
@@ -2939,6 +2963,7 @@ class AsyncTenant:
         postal_code: str | NotGiven | None = NOT_GIVEN,
         city: str | NotGiven | None = NOT_GIVEN,
         registration_number: str | NotGiven | None = NOT_GIVEN,
+        legal_name: str | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
         timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
         max_retries: int | NotGiven = NOT_GIVEN,
@@ -2953,7 +2978,8 @@ class AsyncTenant:
         customer's sale is domestic, cross-border within the EU, or
         outside it.
 
-        The address fields and ``registration_number`` are partial-update,
+        The address fields, ``registration_number`` and ``legal_name`` are
+        partial-update,
         and here ``None`` is a value rather than an omission, as it is for
         ``products.update(default_price_id=...)``: omit a keyword and the
         stored value is left alone, pass ``None`` explicitly and it is
@@ -2979,6 +3005,7 @@ class AsyncTenant:
             ("postal_code", postal_code),
             ("city", city),
             ("registration_number", registration_number),
+            ("legal_name", legal_name),
         ):
             if not isinstance(value, NotGiven):
                 body[key] = value
@@ -4928,8 +4955,14 @@ class Prices:
         """Create a price for an existing product.
 
         Prices are append-only billing terms. Create a new Price when
-        changing amount, interval, trial, or supported payment methods;
-        existing subscriptions keep pointing at their original Price.
+        changing amount, interval or trial; existing subscriptions keep
+        pointing at their original Price.
+
+        ``payment_methods`` gives the price its own list of methods a
+        checkout may offer. Leave it ``None`` (it is then not sent) to make
+        the price follow the account instead: checkouts offer every method
+        switched on in Mollie and not switched off in the workspace's
+        settings, and the response says ``payment_methods_from_account=True``.
 
         ``refund_window_initial_days`` and ``refund_window_renewal_days``
         override the default refund policy (7d / 30d initial, 3d
@@ -5080,6 +5113,7 @@ class Prices:
         metadata: dict[str, str] | None = None,
         tax_behavior: str | None = None,
         payment_methods: list[str] | None = None,
+        follow_account_payment_methods: bool = False,
         refund_on_cancel: str | None = None,
         refund_window_initial_days: int | NotGiven | None = NOT_GIVEN,
         refund_window_renewal_days: int | NotGiven | None = NOT_GIVEN,
@@ -5118,7 +5152,15 @@ class Prices:
         ``refund_window_renewal_days=None`` passed explicitly clear the
         price's override (each sent as a JSON null), so the window falls
         back to the default; omit either to leave it alone. On every other
-        keyword ``None`` means "not given".
+        keyword ``None`` means "not given", ``payment_methods`` included.
+
+        ``follow_account_payment_methods=True`` drops the price's own
+        ``payment_methods`` list (sent as a JSON null), so the price follows
+        the account's payment methods again and
+        ``payment_methods_from_account`` reads ``True``. It is a keyword of
+        its own, not ``payment_methods=None``, because ``None`` has meant
+        "leave it alone" since 1.0; passing it with ``payment_methods``
+        raises ``ValueError``.
 
         Sending the value a price already has returns it unchanged and
         emits no second event, which makes a retry safe. Archiving emits
@@ -5129,10 +5171,17 @@ class Prices:
                 "active": active,
                 "metadata": metadata,
                 "tax_behavior": tax_behavior,
-                "payment_methods": payment_methods,
                 "refund_on_cancel": refund_on_cancel,
             }
         )
+        if follow_account_payment_methods:
+            if payment_methods is not None:
+                raise ValueError(
+                    "Pass payment_methods or follow_account_payment_methods=True, not both."
+                )
+            body["payment_methods"] = None
+        elif payment_methods is not None:
+            body["payment_methods"] = payment_methods
         _put_clearable(
             body,
             refund_window_initial_days=refund_window_initial_days,
@@ -7008,6 +7057,7 @@ class Tenant:
         postal_code: str | NotGiven | None = NOT_GIVEN,
         city: str | NotGiven | None = NOT_GIVEN,
         registration_number: str | NotGiven | None = NOT_GIVEN,
+        legal_name: str | NotGiven | None = NOT_GIVEN,
         idempotency_key: str | None = None,
         timeout: float | httpx.Timeout | NotGiven | None = NOT_GIVEN,
         max_retries: int | NotGiven = NOT_GIVEN,
@@ -7022,7 +7072,8 @@ class Tenant:
         customer's sale is domestic, cross-border within the EU, or
         outside it.
 
-        The address fields and ``registration_number`` are partial-update,
+        The address fields, ``registration_number`` and ``legal_name`` are
+        partial-update,
         and here ``None`` is a value rather than an omission, as it is for
         ``products.update(default_price_id=...)``: omit a keyword and the
         stored value is left alone, pass ``None`` explicitly and it is
@@ -7048,6 +7099,7 @@ class Tenant:
             ("postal_code", postal_code),
             ("city", city),
             ("registration_number", registration_number),
+            ("legal_name", legal_name),
         ):
             if not isinstance(value, NotGiven):
                 body[key] = value

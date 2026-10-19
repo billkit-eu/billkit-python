@@ -1594,6 +1594,71 @@ def test_price_update_sends_every_forward_looking_field(sync_client: BillKit) ->
 
 
 @respx.mock
+def test_price_create_without_payment_methods_sends_no_key(sync_client: BillKit) -> None:
+    """No client-side default: an absent list is what makes the price follow
+    the account's payment methods."""
+    route = respx.post("https://test.billkit.eu/v1/prices").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "price_1",
+                "object": "price",
+                "payment_methods": ["creditcard", "ideal"],
+                "payment_methods_from_account": True,
+            },
+        )
+    )
+    price = sync_client.prices.create(
+        product_id="prod_1", amount_cents=1000, currency="EUR", interval="month"
+    )
+    assert "payment_methods" not in last_request_body(route)
+    assert price.payment_methods_from_account is True
+    assert price["payment_methods_from_account"] is True
+
+
+@respx.mock
+def test_price_update_follow_account_sends_json_null(sync_client: BillKit) -> None:
+    route = respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": "price_1", "object": "price", "payment_methods_from_account": True},
+        )
+    )
+    price = sync_client.prices.update("price_1", follow_account_payment_methods=True)
+    assert route.calls.last.request.read() == b'{"payment_methods":null}'
+    assert price.payment_methods_from_account is True
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_price_update_follow_account_sends_json_null_async(
+    async_client: AsyncBillKit,
+) -> None:
+    route = respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price"})
+    )
+    await async_client.prices.update("price_1", follow_account_payment_methods=True)
+    assert route.calls.last.request.read() == b'{"payment_methods":null}'
+
+
+@respx.mock
+def test_price_update_payment_methods_none_still_means_not_given(sync_client: BillKit) -> None:
+    """1.0 callers passing an optional value through must not reset a price."""
+    route = respx.post("https://test.billkit.eu/v1/prices/price_1").mock(
+        return_value=httpx.Response(200, json={"id": "price_1", "object": "price"})
+    )
+    sync_client.prices.update("price_1", payment_methods=None, active=True)
+    assert route.calls.last.request.read() == b'{"active":true}'
+
+
+def test_price_update_refuses_a_list_and_follow_account_together(sync_client: BillKit) -> None:
+    with pytest.raises(ValueError, match="not both"):
+        sync_client.prices.update(
+            "price_1", payment_methods=["creditcard"], follow_account_payment_methods=True
+        )
+
+
+@respx.mock
 def test_checkout_session_carries_country(sync_client: BillKit) -> None:
     route = respx.post("https://test.billkit.eu/v1/checkout/sessions").mock(
         return_value=httpx.Response(200, json={"id": "cs_1"})
@@ -1650,10 +1715,12 @@ _CLEARABLE = [
     ("tax_rates", "/v1/tax_rates/x_1", "display_name", "BTW"),
 ]
 
-#: Keywords the API cannot clear. It refuses an explicit null on these
-#: with a 400, so ``None`` must keep meaning "not given" and never reach
-#: the wire.
+#: Keywords where ``None`` must keep meaning "not given" and never reach the
+#: wire. Mostly because the API refuses an explicit null with a 400; a
+#: price's ``payment_methods`` because ``None`` meant "leave it alone" in
+#: 1.0, and clearing it has its own keyword, ``follow_account_payment_methods``.
 _NOT_CLEARABLE = [
+    ("prices", "/v1/prices/x_1", "payment_methods"),
     ("products", "/v1/products/x_1", "name"),
     ("products", "/v1/products/x_1", "metadata"),
     ("products", "/v1/products/x_1", "active"),
@@ -1661,7 +1728,6 @@ _NOT_CLEARABLE = [
     ("prices", "/v1/prices/x_1", "active"),
     ("prices", "/v1/prices/x_1", "metadata"),
     ("prices", "/v1/prices/x_1", "tax_behavior"),
-    ("prices", "/v1/prices/x_1", "payment_methods"),
     ("prices", "/v1/prices/x_1", "refund_on_cancel"),
     ("coupons", "/v1/coupons/x_1", "active"),
     ("customers", "/v1/customers/x_1", "email"),

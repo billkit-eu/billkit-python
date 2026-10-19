@@ -69,6 +69,11 @@ class AuditLogAction(StrEnum):
     TENANT_DOMAIN_SET = "tenant.domain_set"
     TENANT_DOMAIN_CHECKED = "tenant.domain_checked"
     TENANT_DOMAIN_REMOVED = "tenant.domain_removed"
+    TENANT_TEST_MODE_EMAIL_ENABLED = "tenant.test_mode_email_enabled"
+    TENANT_TEST_MODE_EMAIL_DISABLED = "tenant.test_mode_email_disabled"
+    TENANT_INVOICE_PDF_ATTACH_ENABLED = "tenant.invoice_pdf_attach_enabled"
+    TENANT_INVOICE_PDF_ATTACH_DISABLED = "tenant.invoice_pdf_attach_disabled"
+    TENANT_PAYMENT_METHODS_UPDATED = "tenant.payment_methods_updated"
     TENANT_DOMAIN_EMAIL_ENABLED = "tenant.domain_email_enabled"
     TENANT_DOMAIN_EMAIL_DISABLED = "tenant.domain_email_disabled"
     TENANT_DOMAIN_PORTAL_ENABLED = "tenant.domain_portal_enabled"
@@ -212,6 +217,7 @@ class ErrorCode(StrEnum):
     REFUND_DUPLICATE = "refund_duplicate"
     PAYMENT_REFUSED = "payment_refused"
     WEBHOOK_ENDPOINT_DISABLED = "webhook_endpoint_disabled"
+    WEBHOOK_ENDPOINT_LIMIT_REACHED = "webhook_endpoint_limit_reached"
     SUBSCRIPTION_PAST_DUE = "subscription_past_due"
     TENANT_SUSPENDED = "tenant_suspended"
 
@@ -448,156 +454,248 @@ class ApiKey(BillKitObject):
     """An ``api_key`` object."""
 
     id: str
+    """Unique identifier for the API key, beginning ak_."""
     object: str
+    """String representing the object's type."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     label: str | None
+    """The name given to the key, or null if it has none."""
     last_used_at: int | None
+    """When the key last authenticated a request, in Unix seconds, updated at most once a minute. Null if it has never been used."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     prefix: str
+    """The first 16 characters of the key, such as bk_live_ and the start of its secret, to tell keys apart."""
     revoked_at: int | None
+    """When the key was revoked, in Unix seconds, or null if it is active."""
     scopes: list[str]
+    """The scopes the key carries. * grants every scope."""
     secret: str | None
+    """The full key. Present only in the response that creates it; null everywhere else."""
 
 
 class AuditLog(BillKitObject):
     """An ``audit_log`` object."""
 
     id: str
+    """Unique identifier for the audit log entry, beginning al_."""
     object: str
+    """String representing the object's type."""
     action: str
-    """Known values: :class:`AuditLogAction`. Open, so expect others."""
+    """What was done, such as customer.created. Known values: :class:`AuditLogAction`. Open, so expect others."""
     actor_id: str | None
+    """Id of the actor, such as the API key's ak_ id or the operator's id. May be null when BillKit acted on its own."""
     actor_type: str
-    """Known values: :class:`AuditLogActorType`. Open, so expect others."""
+    """What performed the action, such as api_key, operator or portal_session, or system when BillKit acted on its own. Known values: :class:`AuditLogActorType`. Open, so expect others."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     ip_address: str | None
+    """Client IP address of the request that performed the action, or null if there was no request."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     metadata: dict[str, Any]
+    """Details recorded with the action. Their keys depend on the action."""
     resource_id: str | None
+    """Id of the object acted on, or null if the action has no single object."""
     resource_type: str | None
+    """Type of the object acted on, such as customer, or null if the action has no single object."""
     user_agent: str | None
+    """User-Agent header of the request that performed the action, or null if there was none."""
 
 
 class BillingPortalSession(BillKitObject):
     """A ``billing_portal.session`` object."""
 
     id: str
+    """Unique identifier for the portal session, prefixed bps_."""
     object: str
+    """String representing the object's type."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     customer_id: str
+    """Id of the customer the subscription belongs to."""
     expires_at: int
+    """When the session expires regardless of use, in Unix seconds. It also expires earlier after a period without use."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     return_url: str
+    """Where the portal sends the customer when they leave it."""
     subscription_id: str | None
+    """Id of the subscription the session covers. Always set today; nullable for future session types."""
     token: str
+    """The session credential. Returned only in this response and never again; do not store it."""
     url: str
+    """The portal link to send the customer to. It carries the token, so treat it as a secret."""
 
 
 class BillingPortalSessionRevocation(BillKitObject):
     """A revoked billing portal session. The token is never returned again."""
 
     id: str
+    """Unique identifier for the portal session, prefixed bps_."""
     object: str
+    """String representing the object's type."""
     customer_id: str
+    """Id of the customer the subscription belongs to."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     revoked_at: int
+    """When the session was revoked, in Unix seconds."""
     subscription_id: str | None
+    """Id of the subscription the session covered. Always set today; nullable for future session types."""
 
 
 class CheckoutSession(BillKitObject):
     """A ``checkout.session`` object."""
 
     id: str
+    """Unique identifier for the checkout session, prefixed cs_."""
     object: str
+    """String representing the object's type."""
     cancel_url: str
+    """Where the buyer is sent if they leave without completing."""
     client_secret: str | None
+    """Secret for mounting the embedded checkout element. Returned only in the response that creates an embedded session; null otherwise."""
     coupon_id: str | None
+    """Id of the coupon applied from coupon_code. Null when none was applied."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     customer_country_code: str | None
+    """The buyer's ISO 3166-1 alpha-2 country as known when the session completed. Null until then."""
     customer_email: str | None
+    """The buyer's email as known when the session completed. Null until then."""
     customer_id: str
+    """Id of the customer checking out, including one created from customer_email."""
     expires_at: int | None
+    """When an open embedded session expires, in Unix seconds. Null for a hosted session."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     metadata: dict[str, str]
+    """Key-value pairs set at creation. Always an object, empty when none were set."""
     payment_id: str | None
+    """Id of the first payment. Null until the session completes."""
     payment_method: str | None
-    """Known values: :class:`PaymentMethod`. Open, so expect others."""
+    """The payment method requested, or for an embedded session the one the buyer chose. Null when none has been chosen yet. Known values: :class:`PaymentMethod`. Open, so expect others."""
     price_id: str
+    """Id of the price the subscription is created on."""
     status: str
-    """Known values: :class:`CheckoutSessionStatus`. Open, so expect others."""
+    """open until the first payment settles, then complete. A hosted session is expired when its payment fails; an embedded session stays open for a retry and is expired after expires_at. Known values: :class:`CheckoutSessionStatus`. Open, so expect others."""
     subscription_id: str | None
+    """Id of the subscription the session created. Null until the session completes."""
     success_url: str
+    """Where the buyer is sent after completing the payment."""
     trial_days_override: int | None
+    """The trial length requested for this checkout, in days. Null when the price's trial_days applies."""
     ui_mode: str
-    """Known values: :class:`UiMode`. Open, so expect others."""
+    """hosted or embedded, as requested at creation. Known values: :class:`UiMode`. Open, so expect others."""
     url: str | None
+    """The payment page to redirect the buyer to. Null for an embedded session until the element confirms a payment that needs one."""
 
 
 class Coupon(BillKitObject):
     """A ``coupon`` object."""
 
     id: str
+    """Unique identifier for the coupon, prefixed coup_."""
     object: str
+    """String representing the object's type."""
     active: bool
+    """Whether the code can be redeemed. false once withdrawn."""
     amount_off_cents: int | None
     """Amount off in minor units of currency, when discount_type is fixed_amount; else null."""
     applies_to_price_ids: list[str] | None
+    """Ids of the prices the coupon can be used with. Null or empty for any price."""
     code: str
+    """The code customers enter, uppercased."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str | None
+    """Three-letter ISO 4217 currency of amount_off_cents and min_amount_cents; the coupon applies only to prices in it. Null for a percent coupon with no minimum, which applies in any currency."""
     discount_type: str
     """Which of percent_off and amount_off_cents this coupon sets. Known values: :class:`DiscountType`. Open, so expect others."""
     duration: str
-    """Known values: :class:`CouponDuration`. Open, so expect others."""
+    """How long the discount applies once redeemed. once discounts the first charge; repeating every charge within duration_in_months months of the first discounted charge; forever every charge. Known values: :class:`CouponDuration`. Open, so expect others."""
     duration_in_months: int | None
+    """Number of months a repeating coupon applies. Null otherwise."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     max_redemptions: int | None
+    """Maximum number of redemptions. Null for no limit."""
     min_amount_cents: int | None
+    """Minimum charge, before the discount, in minor units of currency. Null for no minimum."""
     percent_off: float | None
     """Percent off, more than 0 and at most 100 with up to two decimal places, when discount_type is percent; else null."""
     redeem_by: int | None
+    """Last time the coupon can be redeemed, in Unix seconds. Null for no deadline."""
     redemptions_count: int
+    """Number of times the coupon has been redeemed."""
 
 
 class CouponValidation(BillKitObject):
     """A ``coupon_validation`` object."""
 
     object: str
+    """String representing the object's type."""
     amount_off_cents: int | None
+    """Amount off in minor units of currency when discount_type is fixed_amount; else null."""
     code: str
+    """The code checked, trimmed and uppercased."""
     coupon_id: str | None
+    """Id of the matching coupon. Null when no coupon has this code."""
     currency: str | None
+    """The coupon's currency. Null for a percent coupon with no minimum, which applies in any currency."""
     discount_cents: int | None
+    """What the coupon takes off amount_cents. Null unless valid is true and amount_cents was sent."""
     discount_type: str | None
-    """Known values: :class:`DiscountType`. Open, so expect others."""
+    """percent or fixed_amount. Null when no coupon has this code. Known values: :class:`DiscountType`. Open, so expect others."""
     duration: str | None
-    """Known values: :class:`CouponDuration`. Open, so expect others."""
+    """once, repeating or forever. Null when no coupon has this code. Known values: :class:`CouponDuration`. Open, so expect others."""
     final_charge_cents: int | None
+    """amount_cents after the discount. Null unless valid is true and amount_cents was sent."""
     percent_off: float | None
+    """Percent off when discount_type is percent; else null."""
     reason: str | None
-    """Known values: :class:`CouponValidationReason`. Open, so expect others."""
+    """Why the code cannot be used. Null when valid is true. Known values: :class:`CouponValidationReason`. Open, so expect others."""
     valid: bool
+    """Whether the code can be redeemed for the charge described."""
 
 
 class CreditNote(BillKitObject):
     """A ``credit_note`` object."""
 
     id: str
+    """Unique identifier for the credit note."""
     object: str
+    """String representing the object's type. Always credit_note."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     customer_id: str
+    """The customer the credited invoice was issued to."""
     invoice_id: str
+    """The invoice this credit note reverses."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     number: str
+    """The credit note number, CN-YYYY-NNNNNN: its own sequential, gapless series per account and mode, separate from invoice numbers."""
     reason: str | None
+    """The reason given on the refund that issued this credit note, if any."""
     refund_id: str | None
+    """The refund whose settlement issued this credit note."""
     subtotal_cents: int
+    """Amount credited excluding tax, in minor units of currency. A positive magnitude."""
     tax_cents: int
+    """VAT credited, in minor units of currency. A positive magnitude; 0 when the credited invoice carried no tax."""
     tax_country_code: str | None
+    """Two-letter ISO country code whose VAT treatment applied, as on the credited invoice. Null when none applied."""
     tax_rate_basis_points: int | None
+    """VAT rate credited, in basis points (2100 is 21%). Null when no rate applied."""
     tax_reverse_charged: bool
+    """True when the credited sale was reverse-charged, so no VAT is credited."""
     total_cents: int
+    """Amount credited including tax, in minor units of currency: subtotal_cents plus tax_cents."""
 
 
 class CustomerStats(BillKitObject):
@@ -610,82 +708,130 @@ class CustomerStats(BillKitObject):
     """
 
     object: str
+    """String representing the object's type."""
     currency: str | None
+    """Currency of lifetime_cents, or null when there is nothing to report or the charges span more than one."""
     lifetime_cents: int
+    """Paid charges minus succeeded refunds, in minor units of currency, across subscription and one-off payments."""
     subscription_count: int
+    """Number of the customer's active and trialing subscriptions."""
 
 
 class Customer(BillKitObject):
     """A ``customer`` object."""
 
     id: str
+    """Unique identifier for the customer, prefixed cus_."""
     object: str
+    """String representing the object's type."""
     country_code: str | None
+    """Two-letter ISO 3166-1 country code, uppercase, that selects the customer's tax rate. Null when neither declared nor seen at checkout or on a payment."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     email: str | None
+    """The customer's email address, or null."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     metadata: dict[str, str]
+    """Key-value pairs attached to the customer."""
     name: str | None
+    """The customer's full name or business name, or null."""
     provisional: bool
+    """True while the customer exists only because a checkout was started and not yet paid. Becomes false when a payment succeeds."""
     stats: CustomerStats | None
+    """Subscription count and lifetime payments. Null unless the request asked for expand=stats."""
     test_clock_id: str | None
+    """The test clock this customer is attached to, or null."""
     vat_number: str | None
+    """The customer's VAT registration number, set with POST /v1/customers/{customer_id}/vat_number, or null."""
     vat_number_validated: bool
+    """Whether VIES confirmed vat_number as valid. Charges reverse-charge VAT only when it is true and country_code differs from your account's country."""
 
 
 class DeletedResource(BillKitObject):
     """Returned by a ``DELETE``: the object is gone and further requests for it return 404."""
 
     id: str
+    """Id of the deleted object."""
     object: str
+    """Type of the deleted object, such as customer."""
     deleted: bool
+    """Always true."""
 
 
 class Dispute(BillKitObject):
     """A ``dispute`` object."""
 
     id: str
+    """Unique identifier for the dispute."""
     object: str
+    """String representing the object's type. Always dispute."""
     amount_cents: int
+    """Amount the chargeback pulled back, in minor units of currency."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     one_shot_payment_id: str | None
+    """The one-off payment the chargeback was opened against. Null when it is against a subscription payment."""
     payment_id: str | None
+    """The subscription payment the chargeback was opened against. Null when it is against a one-off payment."""
     provider_chargeback_id: str
+    """The payment provider's id for the chargeback."""
     reason: str | None
+    """The reason the provider reported for the chargeback, such as Fraudulent. Null when none was given."""
     reversed_at: int | None
+    """When the chargeback was reversed at the provider, in Unix seconds. Null while the dispute is open."""
     status: str
-    """Known values: :class:`DisputeStatus`. Open, so expect others."""
+    """open while the funds are withdrawn; won once the chargeback is reversed and the funds return. There is no lost state: a chargeback that stands stays open. Known values: :class:`DisputeStatus`. Open, so expect others."""
     subscription_id: str | None
+    """The subscription behind payment_id. Null for a one-off payment."""
 
 
 class DunningNotification(BillKitObject):
     """``dunning.email_required``: a failed renewal the customer should hear about."""
 
     object: str
+    """String representing the object's type."""
     amount_cents: int
+    """Amount of the failed charge, in minor units of currency."""
     attempt: int
+    """How many dunning notices this subscription has had, this one included."""
     currency: str
+    """ISO 4217 code of the failed charge's currency."""
     customer_email: str | None
+    """The customer's email address, or null if none is on file."""
     customer_id: str
+    """Id of the subscription's customer."""
     failed_at: int
+    """When the failed charge was made, in Unix seconds."""
     failed_payment_id: str
+    """Id of the payment that failed."""
     failure_reason: str | None
+    """The provider's decline reason for the failed charge, or null if it gave none."""
     next_payment_attempt: int | None
+    """When BillKit will try the charge again, in Unix seconds. Null when no further automatic attempt is coming, so the customer must act."""
     payment_method: str | None
-    """Known values: :class:`PaymentMethod`. Open, so expect others."""
+    """The payment method the failed charge used, or null if not known. Known values: :class:`PaymentMethod`. Open, so expect others."""
     subscription_id: str
+    """Id of the subscription whose renewal failed."""
 
 
 class CustomerSummary(BillKitObject):
     """A summary of a customer, added by ``expand=customer``."""
 
     id: str
+    """Unique identifier for the customer, prefixed cus_."""
     object: str
+    """String representing the object's type."""
     country_code: str | None
+    """The customer's two-letter ISO 3166-1 country code. Null if not known."""
     email: str | None
+    """The customer's email address. Null if none is set."""
     name: str | None
+    """The customer's name. Null if none is set."""
 
 
 class Event(BillKitObject):
@@ -699,24 +845,32 @@ class Event(BillKitObject):
     """
 
     id: str
+    """Unique identifier for the event, beginning evt_."""
     object: str
+    """String representing the object's type."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     customer: CustomerSummary | None
+    """The customer named by data.customer_id. Null unless the request asked for expand=customer, and null when the payload names no customer or it no longer exists."""
     data: BillKitObject
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no ``data.object`` wrapper."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     previous_attributes: dict[str, Any] | None
     """On an update, the fields of ``data`` that changed, with their values before the change. Always present, and ``None`` when nothing changed."""
     type: str
-    """Known values: :class:`billkit.EventType`. Open, so expect others."""
+    """What happened, such as customer.created. Known values: :class:`billkit.EventType`. Open, so expect others."""
 
 
 class EventTypeList(BillKitObject):
     """Every event type a webhook endpoint can subscribe to, and the wildcard for all of them."""
 
     object: str
+    """String representing the object's type."""
     data: list[str]
+    """Every event type BillKit sends, such as customer.created."""
     wildcard: str
+    """The value to put in enabled_events to receive every event type, including future ones."""
 
 
 class PriceSummary(BillKitObject):
@@ -729,36 +883,50 @@ class PriceSummary(BillKitObject):
     """
 
     id: str
+    """Unique identifier for the price, prefixed price_."""
     object: str
+    """String representing the object's type."""
     active: bool
+    """Whether the price is on sale. An inactive price cannot be used for new checkouts."""
     amount_cents: int
+    """Amount per interval, or per unit on a metered price, in minor units of currency. Rounded on a metered price with a rate below one minor unit; 0 on a tiered price."""
     billing_scheme: str
-    """Known values: :class:`BillingScheme`. Open, so expect others."""
+    """per_unit charges amount_cents per unit; tiered prices by the price's tiers. Known values: :class:`BillingScheme`. Open, so expect others."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     interval: str
-    """Known values: :class:`PriceInterval`. Open, so expect others."""
+    """Billing interval: month or year. Known values: :class:`PriceInterval`. Open, so expect others."""
     payment_methods: list[str]
-    """Known values: :class:`PaymentMethod`. Open, so expect others."""
+    """Payment methods the price allows at checkout. A given checkout may offer fewer, depending on your provider account and the buyer's country. Known values: :class:`PaymentMethod`. Open, so expect others."""
+    payment_methods_from_account: bool | None = None
+    """True when the price follows your account's payment methods, false when it has its own list."""
     product_id: str
+    """Id of the product the price belongs to."""
     product_name: str
+    """Name of that product."""
     tax_behavior: str
-    """Known values: :class:`TaxBehavior`. Open, so expect others."""
+    """Whether amount_cents includes VAT (inclusive), excludes it (exclusive) or is unspecified. Known values: :class:`TaxBehavior`. Open, so expect others."""
     tiers_mode: str | None
-    """Known values: :class:`TiersMode`. Open, so expect others."""
+    """graduated or volume on a tiered price. Null otherwise. Known values: :class:`TiersMode`. Open, so expect others."""
     trial_days: int
+    """Days of free trial before the first charge, 0 for none."""
     unit_amount_decimal: str
+    """The per-unit rate actually charged, in minor units of currency, as a decimal string."""
     usage_type: str
-    """Known values: :class:`UsageType`. Open, so expect others."""
+    """licensed bills a fixed amount each period; metered bills the usage reported. Known values: :class:`UsageType`. Open, so expect others."""
 
 
 class SubscriptionSummary(BillKitObject):
     """A summary of a subscription, added by ``expand=subscription``."""
 
     id: str
+    """Unique identifier for the subscription, prefixed sub_."""
     object: str
+    """String representing the object's type."""
     price_id: str
+    """Id of the price the subscription is billed at."""
     status: str
-    """Known values: :class:`SubscriptionStatus`. Open, so expect others."""
+    """The subscription's status. Known values: :class:`SubscriptionStatus`. Open, so expect others."""
 
 
 class InvoiceEmail(BillKitObject):
@@ -770,90 +938,152 @@ class InvoiceEmail(BillKitObject):
     """
 
     object: str
+    """String representing the object's type. Always invoice.email."""
     invoice_id: str
+    """The invoice that was emailed."""
     recipient: str
+    """The address the email was sent to: the one recorded on the invoice, which can differ from the customer's current email."""
     sent: bool
+    """Always true: the email was queued. Delivery is best effort and not confirmed."""
 
 
 class InvoiceLineItem(BillKitObject):
     """An ``invoice_line_item`` object."""
 
     id: str
+    """Unique identifier for the line item."""
     object: str
+    """String representing the object's type. Always invoice_line_item."""
     amount_cents: int
+    """The line's amount excluding tax, in minor units of currency. Negative on a credit line, such as unused time credited back from a previous plan."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     description: str
+    """What the line bills, as printed on the invoice: the plan or product name, or a credit's label."""
     period_end: int | None
+    """End of the billing period this line covers, in Unix seconds. Null when the line buys no period, such as a one-off sale."""
     period_start: int | None
+    """Start of the billing period this line covers, in Unix seconds. Null when the line buys no period, such as a one-off sale."""
     quantity: int
+    """Units billed on this line: 1 for a fixed charge, the period's total usage for a metered line."""
     tax_rate_basis_points: int | None
+    """VAT rate applied to the line, in basis points (2100 is 21%). Null when no rate was recorded."""
 
 
 class Invoice(BillKitObject):
     """An ``invoice`` object."""
 
     id: str
+    """Unique identifier for the invoice."""
     object: str
+    """String representing the object's type. Always invoice."""
     billing_address_at_invoice_time: dict[str, Any] | None
+    """The billing address as invoiced. Today it carries only country_code; null when the customer had no country."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     customer: CustomerSummary | None
+    """The customer as they are now, as a summary. Null unless the request asked for expand=customer. The *_at_invoice_time fields are what the document says."""
     customer_business_name_at_invoice_time: str | None
+    """The customer's business name as invoiced. Null when none was on record at charge time."""
     customer_email_at_invoice_time: str | None
+    """The customer's email as invoiced, copied from the charge. Not updated when the customer changes later."""
     customer_id: str
+    """The customer this invoice was issued to."""
     customer_name_at_invoice_time: str | None
+    """The customer's name as invoiced, copied from the charge. Not updated when the customer changes later."""
     customer_vat_number_at_invoice_time: str | None
+    """The customer's VAT number as invoiced, the one any reverse charge was decided against. Null when none was on record at charge time."""
     discount_cents: int
+    """Amount a coupon took off the subtotal, excluding tax, in minor units of currency. 0 when no coupon applied."""
     due_at: int | None
+    """When payment of an open metered invoice falls due, in Unix seconds. Null on an invoice issued already paid."""
     lines: list[InvoiceLineItem]
+    """The invoice's line items, in the order printed on the document."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     number: str
+    """The invoice number, YYYY-NNNNNN: sequential and gapless per account and mode."""
     one_shot_payment_id: str | None
+    """The one-off payment this invoice documents. Set instead of payment_id for a one-off sale; null otherwise."""
     paid_at: int | None
+    """When the invoice was paid, in Unix seconds. Null until it is."""
     payment_id: str | None
+    """The subscription payment this invoice documents. Null for a one-off sale, and on a metered invoice until its charge is paid."""
     pdf_url: str | None
+    """Always null. Download the PDF from GET /v1/invoices/{invoice_id}/pdf."""
     status: str
-    """Known values: :class:`InvoiceStatus`. Open, so expect others."""
+    """One of open (a metered period awaiting its charge), paid, uncollectible (collection was given up) or void. Known values: :class:`InvoiceStatus`. Open, so expect others."""
     subscription_id: str | None
+    """The subscription this invoice bills. Null for a one-off sale."""
     subtotal_cents: int
+    """Amount excluding tax and before any discount, in minor units of currency."""
     tax_cents: int
+    """VAT charged, in minor units of currency. 0 when no tax applied or the charge was reverse-charged."""
     tax_country_code: str | None
+    """Two-letter ISO country code whose VAT treatment applied. Null when the customer had no country and no tax was computed."""
     tax_reverse_charged: bool
+    """True when the customer held a validated VAT number in another EU country, so no VAT was charged and the customer self-accounts for it."""
     total_cents: int
+    """Amount charged including tax, in minor units of currency: subtotal_cents minus discount_cents plus tax_cents."""
     voided_at: int | None
+    """When the invoice was voided, in Unix seconds. Null unless status is void."""
 
 
 class OneShotPayment(BillKitObject):
     """An ``one_shot_payment`` object."""
 
     id: str
+    """Unique identifier for the one-shot payment, prefixed osp_."""
     object: str
+    """String representing the object's type."""
     amount_cents: int
+    """Gross amount charged, VAT included, in minor units of currency."""
     amount_disputed_cents: int | None
+    """Amount held by open disputes, in minor units of currency, already subtracted from amount_refundable_cents. Set on every read, in webhook event payloads and in the data export."""
     amount_refundable_cents: int | None
+    """Amount still refundable, in minor units of currency: 0 unless status is paid, and net of refunds and open disputes. Ignores the refund window. Set on every read, in webhook event payloads and in the data export."""
     amount_refunded_cents: int | None
+    """Total of pending and succeeded refunds, in minor units of currency. Set on every read, in webhook event payloads and in the data export."""
     cancel_url: str | None
+    """Where the payer is sent if they leave without paying, if set."""
     client_secret: str | None
+    """Secret for mounting the embedded payment element. Returned only by the request that creates an embedded payment; null on every read."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     customer_id: str
+    """Id of the customer being charged."""
     description: str | None
+    """What is being paid for, as sent at creation."""
     expires_at: int | None
+    """When an open payment stops being payable, in Unix seconds. On an unconfirmed embedded payment, when its client_secret stops working."""
     failure_reason: str | None
+    """The provider's failure code for a failed payment, such as a card decline reason or a SEPA bank reason code. Null when none was given."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     metadata: dict[str, str]
+    """Key-value pairs set at creation. Always an object, empty when none were set."""
     net_cents: int | None
+    """Amount before VAT, in minor units of currency. Null when no tax was computed."""
     paid_at: int | None
+    """When the payment settled, in Unix seconds. Null until then."""
     payment_method: str | None
-    """Known values: :class:`PaymentMethod`. Open, so expect others."""
+    """The payment method charged. Null on an embedded payment until the buyer confirms. Known values: :class:`PaymentMethod`. Open, so expect others."""
     redirect_url: str | None
+    """The payment page to redirect the payer to. Null on an embedded payment."""
     status: str
-    """Known values: :class:`OneShotPaymentStatus`. Open, so expect others."""
+    """open, pending or authorized before settlement; then paid, failed, expired or canceled. refunded once the full amount has been refunded. Known values: :class:`OneShotPaymentStatus`. Open, so expect others."""
     success_url: str
+    """Where the payer is sent after the payment."""
     tax_cents: int | None
+    """VAT included in amount_cents, in minor units of currency. Null when no tax was computed: no customer country, or no rate for it."""
     tax_reverse_charged: bool
+    """True when a valid VAT number from another country means the customer self-accounts for VAT, so none was charged."""
     ui_mode: str
-    """Known values: :class:`UiMode`. Open, so expect others."""
+    """hosted or embedded, as requested at creation. Known values: :class:`UiMode`. Open, so expect others."""
 
 
 class RefundEligibility(BillKitObject):
@@ -867,134 +1097,209 @@ class RefundEligibility(BillKitObject):
     """
 
     object: str
+    """String representing the object's type."""
     amount_cents: int
+    """The refundable balance in minor units of currency, net of earlier refunds and of money an open dispute has taken back."""
     currency: str | None
+    """Three-letter ISO 4217 currency code of the charge. Null when there is no charge."""
     days_remaining: int | None
+    """Whole days left in the refund window, counting today. Null when no window applies or the window has closed."""
     eligible: bool
+    """Whether a refund of the whole of amount_cents is expected to succeed now."""
     reason: str | None
-    """Known values: :class:`RefundEligibilityReason`. Open, so expect others."""
+    """Why a refund is not possible now. Null when eligible is true. Known values: :class:`RefundEligibilityReason`. Open, so expect others."""
     window_ends_at: int | None
+    """When the refund window closes, in Unix seconds. Null when no window applies."""
 
 
 class Payment(BillKitObject):
     """A ``payment`` object."""
 
     id: str
+    """Unique identifier for the payment."""
     object: str
+    """String representing the object's type. Always payment."""
     amount_cents: int
+    """Amount charged including tax, in minor units of currency."""
     amount_disputed_cents: int | None
+    """Amount open chargebacks have pulled back, in minor units of currency. Already subtracted from amount_refundable_cents. Set on every read, in event payloads and in the data export."""
     amount_refundable_cents: int | None
+    """Balance still refundable, in minor units of currency: the charge less refunds and open disputes, or 0 when the payment cannot be refunded. Does not apply the refund window or price policy, so a refund can still be refused. Set on every read, in event payloads and in the data export."""
     amount_refunded_cents: int | None
+    """Total of this payment's pending and succeeded refunds, in minor units of currency. Set on every read, in event payloads and in the data export."""
     checkout_session_id: str | None
+    """The Checkout session that started this charge. Null for a charge BillKit made on its own, such as a renewal."""
     coupon_id: str | None
+    """The coupon that discounted this charge. Null when none did."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     customer: CustomerSummary | None
+    """A summary of the customer. Null unless the request asked for expand=customer."""
     customer_id: str
+    """The customer who was charged."""
     discount_cents: int
+    """Amount a coupon took off this charge, including tax, in minor units of currency. amount_cents plus discount_cents is the undiscounted charge. 0 when no coupon applied."""
     failure_reason: str | None
+    """Why the charge failed, as reported by the payment provider or recorded by BillKit. Null when no failure was recorded."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     paid_at: int | None
+    """When the charge was paid, in Unix seconds. Null until it is."""
     payment_method: str | None
-    """Known values: :class:`PaymentMethod`. Open, so expect others."""
+    """How the charge was collected, such as creditcard, ideal or directdebit, recorded when it was made. Null when not known. Known values: :class:`PaymentMethod`. Open, so expect others."""
     refund_eligibility: RefundEligibility | None
+    """Whether a refund would succeed now and for how much, applying the refund window and price policy. Null unless a retrieve asked for expand=refund_eligibility."""
     status: str
-    """Known values: :class:`PaymentStatus`. Open, so expect others."""
+    """The provider's status for the charge: open, pending, authorized, paid, failed, expired or canceled. Known values: :class:`PaymentStatus`. Open, so expect others."""
     subscription: SubscriptionSummary | None
+    """A summary of the subscription. Null unless the request asked for expand=subscription, or the payment has none."""
     subscription_id: str | None
+    """The subscription this charge was made for. Null when it is not tied to a subscription."""
     type: str
-    """Known values: :class:`PaymentType`. Open, so expect others."""
+    """Why the charge was made: initial (first payment), renewal, plan_change, reauthorization (a new payment method) or import_activation (first charge of an imported subscription). Known values: :class:`PaymentType`. Open, so expect others."""
 
 
 class PlanChangePreview(BillKitObject):
     """A ``plan_change_preview`` object."""
 
     object: str
+    """String representing the object's type."""
     charge_cents: int
+    """Total that would be charged now, VAT included, in minor units of currency: charge_net_cents plus charge_tax_cents. Not chargeable when refused is true."""
     charge_net_cents: int
+    """The charge before VAT, in minor units of currency: one period of the target price, net of VAT and of any coupon that carries onto it, less credit_cents."""
     charge_tax_cents: int
+    """VAT on charge_net_cents, in minor units of currency."""
     credit_cents: int
+    """Credit for the unused part of the current period, before VAT, in minor units of currency: the unused share of what the period was actually paid."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     new_period_end: int
+    """Where the new period would end, in Unix seconds: one interval of the target price after proration_at."""
     proration_at: int
+    """The instant the quote values the change at, in Unix seconds."""
     refusal_reason: str | None
-    """Known values: :class:`PlanChangeRefusalReason`. Open, so expect others."""
+    """Why the change would be refused: renewal_imminent when the charge would be under the minimum because the renewal is close (wait for it), downgrade_not_supported when the credit exceeds the target price. Null when refused is false. Known values: :class:`PlanChangeRefusalReason`. Open, so expect others."""
     refused: bool
+    """Whether the change would be refused if requested now. See refusal_reason."""
     target_price_cents: int
+    """The target price's amount_cents as listed, before any coupon, in minor units of currency."""
     target_price_id: str
+    """Id of the price the quote is for."""
 
 
 class PortalTenantCapabilities(BillKitObject):
     """The ``PortalTenantCapabilities`` object."""
 
     checkout_header: bool | None = None
+    """Whether the embedded checkout element shows its own header with your logo, name, product and amount. Defaults to true."""
     coupons: bool | None = None
+    """Whether customers can enter a coupon code in the portal. Defaults to false; the code also needs a product that allows promotion codes."""
     customer_country_editable: bool | None = None
+    """Whether customers can change their country in the portal. Your own API and console updates are not affected. Defaults to true."""
     customer_vat_number_editable: bool | None = None
+    """Whether customers can change their VAT number in the portal. Your own API and console updates are not affected. Defaults to true."""
     cycle_enabled: bool | None = None
+    """Whether customers can switch billing interval in the portal. When false, only prices on the subscription's current interval are offered. Defaults to true."""
     invoice_pdf: bool | None = None
+    """Whether the portal offers invoice PDF downloads. Defaults to true."""
     powered_by: bool | None = None
+    """Whether the portal and invoice PDFs show a Powered by BillKit line. Defaults to true."""
     show_features: bool | None = None
+    """Whether the portal lists the product's marketing_features. Defaults to true."""
 
 
 class PortalTenantTheme(BillKitObject):
     """The ``PortalTenantTheme`` object."""
 
     display: str | None
+    """CSS font-family for headings, with the same rules as font."""
     font: str | None
+    """CSS font-family list for body text, such as Inter, sans-serif. The portal ignores a value containing anything but letters, digits, spaces, commas, quotes, underscores and hyphens."""
     on_primary: str | None
+    """Text colour on primary. Black or white, whichever is legible, when unset. A CSS colour: hex, rgb(), hsl() or a colour name. The portal ignores any other value."""
     palette: str | None
-    """Known values: :class:`PortalTenantThemePalette`. Open, so expect others."""
+    """Base look the brand colours are layered over: studio (BillKit's default) or blank, a plain canvas. Null uses studio. Known values: :class:`PortalTenantThemePalette`. Open, so expect others."""
     primary: str | None
+    """Brand colour for buttons and highlights. A CSS colour: hex, rgb(), hsl() or a colour name. The portal ignores any other value."""
     primary_100: str | None
+    """Light brand tint, used as a background. Derived from primary when unset. A CSS colour: hex, rgb(), hsl() or a colour name. The portal ignores any other value."""
     primary_50: str | None
+    """Lightest brand tint, used as a background. Derived from primary when unset. A CSS colour: hex, rgb(), hsl() or a colour name. The portal ignores any other value."""
     primary_600: str | None
+    """Brand colour used as text, such as links. Derived from primary for legibility when unset. A CSS colour: hex, rgb(), hsl() or a colour name. The portal ignores any other value."""
     radius: int | None
+    """Corner radius in pixels. The portal ignores a value above 128."""
     stub_a: str | None
+    """Light end of the gradient on the subscription card. A CSS colour: hex, rgb(), hsl() or a colour name. The portal ignores any other value."""
     stub_b: str | None
+    """Dark end of the gradient on the subscription card. A CSS colour: hex, rgb(), hsl() or a colour name. The portal ignores any other value."""
 
 
 class PriceTier(BillKitObject):
     """One band of a tiered price. ``up_to: null`` marks the open-ended last band."""
 
     flat_amount_cents: int | None
+    """Amount in minor units charged once when the quantity reaches this band, or null."""
     unit_amount_decimal: str
+    """Per-unit rate for this band in minor units, as a decimal string. "0" when the band has no per-unit rate."""
     up_to: int | None
+    """Inclusive upper bound of this band, in units. Null on the open-ended last band."""
 
 
 class Price(BillKitObject):
     """A ``price`` object."""
 
     id: str
+    """Unique identifier for the price, prefixed price_."""
     object: str
+    """String representing the object's type."""
     active: bool
+    """Whether the price can be used for new checkouts. False once archived."""
     amount_cents: int
+    """Amount in minor units of currency: charged each period on a licensed price, the per-unit rate on a metered one. With a decimal rate this is that rate rounded, and can be 0. 0 on a tiered price."""
     billing_scheme: str
-    """Known values: :class:`BillingScheme`. Open, so expect others."""
+    """per_unit multiplies one rate by the quantity; tiered prices it by tiers. Known values: :class:`BillingScheme`. Open, so expect others."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     interval: str
-    """Known values: :class:`PriceInterval`. Open, so expect others."""
+    """How often the price is charged. Known values: :class:`PriceInterval`. Open, so expect others."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     metadata: dict[str, str]
+    """Key-value pairs attached to the price."""
     payment_methods: list[str]
-    """Known values: :class:`PaymentMethod`. Open, so expect others."""
+    """Payment methods offered at checkout for this price. When payment_methods_from_account is true this is every method your account has not switched off, and a checkout offers the ones among them that you have on in Mollie. Known values: :class:`PaymentMethod`. Open, so expect others."""
+    payment_methods_from_account: bool | None = None
+    """True when the price follows your account's payment methods, false when it has its own list. Send payment_methods: null on an update to make it follow your account again."""
     product_id: str
+    """The product this price belongs to."""
     product_name: str
+    """Name of the product this price belongs to."""
     refund_on_cancel: str
-    """Known values: :class:`RefundOnCancel`. Open, so expect others."""
+    """What a cancellation refunds against the most recent charge. Known values: :class:`RefundOnCancel`. Open, so expect others."""
     refund_window_initial_days: int | None
+    """Refund window for the first charge, in days. 0 means not refundable; null means the default (7 days monthly, 30 yearly)."""
     refund_window_renewal_days: int | None
+    """Refund window for renewal charges, in days. 0 means not refundable; null means the default of 3 days."""
     tax_behavior: str
-    """Known values: :class:`TaxBehavior`. Open, so expect others."""
+    """Whether amount_cents includes VAT (inclusive) or has it added on top (exclusive). unspecified follows the tax rate for the customer's country, and is inclusive when there is none. Known values: :class:`TaxBehavior`. Open, so expect others."""
     tiers: list[PriceTier] | None
+    """The pricing bands. Null on a per-unit price."""
     tiers_mode: str | None
-    """Known values: :class:`TiersMode`. Open, so expect others."""
+    """How tiers price a quantity: graduated or volume. Null on a per-unit price. Known values: :class:`TiersMode`. Open, so expect others."""
     trial_days: int
+    """Length of the free trial a new subscription starts with, in days."""
     trial_verification_cents: int
+    """Amount in minor units charged at checkout to set up the payment mandate, during a trial and on a metered price."""
     unit_amount_decimal: str
+    """The per-unit rate actually charged, in minor units, as a decimal string: the declared decimal rate, or amount_cents written as an integer. Do not parse it into a float."""
     usage_type: str
-    """Known values: :class:`UsageType`. Open, so expect others."""
+    """licensed charges amount_cents every period; metered bills reported usage. Known values: :class:`UsageType`. Open, so expect others."""
 
 
 class ProductStats(BillKitObject):
@@ -1010,42 +1315,69 @@ class ProductStats(BillKitObject):
     """
 
     object: str
+    """String representing the object's type."""
     active_price_count: int
+    """Number of the product's prices that are active."""
     currency: str | None
+    """Currency of mrr_cents, or null when the subscriptions use more than one."""
     mrr_cents: int
+    """Monthly recurring revenue of those subscriptions in minor units of currency: yearly prices at a twelfth, recurring coupons applied, metered prices and tax left out."""
     subscriber_count: int
+    """Number of active and trialing subscriptions on any of the product's prices."""
 
 
 class Product(BillKitObject):
     """A ``product`` object."""
 
     id: str
+    """Unique identifier for the product, prefixed prod_."""
     object: str
+    """String representing the object's type."""
     active: bool
+    """Whether the product is on sale. False once archived."""
     allow_promotion_codes: bool
+    """Whether a buyer may enter a coupon code at checkout for this product's prices."""
     archived_at: int | None
+    """When the product was archived, in Unix seconds. Null while it is active."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     default_price: PriceSummary | None
+    """The default price. Null unless the request asked for expand=default_price, or when none is set."""
     default_price_id: str | None
+    """The price the billing portal offers on its interval. Set to the first price created under the product; null when none is set."""
     description: str | None
+    """Longer description of the product, or null."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     marketing_features: list[str] | None
+    """Feature lines listed in the billing portal's plan picker, or null."""
     metadata: dict[str, str]
+    """Key-value pairs attached to the product."""
     name: str
+    """The product's name, shown to customers."""
     prices: list[PriceSummary] | None
+    """The product's prices, archived ones included, active first then newest. Null unless the request asked for expand=prices."""
     stats: ProductStats | None
+    """Subscriber and revenue figures. Null unless the request asked for expand=stats."""
 
 
 class ProviderPayload(BillKitObject):
     """A ``payment.provider_payload`` object."""
 
     object: str
+    """String representing the object's type. Always payment.provider_payload."""
     available: bool
+    """Whether the provider's record could be fetched. When false, payload is null and unavailable_reason says why."""
     payload: dict[str, Any] | None
+    """The provider's record of the charge, verbatim and unmapped. Its shape is the provider's and can change; read it as a diagnostic. Null when available is false."""
     provider: str
+    """The payment provider that holds the charge, such as mollie."""
     provider_payment_id: str
+    """The provider's id for the charge."""
     redacted: bool
+    """True when the payment's customer was purged: payload then keeps only amounts, statuses, timestamps and identifiers, with personal fields removed."""
     unavailable_reason: str | None
+    """Why the record could not be fetched, as a sentence. Null when available is true."""
 
 
 class PurgedResource(BillKitObject):
@@ -1057,9 +1389,13 @@ class PurgedResource(BillKitObject):
     """
 
     id: str
+    """Id of the purged object."""
     object: str
+    """Type of the purged object, such as customer."""
     deleted: bool
+    """Always true."""
     purged: bool
+    """Always true: the object's personal data was erased as well."""
 
 
 class Reauthorization(BillKitObject):
@@ -1072,28 +1408,44 @@ class Reauthorization(BillKitObject):
     """
 
     object: str
+    """String representing the object's type."""
     checkout_url: str
+    """The provider's payment page. Send the customer here to authorise the new method."""
     operation_id: str
+    """Identifier of the billing operation that tracks this replacement, a UUID."""
     subscription_id: str
+    """Id of the subscription whose payment method is being replaced."""
     verification_amount_cents: int
+    """What the customer is charged on the payment page, in minor units of verification_currency: a small verification charge, or the unpaid renewal for a past_due subscription whose renewals BillKit charges."""
     verification_currency: str
+    """Three-letter ISO 4217 currency code of that charge, uppercase."""
 
 
 class Refund(BillKitObject):
     """A ``refund`` object."""
 
     id: str
+    """Unique identifier for the refund."""
     object: str
+    """String representing the object's type. Always refund."""
     amount_cents: int
+    """Amount refunded, in minor units of currency."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     currency: str
+    """Three-letter ISO 4217 currency code, uppercase."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     one_shot_payment_id: str | None
+    """The one-off payment refunded. Null when the refund is against a subscription payment."""
     payment_id: str | None
+    """The subscription payment refunded. Null when the refund is against a one-off payment."""
     reason: str | None
+    """Why the refund was made, as given when it was created. Null when none was given."""
     status: str
-    """Known values: :class:`RefundStatus`. Open, so expect others."""
+    """One of pending, succeeded or failed. Refunds settle asynchronously: watch refund.succeeded and refund.failed. Known values: :class:`RefundStatus`. Open, so expect others."""
     subscription_id: str | None
+    """The subscription behind the refunded payment. Null for a one-off payment."""
 
 
 class SubscriptionDiscount(BillKitObject):
@@ -1105,7 +1457,9 @@ class SubscriptionDiscount(BillKitObject):
     """
 
     object: str
+    """String representing the object's type."""
     coupon_id: str
+    """Id of the coupon applied to the subscription's charges."""
     ends_at: int | None
     """When the discount stops applying, in Unix seconds: a charge dated at or after it is billed at list price. Null for a forever coupon, and for a once or repeating coupon until its first discounted charge, which fixes the end."""
 
@@ -1119,9 +1473,13 @@ class SubscriptionPaymentMethod(BillKitObject):
     """
 
     brand: str | None
+    """Card brand as the provider reports it. Null for a non-card mandate or when not reported."""
     exp_month: int | None
+    """Card expiry month, 1 to 12. Null for a non-card mandate or when not reported."""
     exp_year: int | None
+    """Card expiry year, four digits. Null for a non-card mandate or when not reported."""
     last4: str | None
+    """Last four digits of the card. Null for a non-card mandate or when not reported."""
     type: str
     """The mandate's method: creditcard, directdebit (SEPA) or paypal. An iDEAL checkout mints a directdebit mandate, so it shows as directdebit. Known values: :class:`SubscriptionPaymentMethodType`. Open, so expect others."""
 
@@ -1130,55 +1488,86 @@ class Subscription(BillKitObject):
     """A ``subscription`` object."""
 
     id: str
+    """Unique identifier for the subscription, prefixed sub_."""
     object: str
+    """String representing the object's type."""
     cancel_at_period_end: bool
+    """Whether the subscription has been set to end at current_period_end instead of renewing."""
     canceled_at: int | None
+    """When the subscription ended, in Unix seconds. Null unless status is canceled."""
     cancellation_reason: str | None
-    """Known values: :class:`CancellationReason`. Open, so expect others."""
+    """Why the subscription ended, set by BillKit. Null unless status is canceled. Known values: :class:`CancellationReason`. Open, so expect others."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     current_period_end: int | None
+    """End of the current billing period, in Unix seconds: the next renewal date, or the trial end while trialing. Null until the first period begins."""
     current_period_start: int | None
+    """Start of the current billing period, in Unix seconds. Null until the first period begins."""
     customer: CustomerSummary | None
+    """Summary of the customer. Null unless the request asked for expand=customer."""
     customer_id: str
+    """Id of the customer the subscription bills."""
     discount: SubscriptionDiscount | None
+    """The coupon applied to future charges. Null when none is."""
     dunning_attempts_notified: int
+    """Number of failed-payment notifications sent since the last successful charge. Reset to 0 when a charge succeeds."""
     dunning_last_notified_at: int | None
+    """When the last failed-payment notification was sent, in Unix seconds. Null if none has been sent since the last successful charge."""
     last_payment_at: int | None
+    """When that payment settled, in Unix seconds. Null if no payment has."""
     last_payment_id: str | None
+    """Id of the most recent payment that settled for this subscription. Null if none has."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     mrr_cents: int | None
     """This subscription's monthly recurring revenue in minor units of its price's currency: a yearly price counts at a twelfth, a recurring coupon is applied, tax and metered prices are left out. Null unless the request asked for expand=price."""
     next_charge_amount_cents: int | None
     """What the next renewal will charge, in minor units of the price's currency: the recurring coupon applied, then VAT added on a tax-exclusive price. Null when nothing will be charged at renewal: the subscription is canceled, paused, canceling at period end or stopped, or its price is metered (the period's usage is billed at its close)."""
     next_payment_attempt: int | None
+    """When BillKit will retry a failed renewal, in Unix seconds. Null when no retry is scheduled: no renewal has failed, or the payment method is unusable, the decline forbids retrying or the retries are spent, so the customer has to act."""
     payment_count: int
+    """Number of payments that have settled for this subscription. A trial's verification charge counts as one."""
     payment_method: SubscriptionPaymentMethod | None
+    """The payment method the next renewal charges. Null when there is none yet, as on an imported subscription awaiting activation."""
     price: PriceSummary | None
+    """Summary of the price and its product. Null unless the request asked for expand=price."""
     price_id: str
+    """Id of the price the subscription is billed at. A plan change moves it only once the prorated charge succeeds."""
     refund_eligibility: RefundEligibility | None
     """Whether the last charge can be refunded now, and how much of it. Null unless the request asked for expand=refund_eligibility."""
     renewal_state: str
-    """Known values: :class:`RenewalState`. Open, so expect others."""
+    """What happens at the end of the current period: auto_renew renews it; paused and canceling do not renew, so access ends at current_period_end unless the subscription is resumed or reactivated; stopped means it will not renew again. Known values: :class:`RenewalState`. Open, so expect others."""
     serves_customer: bool
     """Whether the customer should have access right now. True for an active, trialing or past_due subscription that is renewing; when renewal_state is canceling, paused or stopped, true only until current_period_end. Use this rather than status to grant access."""
     status: str
-    """Known values: :class:`SubscriptionStatus`. Open, so expect others."""
+    """Where the subscription stands with its payments. A paused subscription stays active; read renewal_state for pausing and scheduled cancellation. Known values: :class:`SubscriptionStatus`. Open, so expect others."""
     trial_end: int | None
+    """When the free trial ends or ended, in Unix seconds, and the first paid period starts. Null if the subscription had no trial."""
     trial_start: int | None
+    """When the free trial began, in Unix seconds. Null if the subscription had no trial."""
 
 
 class TaxRate(BillKitObject):
     """A ``tax_rate`` object."""
 
     id: str
+    """Unique identifier for the tax rate, prefixed tr_."""
     object: str
+    """String representing the object's type."""
     active: bool
+    """Whether the rate applies to new charges. A country has at most one active rate."""
     country_code: str
+    """Two-letter ISO 3166-1 country code, uppercase, the rate applies to."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     display_name: str | None
+    """A label for the rate, or null."""
     inclusive: bool
+    """Whether prices charged in this country already include the tax (true) or have it added on top (false), for prices whose tax_behavior is unspecified."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     rate_basis_points: int
+    """The rate in basis points: 2100 is 21 percent."""
 
 
 class TenantBillingProfile(BillKitObject):
@@ -1187,20 +1576,32 @@ class TenantBillingProfile(BillKitObject):
     ``country_code`` is what you have stored, or null if you never set it.
     ``effective_country_code`` is the country the next charge will use: the
     stored value, or a platform default when you have none. ``vat_id`` is
-    your own VAT registration number and has no default. The address fields
-    and ``registration_number`` are printed on your invoices.
+    your own VAT registration number and has no default. ``legal_name``, the
+    address fields and ``registration_number`` are printed on your invoices.
     """
 
     object: str
+    """String representing the object's type."""
     address_line1: str | None
+    """First line of your address on invoices, or null."""
     address_line2: str | None
+    """Second line of your address on invoices, or null."""
     city: str | None
+    """City of your address on invoices, or null."""
     country_code: str | None
+    """Your business's country as stored, an ISO 3166-1 alpha-2 code, or null if never set."""
     effective_country_code: str
+    """The country the next charge uses for VAT: country_code, or the platform default when unset."""
+    legal_name: str | None = None
+    """Your business's registered legal name, printed on invoices, or null. BillKit's own invoices to you are issued to this name."""
     postal_code: str | None
+    """Postal code of your address on invoices, or null."""
     registration_number: str | None
+    """Your company registration number, such as a chamber of commerce number, printed on invoices."""
     tenant_id: str
+    """Id of your account, a UUID."""
     vat_id: str | None
+    """Your own VAT registration number, or null if not set."""
 
 
 class TenantCapabilities(BillKitObject):
@@ -1215,14 +1616,23 @@ class TenantCapabilities(BillKitObject):
     """
 
     object: str
+    """String representing the object's type."""
     allowed_currencies: list[str]
+    """ISO 4217 codes, upper case, of the currencies your BillKit account accepts prices in."""
     enabled_currencies: list[str]
+    """ISO 4217 codes of the currencies your provider account in this mode supports."""
     enabled_methods: list[str]
+    """Payment methods enabled on your provider account in this mode, such as ideal or creditcard."""
     livemode: bool
+    """True if these are the live-mode capabilities, false for test mode."""
     mollie_connected: bool
+    """True once any payment provider credential is stored for your account, in either mode."""
     provider_capabilities_refreshed_at: int | None
+    """When the provider lists were last refreshed, in Unix seconds. Null until the first refresh."""
     provider_currencies_verified: bool
+    """True once your provider account in this mode reports at least one currency that is also in allowed_currencies."""
     tenant_id: str
+    """Id of your account, a UUID."""
 
 
 class TenantPortalBranding(BillKitObject):
@@ -1230,39 +1640,59 @@ class TenantPortalBranding(BillKitObject):
 
     The configurable fields are null when never set. ``effective_business_name``
     and ``effective_support_email`` are the values the portal displays,
-    falling back to your account name and a default support address.
+    falling back to your account name, and to an empty string for the
+    support address when you have not set one (the portal then shows no
+    contact line).
     """
 
     object: str
+    """String representing the object's type."""
     business_name: str | None
+    """The business name you set, or null if never set."""
     capabilities: PortalTenantCapabilities | None
+    """The portal and checkout feature flags you set, or null if never set."""
     effective_business_name: str
+    """The name the portal displays: business_name, or your account name when unset."""
     effective_support_email: str
+    """The support address the portal displays: support_email, or the platform fallback when unset. An empty string means the portal shows no contact line."""
     logo_url: str | None
+    """The logo URL you set, or null if never set."""
     support_email: str | None
+    """The support address you set, or null if never set."""
     theme: PortalTenantTheme | None
+    """The theme you set, or null if never set."""
 
 
 class TenantProviderCredential(BillKitObject):
     """Confirms which provider key was replaced, and when. The key itself is never returned."""
 
     object: str
+    """String representing the object's type."""
     mode: str
-    """Known values: :class:`Mode`. Open, so expect others."""
+    """The mode whose provider key was replaced. Known values: :class:`Mode`. Open, so expect others."""
     provider: str
+    """The payment provider whose key was replaced."""
     rotated_at: int
+    """When the key was replaced, in Unix seconds."""
     tenant_id: str
+    """Id of your account, a UUID."""
 
 
 class TestClock(BillKitObject):
     """A ``test_clock`` object."""
 
     id: str
+    """Unique identifier for the test clock, prefixed tc_."""
     object: str
+    """String representing the object's type."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     frozen_time: int
+    """The clock's current time, in Unix seconds. Attached customers are billed as of this time."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     name: str | None
+    """A label for the clock, or null."""
 
 
 class UpcomingInvoice(BillKitObject):
@@ -1273,51 +1703,87 @@ class UpcomingInvoice(BillKitObject):
     """
 
     object: str
+    """String representing the object's type."""
     amount_due_cents: int
+    """The gross amount the charge will collect, tax included, in minor units of currency."""
     coupon_id: str | None
+    """Id of the coupon discounting this charge, or null if none."""
     currency: str
+    """ISO 4217 code of the charge's currency."""
     customer_id: str
+    """Id of the subscription's customer."""
     invoice_id: str | None
+    """Id of the usage invoice the debit will collect, when a metered SEPA period closes. Null for a licensed renewal, which has no invoice until the charge settles."""
     next_payment_attempt: int
+    """When the charge will be attempted, in Unix seconds."""
     period_start: int | None
+    """Start of the period this charge pays for, in Unix seconds, or null if not known."""
     price_id: str
+    """Id of the price being charged."""
     subscription_id: str
+    """Id of the subscription being renewed."""
     tax_cents: int
+    """The VAT included in amount_due_cents, in minor units of currency."""
 
 
 class UsageRecord(BillKitObject):
     """An ``usage_record`` object."""
 
     id: str
+    """Unique identifier for the usage record, prefixed ur_."""
     object: str
+    """String representing the object's type."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     identifier: str | None
+    """The deduplication key sent with the record. Null if none was."""
     invoice_id: str | None
+    """Id of the invoice that billed this usage. Null until it is billed."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     metadata: dict[str, str]
+    """Set of key-value pairs stored on the record."""
     occurred_at: int
+    """When the usage happened, in Unix seconds."""
     quantity: int
+    """Units of usage recorded."""
     subscription_id: str
+    """Id of the metered subscription the usage was recorded against."""
     written_off_at: int | None
+    """When BillKit decided this usage will never be billed, because the subscription stopped billing before a period close picked it up, in Unix seconds. Null otherwise."""
 
 
 class UsageSummary(BillKitObject):
     """What the next period close will bill, and whether it will charge."""
 
     object: str
+    """String representing the object's type."""
     currency: str
+    """Three-letter ISO 4217 currency code of the price, uppercase."""
     gross_cents: int
+    """What the close would charge, VAT included, in minor units of currency."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     minimum_charge_cents: int
+    """The smallest amount the provider will charge, in minor units of currency."""
     net_cents: int
+    """What the pending usage prices to before VAT, in minor units of currency."""
     open_invoice_id: str | None
+    """Id of an earlier invoiced cycle that is still unsettled. No charge for this period is attempted while one is open. Null if none is."""
     pending_quantity: int
+    """Units reported, not yet invoiced and not written off."""
     pending_record_count: int
+    """Number of usage records making up pending_quantity."""
     period_end: int | None
+    """End of the subscription's current period, when the next close bills, in Unix seconds. Null if it has none."""
     period_start: int | None
+    """Start of the subscription's current period, in Unix seconds. Null if it has none."""
     subscription_id: str
+    """Id of the metered subscription summarized."""
     tax_cents: int
+    """VAT on that amount, in minor units of currency."""
     will_charge: bool
+    """Whether the next close would charge. False when there is no usage or gross_cents is under minimum_charge_cents; the usage then rolls into the next period and is not lost."""
 
 
 class WebhookDelivery(BillKitObject):
@@ -1331,36 +1797,58 @@ class WebhookDelivery(BillKitObject):
     """
 
     id: str
+    """Unique identifier for the delivery, beginning whd_."""
     object: str
+    """String representing the object's type."""
     attempt_count: int
+    """How many delivery attempts have been made, redeliveries included."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     delivered_at: int | None
+    """When your receiver accepted the event, in Unix seconds, or null if it has not."""
     endpoint_id: str
+    """Id of the webhook endpoint it is delivered to."""
     event_id: str
+    """Id of the event being delivered."""
     last_error: str | None
+    """Why the latest attempt failed without a response, such as a timeout or connection error, or why it was not sent. Null otherwise."""
     last_response_body_excerpt: str | None
+    """The first 2048 characters of your receiver's latest response body, or null if there was none."""
     last_response_code: int | None
+    """HTTP status your receiver returned on the latest attempt, or null if it gave no response."""
     next_attempt_at: int
+    """When the next attempt is due, in Unix seconds. On a delivered or failed delivery, when the last attempt was scheduled."""
     status: str
-    """Known values: :class:`WebhookDeliveryStatus`. Open, so expect others."""
+    """pending while attempts continue, delivered after a 2xx response, failed once it gave up. Known values: :class:`WebhookDeliveryStatus`. Open, so expect others."""
 
 
 class WebhookEndpoint(BillKitObject):
     """A ``webhook_endpoint`` object."""
 
     id: str
+    """Unique identifier for the webhook endpoint, beginning we_."""
     object: str
+    """String representing the object's type."""
     created: int
+    """Time at which the object was created, in Unix seconds."""
     description: str | None
+    """The note given to the endpoint, or null."""
     enabled_events: list[str]
+    """The event types sent to this endpoint. * means every event."""
     livemode: bool
+    """True if the object exists in live mode, false if it exists in test mode."""
     previous_secret_fingerprint: str | None
+    """Fingerprint of the secret the last rotation replaced, or null if the secret was never rotated."""
     previous_secret_retired_at: int | None
+    """When the previous secret stops signing deliveries, in Unix seconds: 24 hours after the rotation. Until then each delivery is signed with both secrets. Null if never rotated."""
     secret: str | None
+    """The signing secret, beginning bkwhsec_. Present only in the responses that create the endpoint or rotate its secret; null everywhere else."""
     secret_fingerprint: str
+    """First 12 hex characters of the SHA-256 of the current signing secret, to tell secrets apart without revealing them."""
     status: str
-    """Known values: :class:`WebhookEndpointStatus`. Open, so expect others."""
+    """enabled if the endpoint receives events, disabled if it does not. Known values: :class:`WebhookEndpointStatus`. Open, so expect others."""
     url: str
+    """The URL BillKit sends events to."""
 
 
 # ── Webhook events ─────────────────────────────────────────────────────
@@ -1370,6 +1858,7 @@ class CheckoutSessionCompletedEvent(Event):
     data: CheckoutSession
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["checkout.session.completed"]
+    """What happened. Always `checkout.session.completed` on this delivery."""
 
 
 class CheckoutSessionExpiredEvent(Event):
@@ -1378,6 +1867,7 @@ class CheckoutSessionExpiredEvent(Event):
     data: CheckoutSession
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["checkout.session.expired"]
+    """What happened. Always `checkout.session.expired` on this delivery."""
 
 
 class CouponCreatedEvent(Event):
@@ -1386,6 +1876,7 @@ class CouponCreatedEvent(Event):
     data: Coupon
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["coupon.created"]
+    """What happened. Always `coupon.created` on this delivery."""
 
 
 class CouponUpdatedEvent(Event):
@@ -1394,6 +1885,7 @@ class CouponUpdatedEvent(Event):
     data: Coupon
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["coupon.updated"]
+    """What happened. Always `coupon.updated` on this delivery."""
 
 
 class CreditNoteCreatedEvent(Event):
@@ -1402,6 +1894,7 @@ class CreditNoteCreatedEvent(Event):
     data: CreditNote
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["credit_note.created"]
+    """What happened. Always `credit_note.created` on this delivery."""
 
 
 class CustomerCreatedEvent(Event):
@@ -1410,6 +1903,7 @@ class CustomerCreatedEvent(Event):
     data: Customer
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["customer.created"]
+    """What happened. Always `customer.created` on this delivery."""
 
 
 class CustomerDeletedEvent(Event):
@@ -1418,6 +1912,7 @@ class CustomerDeletedEvent(Event):
     data: Customer
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["customer.deleted"]
+    """What happened. Always `customer.deleted` on this delivery."""
 
 
 class CustomerUpdatedEvent(Event):
@@ -1426,6 +1921,7 @@ class CustomerUpdatedEvent(Event):
     data: Customer
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["customer.updated"]
+    """What happened. Always `customer.updated` on this delivery."""
 
 
 class DisputeClosedEvent(Event):
@@ -1434,6 +1930,7 @@ class DisputeClosedEvent(Event):
     data: Dispute
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["dispute.closed"]
+    """What happened. Always `dispute.closed` on this delivery."""
 
 
 class DisputeCreatedEvent(Event):
@@ -1442,6 +1939,7 @@ class DisputeCreatedEvent(Event):
     data: Dispute
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["dispute.created"]
+    """What happened. Always `dispute.created` on this delivery."""
 
 
 class DunningEmailRequiredEvent(Event):
@@ -1450,6 +1948,7 @@ class DunningEmailRequiredEvent(Event):
     data: DunningNotification
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["dunning.email_required"]
+    """What happened. Always `dunning.email_required` on this delivery."""
 
 
 class InvoiceCreatedEvent(Event):
@@ -1458,6 +1957,7 @@ class InvoiceCreatedEvent(Event):
     data: Invoice
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["invoice.created"]
+    """What happened. Always `invoice.created` on this delivery."""
 
 
 class InvoiceMarkedUncollectibleEvent(Event):
@@ -1466,6 +1966,7 @@ class InvoiceMarkedUncollectibleEvent(Event):
     data: Invoice
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["invoice.marked_uncollectible"]
+    """What happened. Always `invoice.marked_uncollectible` on this delivery."""
 
 
 class InvoicePaidEvent(Event):
@@ -1474,6 +1975,7 @@ class InvoicePaidEvent(Event):
     data: Invoice
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["invoice.paid"]
+    """What happened. Always `invoice.paid` on this delivery."""
 
 
 class InvoicePaymentFailedEvent(Event):
@@ -1482,6 +1984,7 @@ class InvoicePaymentFailedEvent(Event):
     data: Invoice
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["invoice.payment_failed"]
+    """What happened. Always `invoice.payment_failed` on this delivery."""
 
 
 class InvoiceUpcomingEvent(Event):
@@ -1490,6 +1993,7 @@ class InvoiceUpcomingEvent(Event):
     data: UpcomingInvoice
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["invoice.upcoming"]
+    """What happened. Always `invoice.upcoming` on this delivery."""
 
 
 class InvoiceVoidedEvent(Event):
@@ -1498,6 +2002,7 @@ class InvoiceVoidedEvent(Event):
     data: Invoice
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["invoice.voided"]
+    """What happened. Always `invoice.voided` on this delivery."""
 
 
 class OneShotPaymentFailedEvent(Event):
@@ -1506,6 +2011,7 @@ class OneShotPaymentFailedEvent(Event):
     data: OneShotPayment
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["one_shot_payment.failed"]
+    """What happened. Always `one_shot_payment.failed` on this delivery."""
 
 
 class OneShotPaymentRefundedEvent(Event):
@@ -1514,6 +2020,7 @@ class OneShotPaymentRefundedEvent(Event):
     data: OneShotPayment
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["one_shot_payment.refunded"]
+    """What happened. Always `one_shot_payment.refunded` on this delivery."""
 
 
 class OneShotPaymentSucceededEvent(Event):
@@ -1522,6 +2029,7 @@ class OneShotPaymentSucceededEvent(Event):
     data: OneShotPayment
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["one_shot_payment.succeeded"]
+    """What happened. Always `one_shot_payment.succeeded` on this delivery."""
 
 
 class PaymentFailedEvent(Event):
@@ -1530,6 +2038,7 @@ class PaymentFailedEvent(Event):
     data: Payment
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["payment.failed"]
+    """What happened. Always `payment.failed` on this delivery."""
 
 
 class PaymentSucceededEvent(Event):
@@ -1538,6 +2047,7 @@ class PaymentSucceededEvent(Event):
     data: Payment
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["payment.succeeded"]
+    """What happened. Always `payment.succeeded` on this delivery."""
 
 
 class PriceArchivedEvent(Event):
@@ -1546,6 +2056,7 @@ class PriceArchivedEvent(Event):
     data: Price
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["price.archived"]
+    """What happened. Always `price.archived` on this delivery."""
 
 
 class PriceCreatedEvent(Event):
@@ -1554,6 +2065,7 @@ class PriceCreatedEvent(Event):
     data: Price
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["price.created"]
+    """What happened. Always `price.created` on this delivery."""
 
 
 class PriceUpdatedEvent(Event):
@@ -1562,6 +2074,7 @@ class PriceUpdatedEvent(Event):
     data: Price
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["price.updated"]
+    """What happened. Always `price.updated` on this delivery."""
 
 
 class ProductArchivedEvent(Event):
@@ -1570,6 +2083,7 @@ class ProductArchivedEvent(Event):
     data: Product
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["product.archived"]
+    """What happened. Always `product.archived` on this delivery."""
 
 
 class ProductCreatedEvent(Event):
@@ -1578,6 +2092,7 @@ class ProductCreatedEvent(Event):
     data: Product
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["product.created"]
+    """What happened. Always `product.created` on this delivery."""
 
 
 class ProductUpdatedEvent(Event):
@@ -1586,6 +2101,7 @@ class ProductUpdatedEvent(Event):
     data: Product
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["product.updated"]
+    """What happened. Always `product.updated` on this delivery."""
 
 
 class RefundCreatedEvent(Event):
@@ -1594,6 +2110,7 @@ class RefundCreatedEvent(Event):
     data: Refund
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["refund.created"]
+    """What happened. Always `refund.created` on this delivery."""
 
 
 class RefundFailedEvent(Event):
@@ -1602,6 +2119,7 @@ class RefundFailedEvent(Event):
     data: Refund
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["refund.failed"]
+    """What happened. Always `refund.failed` on this delivery."""
 
 
 class RefundSucceededEvent(Event):
@@ -1610,6 +2128,7 @@ class RefundSucceededEvent(Event):
     data: Refund
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["refund.succeeded"]
+    """What happened. Always `refund.succeeded` on this delivery."""
 
 
 class SubscriptionCanceledEvent(Event):
@@ -1618,6 +2137,7 @@ class SubscriptionCanceledEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.canceled"]
+    """What happened. Always `subscription.canceled` on this delivery."""
 
 
 class SubscriptionCouponAppliedEvent(Event):
@@ -1626,6 +2146,7 @@ class SubscriptionCouponAppliedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.coupon_applied"]
+    """What happened. Always `subscription.coupon_applied` on this delivery."""
 
 
 class SubscriptionCouponExpiredEvent(Event):
@@ -1634,6 +2155,7 @@ class SubscriptionCouponExpiredEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.coupon_expired"]
+    """What happened. Always `subscription.coupon_expired` on this delivery."""
 
 
 class SubscriptionCreatedEvent(Event):
@@ -1642,6 +2164,7 @@ class SubscriptionCreatedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.created"]
+    """What happened. Always `subscription.created` on this delivery."""
 
 
 class SubscriptionPastDueEvent(Event):
@@ -1650,6 +2173,7 @@ class SubscriptionPastDueEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.past_due"]
+    """What happened. Always `subscription.past_due` on this delivery."""
 
 
 class SubscriptionPausedEvent(Event):
@@ -1658,6 +2182,7 @@ class SubscriptionPausedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.paused"]
+    """What happened. Always `subscription.paused` on this delivery."""
 
 
 class SubscriptionPaymentMethodUpdatedEvent(Event):
@@ -1666,6 +2191,7 @@ class SubscriptionPaymentMethodUpdatedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.payment_method_updated"]
+    """What happened. Always `subscription.payment_method_updated` on this delivery."""
 
 
 class SubscriptionPlanChangedEvent(Event):
@@ -1674,6 +2200,7 @@ class SubscriptionPlanChangedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.plan_changed"]
+    """What happened. Always `subscription.plan_changed` on this delivery."""
 
 
 class SubscriptionReactivatedEvent(Event):
@@ -1682,6 +2209,7 @@ class SubscriptionReactivatedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.reactivated"]
+    """What happened. Always `subscription.reactivated` on this delivery."""
 
 
 class SubscriptionResumedEvent(Event):
@@ -1690,6 +2218,7 @@ class SubscriptionResumedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.resumed"]
+    """What happened. Always `subscription.resumed` on this delivery."""
 
 
 class SubscriptionTrialEndedEvent(Event):
@@ -1698,6 +2227,7 @@ class SubscriptionTrialEndedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.trial_ended"]
+    """What happened. Always `subscription.trial_ended` on this delivery."""
 
 
 class SubscriptionTrialStartedEvent(Event):
@@ -1706,6 +2236,7 @@ class SubscriptionTrialStartedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.trial_started"]
+    """What happened. Always `subscription.trial_started` on this delivery."""
 
 
 class SubscriptionTrialWillEndEvent(Event):
@@ -1714,6 +2245,7 @@ class SubscriptionTrialWillEndEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.trial_will_end"]
+    """What happened. Always `subscription.trial_will_end` on this delivery."""
 
 
 class SubscriptionUpdatedEvent(Event):
@@ -1722,6 +2254,7 @@ class SubscriptionUpdatedEvent(Event):
     data: Subscription
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["subscription.updated"]
+    """What happened. Always `subscription.updated` on this delivery."""
 
 
 class WebhookEndpointCreatedEvent(Event):
@@ -1730,6 +2263,7 @@ class WebhookEndpointCreatedEvent(Event):
     data: WebhookEndpoint
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["webhook_endpoint.created"]
+    """What happened. Always `webhook_endpoint.created` on this delivery."""
 
 
 class WebhookEndpointDeletedEvent(Event):
@@ -1738,6 +2272,7 @@ class WebhookEndpointDeletedEvent(Event):
     data: WebhookEndpoint
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["webhook_endpoint.deleted"]
+    """What happened. Always `webhook_endpoint.deleted` on this delivery."""
 
 
 class WebhookEndpointUpdatedEvent(Event):
@@ -1746,6 +2281,7 @@ class WebhookEndpointUpdatedEvent(Event):
     data: WebhookEndpoint
     """The object the event is about, as it stood when the event was recorded. At the top level: there is no `data.object` wrapper."""
     type: Literal["webhook_endpoint.updated"]
+    """What happened. Always `webhook_endpoint.updated` on this delivery."""
 
 
 #: Event ``type`` -> the class :meth:`billkit.WebhookSignature.verify` and
