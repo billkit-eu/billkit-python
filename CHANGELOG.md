@@ -15,6 +15,14 @@ Published to PyPI as `billkit-eu`; the import name is `billkit`.
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-19
+
+### Changed
+- Generated types regenerated against the current public spec: the
+  `stripe_import.connected`, `stripe_import.started` and
+  `subscription.imported` audit actions and the `import_not_activated`
+  cancellation reason.
+
 ## [1.1.0] - 2026-10-19
 
 ### Added
@@ -783,7 +791,9 @@ First public release.
   API keys, request/response bodies and query strings are never logged, and the
   final failure is raised rather than logged so you never get a duplicate entry.
 
-[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/billkit-eu/billkit-python/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/billkit-eu/billkit-python/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/billkit-eu/billkit-python/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/billkit-eu/billkit-python/compare/v0.9.0...v1.0.0
 [0.9.0]: https://github.com/billkit-eu/billkit-python/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/billkit-eu/billkit-python/compare/v0.8.0...v0.8.1

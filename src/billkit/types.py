@@ -52,6 +52,9 @@ class AuditLogAction(StrEnum):
     SUBSCRIPTION_PLAN_CHANGE_STARTED = "subscription.plan_change_started"
     SUBSCRIPTION_REAUTHORIZE_STARTED = "subscription.reauthorize_started"
     IMPORT_MANDATE_STARTED = "import.mandate_started"
+    STRIPE_IMPORT_CONNECTED = "stripe_import.connected"
+    STRIPE_IMPORT_STARTED = "stripe_import.started"
+    SUBSCRIPTION_IMPORTED = "subscription.imported"
     SUBSCRIPTION_PAYMENT_METHOD_UPDATED = "subscription.payment_method_updated"
     SUBSCRIPTION_TRIAL_STARTED = "subscription.trial_started"
     SUBSCRIPTION_TRIAL_ENDED = "subscription.trial_ended"
@@ -141,6 +144,7 @@ class CancellationReason(StrEnum):
     TRIAL_EXPIRED_UNPAID = "trial_expired_unpaid"
     PERIOD_END = "period_end"
     PAYMENT_FAILED = "payment_failed"
+    IMPORT_NOT_ACTIVATED = "import_not_activated"
     IMPORTED_FROM_STRIPE = "imported_from_stripe"
 
 
@@ -1538,7 +1542,7 @@ class Subscription(BillKitObject):
     renewal_state: str
     """What happens at the end of the current period: auto_renew renews it; paused and canceling do not renew, so access ends at current_period_end unless the subscription is resumed or reactivated; stopped means it will not renew again. Known values: :class:`RenewalState`. Open, so expect others."""
     serves_customer: bool
-    """Whether the customer should have access right now. True for an active, trialing or past_due subscription that is renewing; when renewal_state is canceling, paused or stopped, true only until current_period_end. Use this rather than status to grant access."""
+    """Whether the customer should have access right now. True for an active, trialing or past_due subscription that is renewing; when renewal_state is canceling, paused or stopped, true only until current_period_end. A renewing subscription imported from Stripe that is still waiting for its customer to add a payment method is true until 14 days after the period they paid Stripe for, when it is canceled if still waiting. Use this rather than status to grant access."""
     status: str
     """Where the subscription stands with its payments. A paused subscription stays active; read renewal_state for pausing and scheduled cancellation. Known values: :class:`SubscriptionStatus`. Open, so expect others."""
     trial_end: int | None
